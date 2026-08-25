@@ -56,7 +56,9 @@ diff; why it changed is not.
   - Worked something out about this codebase that was not obvious? Record it (note_add), \
 with the files it concerns. That is knowledge that would otherwise die with this session.
   - About to debug something that feels familiar? Check recall first -- you may have \
-already solved it here or on another project.";
+already solved it here or on another project.
+
+These are ai-kanban's MCP tools; your tool list shows them under a longer namespaced name.";
 
 #[derive(Debug, Default)]
 struct HookInput {

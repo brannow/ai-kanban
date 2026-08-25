@@ -115,13 +115,29 @@ fn a_note_does_not_surface_for_a_different_file_with_the_same_name() {
 
     let root = tmp.path().display();
     assert_eq!(s.notes_for_path(pid, &format!("{root}/src/auth.rs")).unwrap().len(), 1);
-    assert!(s.notes_for_path(pid, &format!("{root}/vendor/other/src/auth.rs")).unwrap().is_empty()
-        || true, "a deeper path that genuinely ends in src/auth.rs is a real match");
-    // The case that must NOT match: same basename, different directory.
+    // A path that genuinely ends in the stored one, at a boundary, IS a match.
+    assert_eq!(s.notes_for_path(pid, &format!("{root}/vendor/other/src/auth.rs")).unwrap().len(), 1,
+        "a real suffix match at a directory boundary must still hit");
+    // The cases that must NOT match.
     assert!(s.notes_for_path(pid, &format!("{root}/vendor/auth.rs")).unwrap().is_empty(),
         "same basename in another directory is not the same file");
     assert!(s.notes_for_path(pid, &format!("{root}/src/notauth.rs")).unwrap().is_empty(),
         "suffix matching must respect the directory boundary");
+}
+
+#[test]
+fn an_underscore_in_a_filename_is_not_a_wildcard() {
+    // `_` is LIKE's single-character wildcard and underscores in filenames are ordinary,
+    // so an unescaped pattern makes a note about auth_guard.rs fire on authXguard.rs.
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::open_in_memory().unwrap();
+    let pid = s.resolve_project(tmp.path()).unwrap().project.id;
+    note_about(&s, pid, "about the guard", "detail", &["src/auth_guard.rs"]);
+
+    let root = tmp.path().display();
+    assert_eq!(s.notes_for_path(pid, &format!("{root}/src/auth_guard.rs")).unwrap().len(), 1);
+    assert!(s.notes_for_path(pid, &format!("{root}/src/authXguard.rs")).unwrap().is_empty(),
+        "_ must be a literal underscore, not a wildcard");
 }
 
 #[test]

@@ -191,12 +191,17 @@ impl Store {
     /// match means a note filed against `auth.rs` fires for `vendor/other/auth.rs`, and a
     /// note that surfaces on the wrong file is worse than no note at all -- it is a
     /// confident claim about code it was never about.
+    ///
+    /// The stored path is escaped before it becomes a `LIKE` pattern. `_` is LIKE's
+    /// single-character wildcard, and underscores in filenames are ordinary -- unescaped,
+    /// a note about `auth_guard.rs` would also fire on `authXguard.rs`.
     pub fn notes_for_path(&self, project_id: i64, abs_path: &str) -> Result<Vec<Note>> {
         let mut st = self.conn.prepare(&format!(
             "SELECT DISTINCT {}
                FROM notes n JOIN note_paths np ON np.note_id = n.id
               WHERE n.project_id = ?1
-                AND (?2 = np.path OR ?2 LIKE '%/' || np.path)
+                AND (?2 = np.path
+                     OR ?2 LIKE '%/' || replace(replace(replace(np.path, '\\', '\\\\'), '%', '\\%'), '_', '\\_') ESCAPE '\\')
               ORDER BY n.updated_at DESC, n.id DESC",
             NOTE_COLS.split(", ").map(|c| format!("n.{c}")).collect::<Vec<_>>().join(", ")
         ))?;
