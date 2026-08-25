@@ -62,13 +62,28 @@ else the repo root path. Normalization collapses `git@github.com:me/repo.git` an
 `https://github.com/me/repo` to one key, because cloning over SSH on one machine and HTTPS
 on another is the least obvious route to a split board.
 
-Resolution order (`src/core/project.rs`):
+Resolution (`src/core/project.rs`) is **one upward walk**, in two passes:
 
-1. `.ai-kanban` marker file, walking up — explicit beats inferred, and it is the escape
-   hatch for monorepo packages and non-git directories
-2. A known path in `project_paths` — hit means no filesystem work at all
-3. Git root, keyed on the normalized remote if present, else the root path
-4. Otherwise the starting directory itself
+1. **Markers, all the way up.** The deepest `.ai-kanban` wins. This is a pass of its own,
+   not a per-level check, and that matters: an alias learned in a directory *below* a marker
+   would otherwise answer first and the marker would silently never take effect. The
+   realistic sequence is an agent working in a monorepo package and someone later adding a
+   marker to split it out — a documented escape hatch that quietly stops working is worse
+   than none.
+2. **Then, per level:** a known path in `project_paths`, else a `.git` directory (keyed on
+   the normalized remote if present, else the root path).
+
+If the walk finds nothing, the starting directory becomes its own project.
+
+Checking learned aliases at **every** level, not just the starting directory, is what stops
+a subdirectory of a **non-git** project from becoming its own board. With no `.git` to mark
+a root, the walk has nothing else to anchor on, so `~/notes` and `~/notes/drafts` were two
+separate memories until this changed.
+
+The creating path (`resolve_project`) and the read-only path (`find_project`) share that
+walk, so they cannot disagree about which board a directory belongs to. `find_project`
+exists for the session-start hook, which runs in every directory the user opens Claude Code
+in and must never mint a board for a scratch folder.
 
 `roots/list` is deliberately **not** in that list. SEP-2577 (Final) deprecates it and names
 environment variables among its replacements, so the caller's path comes from

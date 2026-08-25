@@ -300,13 +300,24 @@ impl Store {
     /// The single upward walk both resolvers share, so the read-only path and the creating
     /// path can never disagree about which board a directory belongs to.
     fn walk(&self, start: &Path) -> Result<Option<Found>> {
+        // Markers are resolved in a full pass of their own, before any alias is considered.
+        //
+        // Interleaving them per level looks equivalent and is not: an alias learned in a
+        // directory *below* a marker would short-circuit the walk before ever reaching the
+        // marker's level. Concretely, an agent works in a monorepo package, the user later
+        // adds `.ai-kanban` to split that package onto its own board -- and nothing happens,
+        // because the deeper alias answers first. A documented escape hatch that silently
+        // stops working is worse than not having one.
+        //
+        // The cost is a handful of `stat` calls on a path that would otherwise hit the
+        // database immediately. That is worth paying for "explicit always beats inferred".
         for dir in start.ancestors() {
-            // Marker first: explicit beats inferred, and it must beat an alias from the
-            // repo-wide board above a monorepo package.
             if let Some(key) = read_marker(&dir.join(MARKER_FILE)) {
                 let name = key.rsplit('/').next().unwrap_or(&key).to_string();
                 return Ok(Some(Found::Identity((key, name, dir.to_path_buf(), Resolution::Marker))));
             }
+        }
+        for dir in start.ancestors() {
             if let Some(p) = self.project_by_path(dir)? {
                 return Ok(Some(Found::Known(p)));
             }

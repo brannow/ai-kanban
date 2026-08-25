@@ -232,3 +232,29 @@ fn the_read_only_lookup_never_creates_a_board() {
     assert_eq!(s.find_project(&deep).unwrap().unwrap().id, created.project.id);
     assert_eq!(s.all_projects().unwrap().len(), 1);
 }
+
+#[test]
+fn a_marker_added_after_the_fact_still_takes_effect() {
+    // The realistic sequence: work happens in a monorepo package, and only later does
+    // someone decide it deserves its own board. If the alias learned during that work
+    // short-circuits the walk before the marker's level, adding the marker does nothing --
+    // an escape hatch that silently stops working, which is worse than not having one.
+    let tmp = tempfile::tempdir().unwrap();
+    fake_repo(tmp.path(), Some("git@github.com:me/monorepo.git"));
+    let pkg = tmp.path().join("packages").join("api");
+    let deep = pkg.join("src");
+    fs::create_dir_all(&deep).unwrap();
+    let s = store();
+
+    // Work happens first, with no marker: everything belongs to the repo-wide board.
+    let before = s.resolve_project(&deep).unwrap();
+    assert_eq!(before.how, Resolution::GitRemote);
+
+    // The marker arrives afterwards.
+    fs::write(pkg.join(".ai-kanban"), "monorepo/api\n").unwrap();
+    let after = s.resolve_project(&deep).unwrap();
+
+    assert_eq!(after.how, Resolution::Marker);
+    assert_eq!(after.project.key, "monorepo/api");
+    assert_ne!(after.project.id, before.project.id);
+}

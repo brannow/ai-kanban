@@ -126,6 +126,21 @@ cargo build --release          # produces target/release/ai-kanban
 claude plugin validate .
 ```
 
+> **Today this plugin is in-place only, not copy-installable.**
+>
+> Both configs point at `${CLAUDE_PLUGIN_ROOT}/target/release/ai-kanban`, and `target/` is
+> gitignored — so any install that *copies* the repo (a marketplace entry,
+> `claude plugin install`) lands without the binary. Discovery in place works, which is why
+> validation and local testing pass and hide this.
+>
+> The failure is also asymmetric. The hook degrades silently by design, but a plugin MCP
+> server that cannot spawn surfaces a visible connection error — so the "never fail loudly"
+> rule does not cover the half that actually breaks.
+>
+> Making it distributable means shipping a built binary per platform, or pointing both
+> configs at an `ai-kanban` already on `PATH` (`cargo install --path .`) and accepting that
+> the plugin then depends on a separate install step.
+
 The MCP server config deliberately does **not** live in a root `.mcp.json`. That file is also
 Claude Code's project-scoped MCP config, so a contributor working in this repo with the
 plugin installed would get every tool registered twice.

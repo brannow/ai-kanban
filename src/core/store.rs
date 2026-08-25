@@ -64,17 +64,32 @@ pub fn now() -> i64 {
 }
 
 impl Store {
-    /// Opens the store only if it already exists, never creating it.
+    /// Opens the store **read-only**, and only if it already exists.
     ///
-    /// The counterpart to `find_project`: a read-only consumer such as the session-start
-    /// hook must not bring a database into being merely by running. Returns `None` when
-    /// there is nothing to read, so the caller can stay silent instead of reporting an
-    /// error for the entirely normal case of "this user has not used ai-kanban yet".
+    /// The counterpart to `find_project`, for consumers like the session-start hook that
+    /// must observe without touching anything. Returns `None` when there is nothing to
+    /// read, so the caller can stay silent rather than report an error for the entirely
+    /// normal case of "this user has not used ai-kanban yet".
+    ///
+    /// Two deliberate differences from `open`:
+    ///
+    /// * `SQLITE_OPEN_READ_ONLY`, so a write is impossible rather than merely unintended.
+    /// * The schema batch is **not** run. It is a no-op against an up-to-date store today,
+    ///   but the moment a real migration is added it would execute at session start, in
+    ///   every directory, under the host's hook timeout. Migrations belong in the paths that
+    ///   already intend to write.
     pub fn open_existing() -> Result<Option<Self>> {
         let path = Self::default_path()?;
         if !path.exists() {
             return Ok(None);
         }
-        Ok(Some(Self::open(&path)?))
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        // Still worth waiting briefly: a reader can block behind a checkpoint. Kept well
+        // under the hook timeout so a stall ends in silence rather than a killed process.
+        conn.busy_timeout(std::time::Duration::from_secs(2))?;
+        Ok(Some(Self { conn }))
     }
 }
