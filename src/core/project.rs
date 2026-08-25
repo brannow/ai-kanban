@@ -15,11 +15,26 @@
 //!
 //! # Order
 //!
-//! 1. `.ai-kanban` marker file, found walking up. Explicit beats inferred -- this is the
-//!    escape hatch for monorepo packages and non-git directories.
-//! 2. A known path in `project_paths`. Hit -> done, no filesystem work at all.
-//! 3. Git root, keyed on the normalized remote URL if there is one, else the root path.
-//! 4. No git, no marker -> the starting directory itself becomes the project.
+//! Resolution is a single walk upward from the caller's directory. At **each** level, in
+//! this order:
+//!
+//! 1. `.ai-kanban` marker file. Explicit beats inferred -- the escape hatch for monorepo
+//!    packages and non-git directories.
+//! 2. A known path in `project_paths`. A board already claimed this directory.
+//! 3. A `.git` directory. Keyed on the normalized remote URL if there is one, else the root
+//!    path.
+//!
+//! If the walk finds nothing, the starting directory becomes its own project.
+//!
+//! The checks are interleaved per level rather than run as three separate passes, and that
+//! ordering carries real weight:
+//!
+//! * Checking learned aliases at every level (not just the starting directory) is what
+//!   stops a subdirectory of a **non-git** project from becoming its own board. Without it
+//!   `~/notes` and `~/notes/drafts` are two separate memories, because with no `.git` to
+//!   mark a root the walk has nothing else to anchor on.
+//! * Checking the marker *before* the alias at each level is what keeps a monorepo package
+//!   from being swallowed by the repo-wide board sitting above it.
 //!
 //! Note what is absent: `roots/list`. SEP-2577 (Final) deprecates it, and names environment
 //! variables as a replacement, so the caller's path comes from `CLAUDE_PROJECT_DIR` first
@@ -64,14 +79,17 @@ impl Store {
     pub fn resolve_project(&self, start: &Path) -> Result<Resolved> {
         let start = canonical(start);
 
-        // 1. Known path. Checked before any filesystem walk: it is the hot path, and a
-        //    learned alias must win over re-deriving an identity that might differ.
-        if let Some(p) = self.project_by_path(&start)? {
-            return Ok(Resolved { project: p, how: Resolution::KnownPath, created: false });
-        }
-
-        // 2..4 -- derive an identity from the filesystem.
-        let (key, name, root, how) = derive_identity(&start);
+        let (key, name, root, how) = match self.walk(&start)? {
+            // A board already owns this directory or one above it.
+            Some(Found::Known(project)) => {
+                // Learn the starting path so the next call short-circuits on the first
+                // level instead of walking again.
+                self.add_path_alias(project.id, &start)?;
+                return Ok(Resolved { project, how: Resolution::KnownPath, created: false });
+            }
+            Some(Found::Identity(id)) => id,
+            None => (format!("path:{}", start.to_string_lossy()), basename(&start), start.clone(), Resolution::Directory),
+        };
 
         let (project, created) = self.upsert_project(&key, &name)?;
         // Both the starting path and the derived root become aliases. Registering the root
@@ -145,28 +163,16 @@ fn row_to_project(r: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project { id: r.get(0)?, key: r.get(1)?, name: r.get(2)?, created_at: r.get(3)? })
 }
 
-/// Walks up from `start` deriving a stable identity. Pure filesystem logic, no DB --
-/// separated so it can be tested against fixture directories.
-fn derive_identity(start: &Path) -> (String, String, PathBuf, Resolution) {
-    for dir in start.ancestors() {
-        // Marker first at each level: explicit beats inferred, and a monorepo package
-        // marker sits below the git root that would otherwise swallow it.
-        let marker = dir.join(MARKER_FILE);
-        if let Some(key) = read_marker(&marker) {
-            let name = key.rsplit('/').next().unwrap_or(&key).to_string();
-            return (key, name, dir.to_path_buf(), Resolution::Marker);
-        }
-        if dir.join(".git").exists() {
-            let name = basename(dir);
-            return match git_remote(dir) {
-                // Keyed on the remote: a second clone, a moved folder and a worktree all
-                // land on the same board.
-                Some(url) => (format!("git:{}", normalize_remote(&url)), name, dir.to_path_buf(), Resolution::GitRemote),
-                None => (format!("path:{}", dir.to_string_lossy()), name, dir.to_path_buf(), Resolution::GitRoot),
-            };
-        }
-    }
-    (format!("path:{}", start.to_string_lossy()), basename(start), start.to_path_buf(), Resolution::Directory)
+/// A derived project identity: key, display name, the directory it was derived from, and
+/// how it was arrived at.
+type Identity = (String, String, PathBuf, Resolution);
+
+/// The outcome of one upward walk.
+enum Found {
+    /// A board already claims this directory or one above it.
+    Known(Project),
+    /// No board yet, but the filesystem says what one here would be called.
+    Identity(Identity),
 }
 
 fn read_marker(path: &Path) -> Option<String> {
@@ -267,4 +273,51 @@ fn normalize_remote_parts(host: &str, path: &str) -> String {
     let path = path.trim_start_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
     format!("{}/{}", host.to_lowercase(), path.trim_end_matches('/').to_lowercase())
+}
+
+impl Store {
+    /// Resolves a path to a project **without creating one**.
+    ///
+    /// This exists for the session-start hook, which runs in every directory the user ever
+    /// opens Claude Code in. Using `resolve_project` there would quietly mint a board for
+    /// every scratch folder, tarball and dotfiles checkout they visit -- filling
+    /// `board(project: "all")` with noise and turning the store's contents into a record of
+    /// where the user has been rather than what they work on.
+    ///
+    /// Aliases are not learned here either: learning is a side effect of *using* a board,
+    /// and merely starting a session in a directory is not use.
+    pub fn find_project(&self, start: &Path) -> Result<Option<Project>> {
+        let start = canonical(start);
+        match self.walk(&start)? {
+            Some(Found::Known(p)) => Ok(Some(p)),
+            // A derived identity is only a *candidate*: it names a board that may not exist
+            // yet, and this function must never bring one into being.
+            Some(Found::Identity((key, _, _, _))) => self.project_by_key(&key),
+            None => Ok(None),
+        }
+    }
+
+    /// The single upward walk both resolvers share, so the read-only path and the creating
+    /// path can never disagree about which board a directory belongs to.
+    fn walk(&self, start: &Path) -> Result<Option<Found>> {
+        for dir in start.ancestors() {
+            // Marker first: explicit beats inferred, and it must beat an alias from the
+            // repo-wide board above a monorepo package.
+            if let Some(key) = read_marker(&dir.join(MARKER_FILE)) {
+                let name = key.rsplit('/').next().unwrap_or(&key).to_string();
+                return Ok(Some(Found::Identity((key, name, dir.to_path_buf(), Resolution::Marker))));
+            }
+            if let Some(p) = self.project_by_path(dir)? {
+                return Ok(Some(Found::Known(p)));
+            }
+            if dir.join(".git").exists() {
+                let name = basename(dir);
+                return Ok(Some(Found::Identity(match git_remote(dir) {
+                    Some(url) => (format!("git:{}", normalize_remote(&url)), name, dir.to_path_buf(), Resolution::GitRemote),
+                    None => (format!("path:{}", dir.to_string_lossy()), name, dir.to_path_buf(), Resolution::GitRoot),
+                })));
+            }
+        }
+        Ok(None)
+    }
 }

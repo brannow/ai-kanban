@@ -5,6 +5,7 @@
 //! land here rather than in a second stack.
 
 use ai_kanban::core::Store;
+use ai_kanban::hook;
 use ai_kanban::mcp::server::AiKanban;
 use rmcp::{transport::stdio, ServiceExt};
 
@@ -12,8 +13,9 @@ const USAGE: &str = "\
 ai-kanban -- a kanban board an agent can actually use
 
 USAGE:
-    ai-kanban mcp       Run the MCP server on stdio (what an agent connects to)
-    ai-kanban where     Print the path to the store
+    ai-kanban mcp                  Run the MCP server on stdio (what an agent connects to)
+    ai-kanban hook session-start   Emit the board as Claude Code SessionStart context
+    ai-kanban where                Print the path to the store
     ai-kanban --help
 
 The store is a single SQLite file. Back it up by copying it.
@@ -24,6 +26,17 @@ Override its location with AI_KANBAN_DB.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("mcp") => run_mcp().await,
+        // Hooks are invoked by the host, never by a person. They read hook JSON on stdin
+        // and write hook JSON on stdout, so the plugin needs no wrapper script.
+        Some("hook") => {
+            match std::env::args().nth(2).as_deref() {
+                Some("session-start") => hook::session_start(),
+                // Silence, not an error: a hook that complains on every session start is a
+                // hook the user removes, taking the bundled MCP server with it.
+                _ => {}
+            }
+            Ok(())
+        }
         Some("where") => {
             println!("{}", Store::default_path()?.display());
             Ok(())

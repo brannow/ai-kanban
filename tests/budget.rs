@@ -16,7 +16,7 @@ use ai_kanban::core::note::NoteDraft;
 use ai_kanban::core::recall::{RecallQuery, DEFAULT_LIMIT};
 use ai_kanban::core::task::{TaskDraft, TaskPatch};
 use ai_kanban::core::Store;
-use ai_kanban::mcp::render;
+use ai_kanban::render;
 
 /// ~4 characters per token for English prose. Rough on purpose: the question here is
 /// "hundreds or thousands", and no precision beyond that changes a decision.

@@ -1,0 +1,19 @@
+{
+  "name": "ai-kanban",
+  "displayName": "ai-kanban",
+  "description": "A kanban board an agent uses as persistent memory: what is in flight, what happened and why, and what was learned about the codebase -- surviving across sessions.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Benjamin Rannow",
+    "email": "benjamin@rannow.de"
+  },
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "kanban",
+    "mcp",
+    "context"
+  ],
+  "hooks": "./plugin/hooks.json",
+  "mcpServers": "./plugin/mcp.json"
+}

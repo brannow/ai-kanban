@@ -1,6 +1,7 @@
-//! Prose rendering for agents.
+//! Prose rendering for agents. Shared by every adapter that talks to a model: the MCP
+//! tools an agent calls, and the hook that injects context it never asked for.
 //!
-//! This lives in the adapter, never in core, because the human's access to this data is
+//! This lives outside core, never in it, because the human's access to this data is
 //! meant to be an API: text in core would force a web UI to parse sentences back into
 //! objects it already had.
 //!

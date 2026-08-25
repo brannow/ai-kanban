@@ -173,3 +173,62 @@ fn different_repos_stay_different() {
     assert_ne!(normalize_remote("git@github.com:me/repo.git"), normalize_remote("git@github.com:me/other.git"));
     assert_ne!(normalize_remote("git@github.com:me/repo.git"), normalize_remote("git@gitlab.com:me/repo.git"));
 }
+
+#[test]
+fn a_subdirectory_of_a_non_git_project_joins_its_board() {
+    // The git case works because `.git` marks the root. With no repo and no marker there is
+    // nothing to anchor on, so every subdirectory used to derive its own identity -- making
+    // ~/notes and ~/notes/drafts two separate memories. Learned aliases are checked at each
+    // level of the walk precisely to close that.
+    let tmp = tempfile::tempdir().unwrap();
+    let deep = tmp.path().join("drafts").join("2026");
+    fs::create_dir_all(&deep).unwrap();
+    let s = store();
+
+    let root = s.resolve_project(tmp.path()).unwrap();
+    let nested = s.resolve_project(&deep).unwrap();
+
+    assert_eq!(root.project.id, nested.project.id, "a plain subdirectory must not fork the board");
+    assert_eq!(nested.how, Resolution::KnownPath);
+    assert!(!nested.created);
+}
+
+#[test]
+fn a_marker_still_wins_over_an_alias_inherited_from_above() {
+    // The inverse risk of checking aliases during the walk: a repo-wide board sitting above
+    // a monorepo package could swallow it. The marker is checked first at every level.
+    let tmp = tempfile::tempdir().unwrap();
+    fake_repo(tmp.path(), Some("git@github.com:me/monorepo.git"));
+    let pkg = tmp.path().join("packages").join("api");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join(".ai-kanban"), "monorepo/api\n").unwrap();
+    let s = store();
+
+    // Resolve the repo-wide board FIRST, so its alias is already learned and sitting above.
+    let root = s.resolve_project(tmp.path()).unwrap();
+    let package = s.resolve_project(&pkg).unwrap();
+    let below_marker = s.resolve_project(&pkg.join("src")).unwrap();
+
+    assert_ne!(root.project.id, package.project.id);
+    assert_eq!(package.how, Resolution::Marker);
+    assert_eq!(below_marker.project.id, package.project.id, "a directory under the marker belongs to the package");
+}
+
+#[test]
+fn the_read_only_lookup_never_creates_a_board() {
+    // The session-start hook runs in every directory the user opens Claude Code in. If it
+    // created boards, the store would become a record of where they have been.
+    let tmp = tempfile::tempdir().unwrap();
+    fake_repo(tmp.path(), Some("git@github.com:me/repo.git"));
+    let s = store();
+
+    assert!(s.find_project(tmp.path()).unwrap().is_none());
+    assert!(s.all_projects().unwrap().is_empty(), "a lookup must not mint a board");
+
+    // Once the board genuinely exists, the same lookup finds it -- from a subdirectory too.
+    let created = s.resolve_project(tmp.path()).unwrap();
+    let deep = tmp.path().join("src");
+    fs::create_dir_all(&deep).unwrap();
+    assert_eq!(s.find_project(&deep).unwrap().unwrap().id, created.project.id);
+    assert_eq!(s.all_projects().unwrap().len(), 1);
+}

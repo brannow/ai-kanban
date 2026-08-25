@@ -31,7 +31,7 @@ use crate::core::project::Resolved;
 use crate::core::recall::{RecallQuery, DEFAULT_LIMIT};
 use crate::core::task::{TaskDraft, TaskPatch};
 use crate::core::{Error, Store};
-use crate::mcp::render;
+use crate::render;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router, ErrorData};
 use schemars::JsonSchema;

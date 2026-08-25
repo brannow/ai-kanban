@@ -62,3 +62,19 @@ pub fn now() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+impl Store {
+    /// Opens the store only if it already exists, never creating it.
+    ///
+    /// The counterpart to `find_project`: a read-only consumer such as the session-start
+    /// hook must not bring a database into being merely by running. Returns `None` when
+    /// there is nothing to read, so the caller can stay silent instead of reporting an
+    /// error for the entirely normal case of "this user has not used ai-kanban yet".
+    pub fn open_existing() -> Result<Option<Self>> {
+        let path = Self::default_path()?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(Self::open(&path)?))
+    }
+}
