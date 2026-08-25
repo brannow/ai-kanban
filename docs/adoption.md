@@ -80,16 +80,36 @@ without being told. Cold start is left to the tool descriptions.
 
 ---
 
-## Deliberately deferred
+## `PostToolUse` — contextual recall
 
-**`PostToolUse` contextual recall.** Board state at session start is the easy half. The half
-that decides whether memory is *used* is surfacing a note when it is relevant — the agent
-opens `auth/middleware.rs` and what was learned about it last time arrives unasked. `recall`
-assumes the agent thinks "let me search my memory", and it will not; it will hit a bug and
-start debugging.
+Board state at session start is the easy half. The half that decides whether memory is
+*used* is surfacing a note when it is relevant: the agent opens `auth/middleware.rs` and what
+was learned about it last time arrives unasked. `recall` assumes the agent thinks "let me
+search my memory", and it will not — it will hit a bug and start debugging.
 
-This is why `note_paths` exists in the v1 schema **with no consumer**. Retrofitting the
-association would mean re-tagging every note ever written, so it ships now and waits.
+This is what `note_paths` was in the schema for, and it now has its consumer.
+
+Three things make the difference between help and irritation, since this fires on **every**
+file read and edit:
+
+**Path matching respects directory boundaries.** Stored paths are usually repo-relative
+(`src/auth.rs`); the hook receives an absolute path. A stored path matches when it is the
+absolute path, or a suffix of it *at a `/`*. Plain suffix matching would fire a note about
+`auth.rs` on `vendor/other/auth.rs` — and a note surfacing on the wrong file is worse than no
+note, because it is a confident claim about code it was never about.
+
+**It never repeats itself.** Reading the same file five times must not deliver the same
+paragraph five times. Notes already surfaced are recorded per session in a file in the OS
+temp directory — not in the store, because the hook opens it read-only and writing "I
+mentioned this" into the user's memory would make an observer into a participant. Losing that
+state costs one repeated note, so every failure there is ignored rather than reported.
+
+**It shows at most three notes and their age**, then a count. A file with a dozen notes
+almost certainly has three that matter. Age is shown because staleness is an unsolved problem
+and this is the one moment the agent can act on it — it is looking at the code the claim is
+about — which is why the output ends by naming `note_update`.
+
+Measured at ~0.5ms per invocation, and silent unless it has something to say.
 
 **A `Stop` hook nudge** at end of turn ("did you record what happened?"). Returning
 `hookSpecificOutput.additionalContext` rather than `decision: "block"` nudges without raising

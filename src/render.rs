@@ -17,6 +17,15 @@
 use crate::core::event::status_transition;
 use crate::core::model::*;
 
+/// Age as a parenthetical, e.g. `(3mo old)` or `(just now)`.
+///
+/// Exists because `ago` returns a bare duration for old things but the phrase "just now"
+/// for recent ones, so appending " old" unconditionally produces "just now old".
+pub fn age(now: i64, ts: i64) -> String {
+    let a = ago(now, ts);
+    if a == "just now" { a } else { format!("{a} old") }
+}
+
 /// Relative age. Absolute timestamps would be noise: what matters is "is this stale",
 /// which is a question about distance from now, not about a date.
 pub fn ago(now: i64, ts: i64) -> String {
@@ -144,7 +153,7 @@ pub fn task_detail(d: &TaskDetail) -> String {
     if !d.notes.is_empty() {
         out.push_str("\nnotes\n");
         for n in &d.notes {
-            out.push_str(&format!("  #{} {}  ({} old)\n", n.id, truncate(&n.title, 45), ago(d.now, n.updated_at)));
+            out.push_str(&format!("  #{} {}  ({})\n", n.id, truncate(&n.title, 45), age(d.now, n.updated_at)));
         }
     }
     if !d.events.is_empty() {

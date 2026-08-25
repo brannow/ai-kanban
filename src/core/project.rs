@@ -122,7 +122,7 @@ impl Store {
 
     pub fn all_projects(&self) -> Result<Vec<Project>> {
         let mut st = self.conn.prepare(
-            "SELECT id, key, name, created_at FROM projects ORDER BY name",
+            "SELECT id, key, name, created_at FROM projects ORDER BY name, id",
         )?;
         let rows = st.query_map([], row_to_project)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -152,7 +152,7 @@ impl Store {
 
     pub fn project_paths(&self, project_id: i64) -> Result<Vec<String>> {
         let mut st = self.conn.prepare(
-            "SELECT path FROM project_paths WHERE project_id = ?1 ORDER BY created_at",
+            "SELECT path FROM project_paths WHERE project_id = ?1 ORDER BY created_at, path",
         )?;
         let rows = st.query_map([project_id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)

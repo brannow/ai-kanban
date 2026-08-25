@@ -61,6 +61,8 @@ already solved it here or on another project.";
 #[derive(Debug, Default)]
 struct HookInput {
     cwd: Option<String>,
+    file_path: Option<String>,
+    session_id: Option<String>,
 }
 
 fn read_input() -> HookInput {
@@ -71,6 +73,8 @@ fn read_input() -> HookInput {
     match serde_json::from_str::<serde_json::Value>(&buf) {
         Ok(v) => HookInput {
             cwd: v.get("cwd").and_then(|c| c.as_str()).map(String::from),
+            file_path: v.pointer("/tool_input/file_path").and_then(|c| c.as_str()).map(String::from),
+            session_id: v.get("session_id").and_then(|c| c.as_str()).map(String::from),
         },
         Err(_) => HookInput::default(),
     }
@@ -135,4 +139,132 @@ pub fn context_for(store: &Store, start: &std::path::Path) -> Option<String> {
         out.push_str("\n...(truncated)\n");
     }
     Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// PostToolUse -- contextual recall
+// ---------------------------------------------------------------------------
+
+/// Notes shown for one file before the rest become a count. A file with a dozen notes
+/// almost certainly has three that matter; dumping all of them turns a helpful aside into
+/// an interruption.
+const MAX_NOTES: usize = 3;
+
+/// Runs the `PostToolUse` hook: surfaces what is known about the file just touched.
+///
+/// # Why this event, and not `FileChanged`
+///
+/// `FileChanged`'s matcher builds a *literal filename watch list* in the working directory,
+/// so it is built for watching specific config files, not for noticing which of a thousand
+/// source files an agent just opened. `PostToolUse` matches on tool name and hands over
+/// `tool_input.file_path`, which is exactly the question being asked.
+///
+/// # The constraint that shapes everything here
+///
+/// This fires on **every** file read and edit. Anything it prints that was not worth
+/// printing is a tax on every tool call in the session, and the fastest route to the plugin
+/// being disabled -- which would take the board and the MCP server with it. So it stays
+/// silent unless a note is genuinely about this file, and it never repeats itself.
+pub fn post_tool_use() {
+    if let Some(context) = build_file_context() {
+        let payload = serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": context,
+            }
+        });
+        println!("{payload}");
+    }
+}
+
+fn build_file_context() -> Option<String> {
+    let input = read_input();
+    let file = input.file_path.clone()?;
+    let store = Store::open_existing().ok()??;
+    let project = store.find_project(&start_dir(&input)).ok()??;
+
+    let notes = store.notes_for_path(project.id, &file).ok()?;
+    if notes.is_empty() {
+        return None;
+    }
+
+    // Suppress notes already shown this session. Reading the same file five times must not
+    // deliver the same paragraph five times -- that is the behaviour that makes a hook feel
+    // like nagging rather than help.
+    let seen = SeenNotes::for_session(input.session_id.as_deref());
+    let fresh: Vec<_> = notes.iter().filter(|n| !seen.contains(n.id)).collect();
+    if fresh.is_empty() {
+        return None;
+    }
+    seen.record(fresh.iter().map(|n| n.id));
+
+    let now = crate::core::now();
+    let shown = fresh.iter().take(MAX_NOTES);
+    let mut out = format!("Recorded previously about {}:\n", short_path(&file));
+    for n in shown {
+        out.push_str(&format!("\nnote #{} \"{}\"  ({})\n", n.id, n.title, render::age(now, n.updated_at)));
+        if !n.body.is_empty() {
+            out.push_str(&format!("  {}\n", n.body.replace('\n', "\n  ")));
+        }
+    }
+    if fresh.len() > MAX_NOTES {
+        out.push_str(&format!("\n...and {} more for this file (recall to see them)\n", fresh.len() - MAX_NOTES));
+    }
+    // Named here because this is the moment the agent can act on it: it is looking at the
+    // code the claim is about. Stale memory the agent trusts is worse than no memory, and
+    // nothing else in the system decides when a note stops being true.
+    out.push_str("\nIf any of this is now wrong, correct it with note_update.");
+    Some(out)
+}
+
+/// Per-session record of which notes have already been surfaced.
+///
+/// Deliberately a file in the OS temp directory rather than a table: the hook opens the
+/// store read-only, and writing "I mentioned this" into the user's memory would make an
+/// observer into a participant. Losing this state costs a repeated note, which is why every
+/// failure here is ignored rather than reported.
+struct SeenNotes {
+    path: Option<PathBuf>,
+    ids: Vec<i64>,
+}
+
+impl SeenNotes {
+    fn for_session(session: Option<&str>) -> Self {
+        // No session id means no way to scope the state; degrade to showing the note rather
+        // than sharing one file across unrelated sessions.
+        let Some(session) = session.filter(|s| !s.is_empty() && is_safe_id(s)) else {
+            return Self { path: None, ids: vec![] };
+        };
+        let path = std::env::temp_dir().join(format!("ai-kanban-seen-{session}"));
+        let ids = std::fs::read_to_string(&path)
+            .map(|t| t.lines().filter_map(|l| l.trim().parse::<i64>().ok()).collect())
+            .unwrap_or_default();
+        Self { path: Some(path), ids }
+    }
+
+    fn contains(&self, id: i64) -> bool {
+        self.ids.contains(&id)
+    }
+
+    fn record(&self, ids: impl Iterator<Item = i64>) {
+        let Some(path) = &self.path else { return };
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            for id in ids {
+                let _ = writeln!(f, "{id}");
+            }
+        }
+    }
+}
+
+/// Session ids come from the host, but they are interpolated into a filename, so they are
+/// checked rather than trusted.
+fn is_safe_id(s: &str) -> bool {
+    s.len() <= 128 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Trims an absolute path to something readable. The agent knows which repo it is in; the
+/// leading /Users/someone/code/ is noise repeated on every hit.
+fn short_path(p: &str) -> &str {
+    p.rsplit_once('/').map(|(_, f)| f).filter(|_| p.len() > 60).unwrap_or(p)
 }

@@ -108,7 +108,7 @@ impl Store {
                JOIN notes n ON n.id = notes_fts.rowid
                JOIN projects p ON p.id = n.project_id
               WHERE notes_fts MATCH ?1 AND (?2 IS NULL OR n.project_id = ?2)
-              ORDER BY notes_fts.rank LIMIT ?3",
+              ORDER BY notes_fts.rank, n.id DESC LIMIT ?3",
         )?;
         let rows = st.query_map(params![m, project, limit as i64], |r| {
             Ok(RecallHit {
@@ -129,7 +129,7 @@ impl Store {
                JOIN tasks t ON t.id = tasks_fts.rowid
                JOIN projects p ON p.id = t.project_id
               WHERE tasks_fts MATCH ?1 AND (?2 IS NULL OR t.project_id = ?2)
-              ORDER BY tasks_fts.rank LIMIT ?3",
+              ORDER BY tasks_fts.rank, t.id DESC LIMIT ?3",
         )?;
         let rows = st.query_map(params![m, project, limit as i64], |r| {
             Ok(RecallHit {
@@ -161,7 +161,7 @@ impl Store {
                LEFT JOIN tasks t ON t.id = e.task_id
               WHERE events_fts MATCH ?1 AND (?2 IS NULL OR e.project_id = ?2)
                 AND e.kind NOT IN ('created', 'note_added')
-              ORDER BY events_fts.rank LIMIT ?3",
+              ORDER BY events_fts.rank, e.id DESC LIMIT ?3",
         )?;
         let rows = st.query_map(params![m, project, limit as i64], |r| {
             let task_id: Option<i64> = r.get(6)?;

@@ -15,6 +15,7 @@ ai-kanban -- a kanban board an agent can actually use
 USAGE:
     ai-kanban mcp                  Run the MCP server on stdio (what an agent connects to)
     ai-kanban hook session-start   Emit the board as Claude Code SessionStart context
+    ai-kanban hook post-tool-use   Emit notes about the file a tool just touched
     ai-kanban where                Print the path to the store
     ai-kanban --help
 
@@ -31,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("hook") => {
             match std::env::args().nth(2).as_deref() {
                 Some("session-start") => hook::session_start(),
+                Some("post-tool-use") => hook::post_tool_use(),
                 // Silence, not an error: a hook that complains on every session start is a
                 // hook the user removes, taking the bundled MCP server with it.
                 _ => {}

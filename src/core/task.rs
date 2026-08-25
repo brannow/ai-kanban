@@ -123,7 +123,7 @@ impl Store {
     /// still do not work, and give no clue why.
     fn task_not_found(&self, project_id: i64, id: i64) -> Error {
         let existing = self.conn
-            .prepare("SELECT id, title FROM tasks WHERE project_id = ?1 AND status != 'archived' ORDER BY updated_at DESC LIMIT 8")
+            .prepare("SELECT id, title FROM tasks WHERE project_id = ?1 AND status != 'archived' ORDER BY updated_at DESC, id DESC LIMIT 8")
             .and_then(|mut st| {
                 st.query_map([project_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
                     .collect::<rusqlite::Result<Vec<_>>>()
@@ -186,7 +186,7 @@ impl Store {
 
     pub fn tasks_blocked_by(&self, project_id: i64, id: i64) -> Result<Vec<Task>> {
         let mut st = self.conn.prepare(&format!(
-            "SELECT {TASK_COLS} FROM tasks WHERE blocked_by = ?1 AND project_id = ?2 AND status != 'archived' ORDER BY updated_at DESC"
+            "SELECT {TASK_COLS} FROM tasks WHERE blocked_by = ?1 AND project_id = ?2 AND status != 'archived' ORDER BY updated_at DESC, id DESC"
         ))?;
         Ok(st.query_map(params![id, project_id], row_to_task)?.collect::<rusqlite::Result<Vec<_>>>()?)
     }

@@ -10,6 +10,18 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/target/release/ai-kanban hook post-tool-use",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

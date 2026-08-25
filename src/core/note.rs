@@ -142,7 +142,7 @@ impl Store {
 
     pub fn notes_for_task(&self, project_id: i64, task_id: i64) -> Result<Vec<Note>> {
         let mut st = self.conn.prepare(&format!(
-            "SELECT {NOTE_COLS} FROM notes WHERE task_id = ?1 AND project_id = ?2 ORDER BY updated_at DESC"
+            "SELECT {NOTE_COLS} FROM notes WHERE task_id = ?1 AND project_id = ?2 ORDER BY updated_at DESC, id DESC"
         ))?;
         let mut notes = st.query_map(params![task_id, project_id], row_to_note)?.collect::<rusqlite::Result<Vec<_>>>()?;
         for n in &mut notes { n.paths = self.note_paths(n.id)?; }
@@ -170,4 +170,41 @@ fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max { return s.to_string(); }
     let cut: String = s.chars().take(max).collect();
     format!("{cut}...")
+}
+
+impl Store {
+    /// Notes associated with a file, newest first.
+    ///
+    /// This is the query `note_paths` was created for and shipped without: proactive
+    /// contextual recall. The agent opens `auth/middleware.rs` and what was learned about
+    /// it last time arrives without anyone asking, because the alternative -- the agent
+    /// deciding to search its own memory -- does not happen. It hits a bug and starts
+    /// debugging.
+    ///
+    /// # Matching
+    ///
+    /// The caller has an absolute path; the stored path is whatever the agent wrote, which
+    /// is usually repo-relative. So a stored path matches when it *is* the absolute path, or
+    /// is a suffix of it **at a directory boundary**.
+    ///
+    /// That boundary is the whole difference between useful and useless. A plain suffix
+    /// match means a note filed against `auth.rs` fires for `vendor/other/auth.rs`, and a
+    /// note that surfaces on the wrong file is worse than no note at all -- it is a
+    /// confident claim about code it was never about.
+    pub fn notes_for_path(&self, project_id: i64, abs_path: &str) -> Result<Vec<Note>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT DISTINCT {}
+               FROM notes n JOIN note_paths np ON np.note_id = n.id
+              WHERE n.project_id = ?1
+                AND (?2 = np.path OR ?2 LIKE '%/' || np.path)
+              ORDER BY n.updated_at DESC, n.id DESC",
+            NOTE_COLS.split(", ").map(|c| format!("n.{c}")).collect::<Vec<_>>().join(", ")
+        ))?;
+        let mut notes = st.query_map(params![project_id, abs_path], row_to_note)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for n in &mut notes {
+            n.paths = self.note_paths(n.id)?;
+        }
+        Ok(notes)
+    }
 }

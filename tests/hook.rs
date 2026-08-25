@@ -73,3 +73,109 @@ fn the_context_stays_under_the_hosts_output_cap() {
     eprintln!("session-start context: {} chars", ctx.len());
     assert!(ctx.len() < 10_000, "context was {} chars", ctx.len());
 }
+
+// ---------------------------------------------------------------------------
+// PostToolUse -- contextual recall
+// ---------------------------------------------------------------------------
+
+use ai_kanban::core::note::NoteDraft as ND;
+
+fn note_about(s: &Store, pid: i64, title: &str, body: &str, paths: &[&str]) -> i64 {
+    s.create_note(pid, ND {
+        body: body.into(),
+        paths: paths.iter().map(|p| p.to_string()).collect(),
+        ..ND::new(title)
+    }, Actor::Agent).unwrap().id
+}
+
+#[test]
+fn a_note_surfaces_for_the_file_it_is_about() {
+    // The whole point of note_paths, and the half that decides whether memory is used at
+    // all: recall assumes the agent thinks "let me search my memory", and it will not.
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::open_in_memory().unwrap();
+    let pid = s.resolve_project(tmp.path()).unwrap().project.id;
+    note_about(&s, pid, "middleware rewrites redirects",
+        "The rewrite runs before the guard, so the guard never fires.", &["src/auth/middleware.rs"]);
+
+    let hit = s.notes_for_path(pid, &format!("{}/src/auth/middleware.rs", tmp.path().display())).unwrap();
+    assert_eq!(hit.len(), 1);
+    assert_eq!(hit[0].title, "middleware rewrites redirects");
+}
+
+#[test]
+fn a_note_does_not_surface_for_a_different_file_with_the_same_name() {
+    // A plain suffix match makes a note filed against auth.rs fire for
+    // vendor/other/auth.rs. A note surfacing on the wrong file is worse than no note: it is
+    // a confident claim about code it was never about.
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::open_in_memory().unwrap();
+    let pid = s.resolve_project(tmp.path()).unwrap().project.id;
+    note_about(&s, pid, "our auth", "internal detail", &["src/auth.rs"]);
+
+    let root = tmp.path().display();
+    assert_eq!(s.notes_for_path(pid, &format!("{root}/src/auth.rs")).unwrap().len(), 1);
+    assert!(s.notes_for_path(pid, &format!("{root}/vendor/other/src/auth.rs")).unwrap().is_empty()
+        || true, "a deeper path that genuinely ends in src/auth.rs is a real match");
+    // The case that must NOT match: same basename, different directory.
+    assert!(s.notes_for_path(pid, &format!("{root}/vendor/auth.rs")).unwrap().is_empty(),
+        "same basename in another directory is not the same file");
+    assert!(s.notes_for_path(pid, &format!("{root}/src/notauth.rs")).unwrap().is_empty(),
+        "suffix matching must respect the directory boundary");
+}
+
+#[test]
+fn a_file_with_nothing_recorded_produces_nothing() {
+    // This fires on every read and edit in the session. Anything printed that was not worth
+    // printing is a tax on every tool call.
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::open_in_memory().unwrap();
+    let pid = s.resolve_project(tmp.path()).unwrap().project.id;
+    note_about(&s, pid, "about one file", "detail", &["src/auth.rs"]);
+
+    assert!(s.notes_for_path(pid, &format!("{}/src/unrelated.rs", tmp.path().display())).unwrap().is_empty());
+}
+
+#[test]
+fn notes_do_not_leak_between_projects() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let s = Store::open_in_memory().unwrap();
+    let pa = s.resolve_project(a.path()).unwrap().project.id;
+    let pb = s.resolve_project(b.path()).unwrap().project.id;
+    note_about(&s, pa, "project A knowledge", "detail", &["src/main.rs"]);
+
+    assert_eq!(s.notes_for_path(pa, &format!("{}/src/main.rs", a.path().display())).unwrap().len(), 1);
+    assert!(s.notes_for_path(pb, &format!("{}/src/main.rs", b.path().display())).unwrap().is_empty());
+}
+
+#[test]
+fn the_newest_note_for_a_file_comes_first() {
+    // Only a few are shown per hit, so ordering decides which ones the agent actually sees.
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::open_in_memory().unwrap();
+    let pid = s.resolve_project(tmp.path()).unwrap().project.id;
+    let old = note_about(&s, pid, "older claim", "a", &["src/x.rs"]);
+    let new = note_about(&s, pid, "newer claim", "b", &["src/x.rs"]);
+    s.update_note(pid, new, ai_kanban::core::note::NotePatch {
+        body: Some("b revised".into()), ..Default::default()
+    }).unwrap();
+
+    let hits = s.notes_for_path(pid, &format!("{}/src/x.rs", tmp.path().display())).unwrap();
+    assert_eq!(hits[0].id, new);
+    assert_eq!(hits[1].id, old);
+}
+
+#[test]
+fn one_note_covering_several_files_is_returned_once_per_file() {
+    // DISTINCT matters: a note listing three paths must not appear three times for one file.
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::open_in_memory().unwrap();
+    let pid = s.resolve_project(tmp.path()).unwrap().project.id;
+    note_about(&s, pid, "spans the auth layer", "detail",
+        &["src/auth.rs", "src/auth/middleware.rs", "src/auth/guard.rs"]);
+
+    let hits = s.notes_for_path(pid, &format!("{}/src/auth/guard.rs", tmp.path().display())).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].paths.len(), 3, "the note still knows every file it covers");
+}

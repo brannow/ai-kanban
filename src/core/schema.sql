@@ -10,6 +10,11 @@
 --    which breaks cross-project recall where hits from several projects interleave.
 --    It would also need SELECT MAX()+1 under a transaction; multiple sessions write
 --    concurrently under WAL, and that races. rowid autoincrement does not.
+--  * Every ORDER BY on a timestamp carries an `id` tie-break. Timestamps are whole
+--    seconds, so anything created in the same second ties -- and a hundred rows written
+--    in one second is not a corner case, it is a seeded board or a busy minute. SQLite
+--    then returns tied rows in whatever order it likes, which makes listings unstable
+--    between calls and tests flaky in a way that looks like a logic bug.
 --  * Enumerations use CHECK constraints rather than free TEXT so a wrong value fails
 --    loudly at write time. The adapter turns the failure into a message listing the
 --    valid values, per the design law that errors self-correct.
