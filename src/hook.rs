@@ -202,7 +202,7 @@ fn build_file_context() -> Option<String> {
 
     let now = crate::core::now();
     let shown = fresh.iter().take(MAX_NOTES);
-    let mut out = format!("Recorded previously about {}:\n", short_path(&file));
+    let mut out = format!("Recorded previously about {}:\n", short_path(&file, &start_dir(&input)));
     for n in shown {
         out.push_str(&format!("\nnote #{} \"{}\"  ({})\n", n.id, n.title, render::age(now, n.updated_at)));
         if !n.body.is_empty() {
@@ -265,8 +265,16 @@ fn is_safe_id(s: &str) -> bool {
     s.len() <= 128 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// Trims an absolute path to something readable. The agent knows which repo it is in; the
-/// leading /Users/someone/code/ is noise repeated on every hit.
-fn short_path(p: &str) -> &str {
-    p.rsplit_once('/').map(|(_, f)| f).filter(|_| p.len() > 60).unwrap_or(p)
+/// Trims an absolute path to something readable: relative to the project when it is inside
+/// it, otherwise unchanged.
+///
+/// Relative rather than a bare basename, because `note.rs` is ambiguous in any repo with
+/// more than one, and relative rather than a length threshold, because how noisy a prefix is
+/// has nothing to do with how many characters it happens to be.
+fn short_path<'a>(path: &'a str, root: &std::path::Path) -> &'a str {
+    let root = root.to_string_lossy();
+    path.strip_prefix(root.as_ref())
+        .map(|r| r.trim_start_matches('/'))
+        .filter(|r| !r.is_empty())
+        .unwrap_or(path)
 }

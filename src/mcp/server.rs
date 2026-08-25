@@ -33,7 +33,8 @@ use crate::core::task::{TaskDraft, TaskPatch};
 use crate::core::{Error, Store};
 use crate::render;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{tool, tool_router, ErrorData};
+use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -239,7 +240,7 @@ pub struct LogParams {
 // Tools
 // ---------------------------------------------------------------------------
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl AiKanban {
     /// Show the board: what is in flight, what is blocked and why, and what happened
     /// recently. Call this when starting work on a project to find out where things stand.
@@ -399,5 +400,36 @@ impl AiKanban {
         let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
         store.log_on(resolved.project.id, p.task, Actor::Agent, &p.body).map_err(fail)?;
         Ok(format!("Board: {}\n\nrecorded.\n", resolved.project.name))
+    }
+}
+
+/// Written out rather than left to the macro so the server can carry `instructions`.
+///
+/// Instructions are a **second adoption channel**, independent of hooks: the client receives
+/// them at initialize and they reach the model without anything having to fire, be enabled,
+/// or be chosen. If the hooks are ever disabled, this is what is left, so it says the same
+/// thing in fewer words rather than describing the API.
+#[tool_handler]
+impl ServerHandler for AiKanban {
+    fn get_info(&self) -> ServerInfo {
+        // Both ServerInfo and Implementation are #[non_exhaustive], so they are built
+        // through their constructors and then adjusted.
+        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+        info.server_info = Implementation::from_build_env();
+        info.server_info.name = "ai-kanban".into();
+        info.server_info.version = env!("CARGO_PKG_VERSION").into();
+        info.instructions = Some(
+            "A kanban board that is this project's memory across sessions.\n\n\
+             Call `board` when you start work on a project to see what is in flight, what is \
+             blocked and why, and what happened recently.\n\n\
+             File a task as soon as you notice something worth doing -- an unrelated bug, a \
+             TODO, a side quest -- rather than carrying it or dropping it. When you move a \
+             task, say why: what changed is recoverable from the diff, why it changed is not. \
+             Record what you work out about the codebase as a note, with the files it \
+             concerns. Before debugging something that feels familiar, try `recall` -- it \
+             searches other projects too."
+                .into(),
+        );
+        info
     }
 }

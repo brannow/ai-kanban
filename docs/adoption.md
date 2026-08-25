@@ -152,38 +152,45 @@ cargo build --release          # produces target/release/ai-kanban
 claude plugin validate .
 ```
 
-> **Today this plugin is in-place only, not copy-installable.**
->
-> Both configs point at `${CLAUDE_PLUGIN_ROOT}/target/release/ai-kanban`, and `target/` is
-> gitignored — so any install that *copies* the repo (a marketplace entry,
-> `claude plugin install`) lands without the binary. Discovery in place works, which is why
-> validation and local testing pass and hide this.
->
-> The failure is also asymmetric. The hook degrades silently by design, but a plugin MCP
-> server that cannot spawn surfaces a visible connection error — so the "never fail loudly"
-> rule does not cover the half that actually breaks.
->
-> Making it distributable means shipping a built binary per platform.
->
-> The obvious cheaper fix — point both configs at a bare `ai-kanban` and let `PATH` find it —
-> was tried and reverted. `cargo install --path .` puts the binary in `~/.cargo/bin`, which
-> is not on `PATH` on every machine (it is not on this one; rust here comes from Homebrew).
-> A hook that cannot find its binary at all is strictly worse than one that only works when
-> the plugin is discovered in place.
+The plugin lives at `.claude/skills/ai-kanban/`, **inside this repository**. A folder in a
+project's `.claude/skills/` that contains a `.claude-plugin/plugin.json` loads as
+`ai-kanban@skills-dir` (`reference/skills.md:150`), gated by the workspace trust dialog.
 
-### Running it against this repo
-
-Skills-directory discovery loads a plugin **in place** rather than copying it, which is
-exactly what the in-place constraint needs:
+So the only setup for this repo is:
 
 ```sh
 cargo build --release
-ln -sfn "$PWD" ~/.claude/skills/ai-kanban     # loads as ai-kanban@skills-dir next session
 ```
 
-Undo with `rm ~/.claude/skills/ai-kanban`, or turn it off with
-`claude plugin disable ai-kanban@skills-dir`. Discovery happens at session start, so it does
-not appear in `claude plugin list` until the next session.
+The plugin is discovered at session start, so it does not appear in `claude plugin list`
+until the next session. Turn it off with `claude plugin disable ai-kanban@skills-dir`.
+
+### Why project-local, and not `~/.claude/skills`
+
+A global install needs the plugin directory to *be* the repo, so the binary at
+`target/release/` is reachable — which means symlinking the whole repository into
+`~/.claude/skills`, dragging a 757MB `target/`, 208 vendored reference files and `.git` into
+a directory scanned at session start. Symlinking it *inside* the repo instead would be a
+symlink loop.
+
+A real directory holding three small files avoids both. It is 12K, it travels with the repo,
+and `${CLAUDE_PLUGIN_ROOT}/../../../target/release/ai-kanban` reaches the binary.
+
+> **This is the dogfooding setup, not the distribution story.** It makes ai-kanban work *on
+> ai-kanban*. Using it in another repository still needs a real install, and that is still
+> unsolved: `target/` is gitignored, so any copy-install lands without a binary. The obvious
+> cheaper fix — a bare `ai-kanban` found on `PATH` — was tried and reverted, because
+> `cargo install` puts it in `~/.cargo/bin`, which is not on `PATH` on every machine (it is
+> not on this one; rust here is from Homebrew). A hook that cannot find its binary at all is
+> strictly worse than one that only works where it is checked out. Distribution needs
+> per-platform prebuilt binaries.
+
+## `instructions` — the channel that needs no hook
+
+The MCP server sends `instructions` at initialize. They reach the model without any hook
+firing, being enabled, or being chosen, so they are what remains if the hooks are ever turned
+off. They say the same thing as the `SessionStart` guidance in fewer words, rather than
+describing the API — the client already has the tool list for that.
 
 The MCP server config deliberately does **not** live in a root `.mcp.json`. That file is also
 Claude Code's project-scoped MCP config, so a contributor working in this repo with the
