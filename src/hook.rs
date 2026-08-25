@@ -58,14 +58,6 @@ with the files it concerns. That is knowledge that would otherwise die with this
   - About to debug something that feels familiar? Check recall first -- you may have \
 already solved it here or on another project.";
 
-/// Emitted when the user has a store but no board for this directory yet.
-///
-/// Without it a fresh project is completely silent, and the agent has no reason to start
-/// using a board that does not visibly exist. One line is the whole budget: this fires in
-/// every directory, and the fastest way to get a hook uninstalled is to make it chatty.
-const NO_BOARD: &str = "No ai-kanban board for this project yet. Tasks and notes you record \
-here (task_add, note_add) will persist across sessions and be waiting next time.";
-
 #[derive(Debug, Default)]
 struct HookInput {
     cwd: Option<String>,
@@ -120,9 +112,13 @@ fn build_context() -> Option<String> {
 /// The part worth testing, separated from the environment it normally reads.
 pub fn context_for(store: &Store, start: &std::path::Path) -> Option<String> {
     // Lookup, never resolve: this runs in every directory the user opens Claude Code in.
-    let Some(project) = store.find_project(start).ok()? else {
-        return Some(NO_BOARD.to_string());
-    };
+    //
+    // No board means nothing to say. A "you could start a board here" nudge was tried and
+    // dropped: the store exists as soon as ai-kanban is used once, so from then on that line
+    // would appear in every directory forever -- $HOME, /tmp, an unpacked tarball, someone
+    // else's clone. Chattiness is what gets a hook uninstalled, and the agent can already
+    // see the tools exist without being told.
+    let project = store.find_project(start).ok()??;
 
     let snap = store.board(project.id, &BoardQuery::board()).ok()?;
     let board = render::board(&snap);

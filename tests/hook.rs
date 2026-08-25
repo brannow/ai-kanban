@@ -27,15 +27,15 @@ fn a_known_board_arrives_with_its_state_and_what_to_do_with_it() {
 }
 
 #[test]
-fn an_unknown_directory_does_not_get_a_board_minted_for_it() {
-    // This is the property that keeps the store meaningful. Without it, every scratch
-    // folder and tarball the user opens Claude Code in becomes a project.
+fn a_directory_with_no_board_produces_nothing_at_all() {
+    // Two properties in one. The hook must not mint a board -- otherwise every scratch
+    // folder and tarball opened in Claude Code becomes a project. And it must stay silent
+    // rather than suggest starting one: the store exists after the first use of ai-kanban,
+    // so any nudge here would appear in every directory forever.
     let tmp = tempfile::tempdir().unwrap();
     let s = Store::open_in_memory().unwrap();
 
-    let ctx = hook::context_for(&s, tmp.path()).unwrap();
-
-    assert!(ctx.contains("No ai-kanban board"));
+    assert!(hook::context_for(&s, tmp.path()).is_none(), "nothing to say means say nothing");
     assert!(s.all_projects().unwrap().is_empty(), "the hook must not create anything");
 }
 

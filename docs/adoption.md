@@ -66,11 +66,17 @@ scratch folder, tarball and dotfiles checkout — turning the store into a recor
 user has been rather than what they work on. Hence `find_project` and `open_existing`, which
 look up and never insert.
 
-**It must never fail loudly.** A hook that prints an error on every session start gets
-deleted, and it takes the bundled MCP server with it. Every failure path exits 0 in silence.
-The one exception is a user who has a store but no board for this directory: they get a
-single line saying a board would persist, because complete silence gives a fresh project no
-reason to ever start using one.
+**It must never fail loudly, or speak when it has nothing to say.** A hook that prints an
+error on every session start gets deleted, and it takes the bundled MCP server with it.
+Every failure path exits 0 in silence, and so does every directory with no board.
+
+That second half was a deliberate reversal. A one-line "you could start a board here" nudge
+looked harmless and solved the cold-start problem — a fresh project is otherwise completely
+silent. But the store comes into existence the first time ai-kanban is used at all, so from
+that point the line would appear in **every** directory, forever: `$HOME`, `/tmp`, an
+unpacked tarball, someone else's clone. That is exactly the chattiness this document says
+gets hooks uninstalled, and the agent can already see the tools exist from `tools/list`
+without being told. Cold start is left to the tool descriptions.
 
 ---
 
