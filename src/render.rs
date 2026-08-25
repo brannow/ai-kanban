@@ -17,13 +17,20 @@
 use crate::core::event::status_transition;
 use crate::core::model::*;
 
-/// Age as a parenthetical, e.g. `(3mo old)` or `(just now)`.
+/// `ago` returns a bare duration ("3mo") for old things but a complete phrase ("just now")
+/// for recent ones. These two wrap it so callers never staple a suffix onto the phrase and
+/// produce "just now old" or "filed just now ago".
 ///
-/// Exists because `ago` returns a bare duration for old things but the phrase "just now"
-/// for recent ones, so appending " old" unconditionally produces "just now old".
+/// Age of a thing: `3mo old` / `just now`.
 pub fn age(now: i64, ts: i64) -> String {
     let a = ago(now, ts);
     if a == "just now" { a } else { format!("{a} old") }
+}
+
+/// Time since an event: `3mo ago` / `just now`.
+pub fn since(now: i64, ts: i64) -> String {
+    let a = ago(now, ts);
+    if a == "just now" { a } else { format!("{a} ago") }
 }
 
 /// Relative age. Absolute timestamps would be noise: what matters is "is this stale",
@@ -131,7 +138,7 @@ pub fn task_detail(d: &TaskDetail) -> String {
     let t = &d.task;
     let mut out = format!("Board: {}\n\n#{} {}\n", d.project.name, t.id, t.title);
     let mut meta = vec![t.status.to_string(), t.task_type.to_string(), format!("{} priority", t.priority), t.origin.to_string()];
-    meta.push(format!("filed {} ago", ago(d.now, t.created_at)));
+    meta.push(format!("filed {}", since(d.now, t.created_at)));
     out.push_str(&format!("  {}\n", meta.join(", ")));
 
     if !t.body.is_empty() {
@@ -225,7 +232,7 @@ pub fn project_summaries(sums: &[ProjectSummary], total: usize, now: i64) -> Str
     }
     let mut out = format!("{} board{}\n", total, plural(total));
     for s in sums {
-        let when = s.last_activity.map(|t| ago(now, t)).unwrap_or_else(|| "never".into());
+        let when = s.last_activity.map(|t| since(now, t)).unwrap_or_else(|| "never".into());
         out.push_str(&format!("\n{}  ({} open, last active {})\n", s.project.name, s.open, when));
         for t in &s.doing {
             out.push_str(&format!("  doing  #{} {}\n", t.id, truncate(&t.title, 45)));
