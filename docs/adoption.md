@@ -163,9 +163,27 @@ claude plugin validate .
 > server that cannot spawn surfaces a visible connection error — so the "never fail loudly"
 > rule does not cover the half that actually breaks.
 >
-> Making it distributable means shipping a built binary per platform, or pointing both
-> configs at an `ai-kanban` already on `PATH` (`cargo install --path .`) and accepting that
-> the plugin then depends on a separate install step.
+> Making it distributable means shipping a built binary per platform.
+>
+> The obvious cheaper fix — point both configs at a bare `ai-kanban` and let `PATH` find it —
+> was tried and reverted. `cargo install --path .` puts the binary in `~/.cargo/bin`, which
+> is not on `PATH` on every machine (it is not on this one; rust here comes from Homebrew).
+> A hook that cannot find its binary at all is strictly worse than one that only works when
+> the plugin is discovered in place.
+
+### Running it against this repo
+
+Skills-directory discovery loads a plugin **in place** rather than copying it, which is
+exactly what the in-place constraint needs:
+
+```sh
+cargo build --release
+ln -sfn "$PWD" ~/.claude/skills/ai-kanban     # loads as ai-kanban@skills-dir next session
+```
+
+Undo with `rm ~/.claude/skills/ai-kanban`, or turn it off with
+`claude plugin disable ai-kanban@skills-dir`. Discovery happens at session start, so it does
+not appear in `claude plugin list` until the next session.
 
 The MCP server config deliberately does **not** live in a root `.mcp.json`. That file is also
 Claude Code's project-scoped MCP config, so a contributor working in this repo with the
