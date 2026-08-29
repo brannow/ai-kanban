@@ -50,8 +50,8 @@ dependency, and it works on Windows.
 
 **`FileChanged` is the wrong event for contextual recall.** Its `matcher` builds a *literal
 filename watch list* in the working directory (`hooks.md:2764`) — it exists for config files,
-not for noticing which source file the agent just opened. `PostToolUse` matching `Read|Edit`
-is the right shape, since it receives `tool_input.file_path`.
+not for noticing which source file the agent just opened. `PostToolUse` is the right shape,
+since it receives `tool_input.file_path`.
 
 **Hook output is capped at 10,000 characters** (`hooks.md:893`), and past it the text is
 replaced with a preview and a file path. The board's own caps are what keep this comfortable;
@@ -89,8 +89,23 @@ search my memory", and it will not — it will hit a bug and start debugging.
 
 This is what `note_paths` was in the schema for, and it now has its consumer.
 
+**The matcher is `Read|Edit|Write|Bash`, and `Bash` is the half that was missing.** The
+obvious matcher is `Read|Edit|Write`, and it was wrong for a reason that took dogfooding to
+see: agents mostly do not read files with `Read`. This project's own `CLAUDE.md` tells them to
+use `cat`, `sed` and `grep`, and Claude Code's auto mode does too. So contextual recall fired
+on a minority of reads and stayed silent on the rest — the worst possible failure for a memory
+system, because nothing indicates it is being skipped.
+
+`Bash` gets no `file_path`, only `command`. The fix is to pull candidate paths out of the
+command string and keep the ones that resolve to real files. The parsing is deliberately
+crude — split on whitespace and shell separators, drop flags, discard anything that is not a
+file on disk. **The existence check is the only filter that matters**; understanding shell
+properly would be a lot of code to slightly reduce the number of `stat` calls, and would still
+be wrong on the first construct nobody anticipated. Measured at ~4ms per invocation, bounded
+to 40 tokens and 4 files so a heredoc cannot turn into work.
+
 Three things make the difference between help and irritation, since this fires on **every**
-file read and edit:
+file read, edit, and shell command:
 
 **Path matching respects directory boundaries.** Stored paths are usually repo-relative
 (`src/auth.rs`); the hook receives an absolute path. A stored path matches when it is the

@@ -64,6 +64,8 @@ These are ai-kanban's MCP tools; your tool list shows them under a longer namesp
 struct HookInput {
     cwd: Option<String>,
     file_path: Option<String>,
+    /// Bash's `tool_input` carries this instead of `file_path`. See `paths_in_command`.
+    command: Option<String>,
     session_id: Option<String>,
 }
 
@@ -76,6 +78,7 @@ fn read_input() -> HookInput {
         Ok(v) => HookInput {
             cwd: v.get("cwd").and_then(|c| c.as_str()).map(String::from),
             file_path: v.pointer("/tool_input/file_path").and_then(|c| c.as_str()).map(String::from),
+            command: v.pointer("/tool_input/command").and_then(|c| c.as_str()).map(String::from),
             session_id: v.get("session_id").and_then(|c| c.as_str()).map(String::from),
         },
         Err(_) => HookInput::default(),
@@ -152,6 +155,13 @@ pub fn context_for(store: &Store, start: &std::path::Path) -> Option<String> {
 /// an interruption.
 const MAX_NOTES: usize = 3;
 
+/// How many distinct files one shell command is examined for, and how many of its tokens are
+/// considered. Both bound work that happens on **every** `Bash` call in a session; a
+/// generated command or a heredoc can be arbitrarily long, and no useful command names five
+/// files worth reporting on at once.
+const MAX_COMMAND_PATHS: usize = 4;
+const MAX_COMMAND_TOKENS: usize = 40;
+
 /// Runs the `PostToolUse` hook: surfaces what is known about the file just touched.
 ///
 /// # Why this event, and not `FileChanged`
@@ -181,42 +191,192 @@ pub fn post_tool_use() {
 
 fn build_file_context() -> Option<String> {
     let input = read_input();
-    let file = input.file_path.clone()?;
+    // Cheapest possible bail, before opening anything: this fires on every matched tool call.
+    if input.file_path.is_none() && input.command.is_none() {
+        return None;
+    }
     let store = Store::open_existing().ok()??;
-    let project = store.find_project(&start_dir(&input)).ok()??;
+    let start = start_dir(&input);
+    let files = files_touched(&input, &start);
+    file_context(&store, &start, &files, input.session_id.as_deref())
+}
 
-    let notes = store.notes_for_path(project.id, &file).ok()?;
-    if notes.is_empty() {
+/// The part worth testing, separated from stdin and the environment.
+///
+/// `session` scopes the already-shown record; `None` disables it, which is what tests want.
+pub fn file_context(
+    store: &Store, start: &std::path::Path, files: &[String], session: Option<&str>,
+) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    // No board here means nothing to say, whatever the command touched.
+    let project = store.find_project(start).ok()??;
+
+    // Normalise both sides here rather than trusting the caller, because the two arrive in
+    // different forms: the host hands `Read` the path as the agent wrote it, while extraction
+    // from a shell command canonicalises in order to test existence. On macOS that difference
+    // is visible -- `/var` resolves to `/private/var` -- and an uncanonicalised root then
+    // fails to strip from a canonicalised file, so the header prints a full absolute path
+    // where it should print a repo-relative one.
+    let root = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    let files: Vec<String> = files.iter().map(|f| canonical_str(f)).collect();
+    let files = &files;
+
+    // Kept grouped by file rather than merged into one list: a note is a claim about a
+    // specific file, and which file is most of what makes it actionable.
+    let mut groups: Vec<(&String, Vec<crate::core::model::Note>)> = Vec::new();
+    for f in files {
+        let Ok(notes) = store.notes_for_path(project.id, f) else { continue };
+        if !notes.is_empty() {
+            groups.push((f, notes));
+        }
+    }
+    if groups.is_empty() {
         return None;
     }
 
     // Suppress notes already shown this session. Reading the same file five times must not
     // deliver the same paragraph five times -- that is the behaviour that makes a hook feel
     // like nagging rather than help.
-    let seen = SeenNotes::for_session(input.session_id.as_deref());
-    let fresh: Vec<_> = notes.iter().filter(|n| !seen.contains(n.id)).collect();
-    if fresh.is_empty() {
-        return None;
-    }
-    seen.record(fresh.iter().map(|n| n.id));
+    let seen = SeenNotes::for_session(session);
 
     let now = crate::core::now();
-    let shown = fresh.iter().take(MAX_NOTES);
-    let mut out = format!("Recorded previously about {}:\n", short_path(&file, &start_dir(&input)));
-    for n in shown {
-        out.push_str(&format!("\nnote #{} \"{}\"  ({})\n", n.id, n.title, render::age(now, n.updated_at)));
-        if !n.body.is_empty() {
-            out.push_str(&format!("  {}\n", n.body.replace('\n', "\n  ")));
+    let mut out = String::new();
+    let mut shown = 0usize;
+    let mut withheld = 0usize;
+    let mut recorded: Vec<i64> = Vec::new();
+
+    for (file, notes) in &groups {
+        let fresh: Vec<_> = notes.iter().filter(|n| !seen.contains(n.id)).collect();
+        if fresh.is_empty() {
+            continue;
         }
+        // The cap is on the whole message, not per file. One shell command touching four
+        // documented files must not cost four times as much as reading one.
+        let room = MAX_NOTES.saturating_sub(shown);
+        if room == 0 {
+            withheld += fresh.len();
+            continue;
+        }
+
+        out.push_str(&format!("Recorded previously about {}:\n", short_path(file, &root)));
+        for n in fresh.iter().take(room) {
+            out.push_str(&format!("\nnote #{} \"{}\"  ({})\n", n.id, n.title, render::age(now, n.updated_at)));
+            if !n.body.is_empty() {
+                out.push_str(&format!("  {}\n", n.body.replace('\n', "\n  ")));
+            }
+            shown += 1;
+        }
+        withheld += fresh.len().saturating_sub(room);
+        // Everything fresh is marked seen, including what did not fit. Showing it on the
+        // next tool call would be the same interruption, one step later.
+        recorded.extend(fresh.iter().map(|n| n.id));
     }
-    if fresh.len() > MAX_NOTES {
-        out.push_str(&format!("\n...and {} more for this file (recall to see them)\n", fresh.len() - MAX_NOTES));
+
+    if shown == 0 {
+        return None;
+    }
+    seen.record(recorded.into_iter());
+
+    if withheld > 0 {
+        out.push_str(&format!("\n...and {withheld} more (recall to see them)\n"));
     }
     // Named here because this is the moment the agent can act on it: it is looking at the
     // code the claim is about. Stale memory the agent trusts is worse than no memory, and
     // nothing else in the system decides when a note stops being true.
     out.push_str("\nIf any of this is now wrong, correct it with note_update.");
     Some(out)
+}
+
+/// Files a shell command appears to touch.
+///
+/// # Why this exists
+///
+/// `PostToolUse` hands `Read`, `Edit` and `Write` a `tool_input.file_path`. It hands `Bash` a
+/// `command` string and nothing else. So a matcher of `Read|Edit|Write` misses every file an
+/// agent opens with `cat`, `sed`, `head` or `grep` -- and that is not a corner case: this
+/// project's own `CLAUDE.md` tells agents to read that way, and Claude Code's auto mode does
+/// too. Half of contextual recall was silently not firing, which is worse than it not
+/// existing, because nothing indicates the memory is being skipped.
+///
+/// # Why the parsing is deliberately dumb
+///
+/// Split on whitespace and shell separators, drop flags and punctuation, keep whatever
+/// resolves to a real file. There is no attempt to understand redirects, quoting, expansion
+/// or which argument of which command is an input.
+///
+/// That is not laziness, it is where the filtering actually happens: **the existence check is
+/// the only filter that matters.** A token that is not a file on disk is discarded, so the
+/// cost of a sloppy candidate is one `canonicalize` call. Parsing shell properly would be a
+/// large amount of code to slightly reduce the number of stat calls, and would still be wrong
+/// on the first command that used a construct nobody thought of.
+///
+/// The false positive it does admit -- a path named in a command that never read it, like
+/// `rm old.rs` -- surfaces what is known about a file the agent is acting on. That is not the
+/// wrong moment to say it.
+pub fn paths_in_command(command: &str, cwd: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    for (checked, raw) in command
+        .split(|c: char| c.is_whitespace() || matches!(c, '|' | ';' | '&' | '<' | '>' | '(' | ')'))
+        .filter(|t| !t.is_empty())
+        .enumerate()
+    {
+        // Bounded twice: a heredoc or a generated command can be enormous, and this runs on
+        // every shell call in the session.
+        if out.len() >= MAX_COMMAND_PATHS || checked >= MAX_COMMAND_TOKENS {
+            break;
+        }
+        let tok = raw.trim_matches(|c| matches!(c, '"' | '\'' | ',' | ':'));
+        // Flags, and anything long enough to be content rather than a path.
+        if tok.is_empty() || tok.starts_with('-') || tok.len() > 256 {
+            continue;
+        }
+        // Cheap narrowing before touching the filesystem. Every path has one or the other;
+        // most shell noise (`-n`, `HEAD~1`, `install`) has neither.
+        if !tok.contains('/') && !tok.contains('.') {
+            continue;
+        }
+
+        let joined = if std::path::Path::new(tok).is_absolute() {
+            PathBuf::from(tok)
+        } else {
+            cwd.join(tok)
+        };
+        // `canonicalize` proves existence and normalises `./` and `..` in one syscall. The
+        // stored note paths are matched as suffixes, so resolving symlinks here is harmless.
+        let Ok(abs) = std::fs::canonicalize(&joined) else { continue };
+        if !abs.is_file() {
+            continue;
+        }
+        let abs = abs.to_string_lossy().into_owned();
+        if !out.contains(&abs) {
+            out.push(abs);
+        }
+    }
+    out
+}
+
+/// The files this tool call touched, however the host chose to describe them.
+///
+fn files_touched(input: &HookInput, cwd: &std::path::Path) -> Vec<String> {
+    if let Some(f) = &input.file_path {
+        return vec![f.clone()];
+    }
+    match &input.command {
+        Some(c) => paths_in_command(c, cwd),
+        None => Vec::new(),
+    }
+}
+
+/// Canonical form, or the input unchanged when it cannot be resolved. Falling back rather
+/// than dropping: a path that does not resolve may still match a note by suffix, and this
+/// adapter's job is to say something useful, not to be strict.
+fn canonical_str(p: &str) -> String {
+    std::fs::canonicalize(p)
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| p.to_string())
 }
 
 /// Per-session record of which notes have already been surfaced.

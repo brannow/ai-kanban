@@ -69,7 +69,7 @@ Apply it to every change to the tool surface. Details and worked examples in
 ## Commands
 
 ```sh
-cargo test                      # 90 tests
+cargo test                      # 99 tests
 cargo test --test budget -- --nocapture   # prints measured token costs
 cargo build --release           # the plugin's hook and MCP configs both need this
 claude plugin validate .claude/skills/ai-kanban   # the plugin is project-local
