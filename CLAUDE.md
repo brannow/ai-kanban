@@ -37,6 +37,7 @@ Apply it to every change to the tool surface. Details and worked examples in
 | `docs/data-model.md` | Schema and why each column exists. Read before changing `schema.sql`. |
 | `docs/tool-design.md` | The agent-facing surface and its response shapes. |
 | `docs/adoption.md` | Hooks and the plugin — the load-bearing risk. |
+| `docs/http-api.md` | The human-facing API and live updates. Designed, not built. |
 | `docs/architecture.md` | Layering, the store, durability, dependencies. |
 | `docs/plan.md` | Founding record. Superseded by the above where they disagree. |
 
@@ -48,8 +49,19 @@ Apply it to every change to the tool surface. Details and worked examples in
   read or overwrite another board's row.
 - **Every `ORDER BY` on a timestamp needs an `id` tie-break.** Timestamps are whole seconds,
   so rows written in the same second tie and order arbitrarily.
+- **`schema.sql` is frozen at v1. Schema changes are migrations** (`src/core/migrations/`,
+  registered in `src/core/migrate.rs`). Editing both the schema file and adding a migration
+  writes every change twice and lets a fresh store drift from an upgraded one.
+- **A column list used by a shared `row_to_*` lives in exactly one place.** `TASK_COLS` was
+  once duplicated across two files that fed the same row mapper; adding a column to one
+  shifts every index after it and reads fields into the wrong struct members.
 - **Response caps are asserted in `tests/budget.rs`.** Widening one without updating that
   test is how the board quietly becomes too expensive to use.
+- **Every mutation writes an event.** The events table is also the change feed the HTTP live
+  stream polls (`MAX(events.id)`), so a write with no event is invisible to a live page.
+  `tests/change_feed.rs` asserts it for every mutation. Infrastructure events go in
+  `HOUSEKEEPING_KINDS`, which keeps them out of the agent's `recent` without hiding them
+  from the feed.
 - **Hook code must never write, never create, and never fail loudly.** It runs in every
   directory the user opens Claude Code in.
 - Comments explain *why*. What the code does is already visible.
@@ -57,10 +69,10 @@ Apply it to every change to the tool surface. Details and worked examples in
 ## Commands
 
 ```sh
-cargo test                      # 61 tests
+cargo test                      # 90 tests
 cargo test --test budget -- --nocapture   # prints measured token costs
 cargo build --release           # the plugin's hook and MCP configs both need this
-claude plugin validate .
+claude plugin validate .claude/skills/ai-kanban   # the plugin is project-local
 ```
 
 **Set `AI_KANBAN_DB` when running anything by hand.** Without it you are writing to your real

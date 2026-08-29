@@ -34,9 +34,11 @@ pub struct NotePatch {
     pub tags: Option<Vec<String>>,
     pub paths: Option<Vec<String>>,
     pub actor: Actor,
+    /// See `TaskPatch::expected_version` -- same contract, same reason it is optional.
+    pub expected_version: Option<i64>,
 }
 
-const NOTE_COLS: &str = "id, project_id, task_id, title, body, tags, created_at, updated_at";
+const NOTE_COLS: &str = "id, project_id, task_id, title, body, tags, created_at, updated_at, version";
 
 fn row_to_note(r: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
     let tags: String = r.get(5)?;
@@ -50,6 +52,7 @@ fn row_to_note(r: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
         paths: Vec::new(), // filled by hydrate_paths
         created_at: r.get(6)?,
         updated_at: r.get(7)?,
+        version: r.get(8)?,
     })
 }
 
@@ -76,7 +79,7 @@ impl Store {
         )?;
         let id = self.conn.last_insert_rowid();
         self.set_note_paths(id, &draft.paths)?;
-        self.write_event(project_id, draft.task_id, actor, "note_added", &draft.title)?;
+        self.write_event_for(project_id, draft.task_id, Some(id), actor, "note_added", &draft.title)?;
         self.note(project_id, id)
     }
 
@@ -104,17 +107,24 @@ impl Store {
         let body = patch.body.clone().unwrap_or_else(|| before.body.clone());
         let tags = patch.tags.clone().unwrap_or_else(|| before.tags.clone());
 
-        self.conn.execute(
-            "UPDATE notes SET title=?2, body=?3, tags=?4, updated_at=?5 WHERE id=?1",
-            params![id, title, body, join_tags(&tags), now()],
+        let changed = self.conn.execute(
+            "UPDATE notes SET title=?2, body=?3, tags=?4, updated_at=?5, version = version + 1
+              WHERE id=?1 AND (?6 IS NULL OR version = ?6)",
+            params![id, title, body, join_tags(&tags), now(), patch.expected_version],
         )?;
+        if changed == 0 {
+            let actual = self.note(project_id, id)?.version;
+            return Err(Error::Conflict { id, expected: patch.expected_version.unwrap_or(0), actual });
+        }
         if let Some(paths) = &patch.paths {
             self.set_note_paths(id, paths)?;
         }
 
         let previous = if before.body.is_empty() { before.title.clone() } else { before.body.clone() };
-        self.write_event(
-            before.project_id, before.task_id, patch.actor, "note_updated",
+        // `Some(id)` is what makes this removable later: the body below embeds the note's
+        // previous content, so without the reference it is text nothing can ever find again.
+        self.write_event_for(
+            before.project_id, before.task_id, Some(id), patch.actor, "note_updated",
             &format!("note #{id} \"{}\" -- was: {}", before.title, truncate(&previous, 400)),
         )?;
         self.note(project_id, id)

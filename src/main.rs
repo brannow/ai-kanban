@@ -19,8 +19,13 @@ USAGE:
     ai-kanban where                Print the path to the store
     ai-kanban --help
 
-The store is a single SQLite file. Back it up by copying it.
-Override its location with AI_KANBAN_DB.
+The store is a single SQLite file, but it runs in WAL mode, so recent work lives in a
+`-wal` sidecar until it is checkpointed. Copying `kanban.db` on its own can therefore
+silently leave the newest tasks and notes behind. Back it up with:
+
+    sqlite3 \"$(ai-kanban where)\" \".backup /path/to/backup.db\"
+
+Override the store location with AI_KANBAN_DB.
 ";
 
 #[tokio::main]

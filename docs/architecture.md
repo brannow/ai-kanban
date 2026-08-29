@@ -61,9 +61,29 @@ atomic. It handles requests concurrently, so a client that *pipelines* several c
 awaiting each one may see them applied in a different order than sent. Real clients await
 each response; the ordering is worth knowing about rather than defending against.
 
-Hook subcommands open the store **read-only** and skip the schema batch entirely. They run in
-every directory the user opens Claude Code in, under a host timeout, and must not be able to
-write, migrate, or block.
+Hook subcommands open the store **read-only** and skip migrations entirely. They run in every
+directory the user opens Claude Code in, under a host timeout, and must not be able to write,
+migrate, or block. The cost of that is a store newer than the binary's read queries, which
+`migrate::is_readable` turns into silence rather than an error.
+
+Rows carry a `version` that every update bumps, and updates may pass the version they read
+(`expected_version`) to make the write a compare-and-swap. The MCP path omits it — an agent's
+read and write are milliseconds apart inside one tool call, and requiring it would turn every
+update into two calls. The HTTP API always sends it, because a browser form open for minutes
+is precisely the lost-update case. See `docs/http-api.md`.
+
+## Schema versioning
+
+`PRAGMA user_version`, with `src/core/schema.sql` frozen as the version-1 baseline and every
+later change a numbered migration in `src/core/migrations/`.
+
+Frozen matters: keeping the schema file current *and* writing a migration means every change
+is written twice, and the two can disagree — at which point a fresh install differs from an
+upgraded one, and the resulting bug depends on when the user first ran the tool.
+
+Migrations run only from `Store::open`, each atomic with its own version stamp (SQLite has
+transactional DDL, so a failed migration leaves the previous version rather than something
+in between).
 
 ## Durability — stated out loud
 
@@ -71,8 +91,15 @@ write, migrate, or block.
 versioned, and does not travel between machines. Said plainly here so it is a decision rather
 than something discovered after a disk failure.
 
-- **Backup is a copy:** `cp "$(ai-kanban where)" ~/backups/`
-- **`export` / `import`:** roadmap.
+- **Backup is `.backup`, not `cp`:**
+  `sqlite3 "$(ai-kanban where)" ".backup ~/backups/kanban.db"`
+
+  This doc previously said to copy the file. Under WAL that silently loses recent work: the
+  newest writes sit in a `-wal` sidecar until a checkpoint, so a plain `cp` of `kanban.db`
+  restores a board that is missing everything since the last checkpoint, with no error. It
+  was found for real — a live store's main file was four days and six tasks behind its WAL.
+- **`export` / `import`:** roadmap (#2), and the proper fix for the above. Nobody should have
+  to know what a WAL is to keep their own history.
 - **Multi-machine sync: deliberately out of scope for v1.** A desktop and a laptop are two
   disjoint memories — the same split-memory failure `project_paths` prevents within a
   machine, recurring at machine level. Naming it is not solving it, but an unnamed version of

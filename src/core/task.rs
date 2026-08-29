@@ -51,6 +51,22 @@ pub struct TaskPatch {
     /// worth reading six months later.
     pub log: Option<String>,
     pub actor: Actor,
+    /// The `version` the caller read, if it read one. `Some` makes the write a
+    /// compare-and-swap that fails with `Error::Conflict` rather than overwriting a change
+    /// it never saw.
+    ///
+    /// It is **optional on purpose**, and the two consumers answer it differently.
+    ///
+    /// The HTTP API always sends it: a browser form sits open for minutes while an agent
+    /// works the same board, so a blind write there is a lost update waiting to happen
+    /// (`docs/http-api.md`).
+    ///
+    /// The MCP agent sends `None`. Requiring a version would mean every `task_update` had
+    /// to be preceded by a `task_show` to fetch one, turning one call into two -- and "one
+    /// call per intent" is the rule the entire tool surface is built on. The exposure it
+    /// accepts is small and bounded: an agent's read and write sit inside a single tool
+    /// call milliseconds apart, and the MCP server serialises its own writes behind a mutex.
+    pub expected_version: Option<i64>,
 }
 
 impl TaskPatch {
@@ -61,7 +77,7 @@ impl TaskPatch {
     }
 }
 
-const TASK_COLS: &str = "id, project_id, title, body, status, type, origin, priority, blocked_by, created_at, updated_at";
+pub(crate) const TASK_COLS: &str = "id, project_id, title, body, status, type, origin, priority, blocked_by, created_at, updated_at, version";
 
 pub(crate) fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
@@ -76,6 +92,7 @@ pub(crate) fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         blocked_by: r.get(8)?,
         created_at: r.get(9)?,
         updated_at: r.get(10)?,
+        version: r.get(11)?,
     })
 }
 
@@ -163,10 +180,21 @@ impl Store {
         let task_type = patch.task_type.unwrap_or(before.task_type);
         let blocked_by = match patch.blocked_by { Some(v) => v, None => before.blocked_by };
 
-        self.conn.execute(
-            "UPDATE tasks SET title=?2, body=?3, status=?4, type=?5, priority=?6, blocked_by=?7, updated_at=?8 WHERE id=?1",
-            params![id, title, body, status, task_type, priority, blocked_by, ts],
+        // `?9 IS NULL OR version = ?9` keeps the guarded and unguarded writes on one
+        // statement: a caller that read a version gets a compare-and-swap, one that did not
+        // gets the plain update. Two statements would be two chances to fix a bug once.
+        let changed = self.conn.execute(
+            "UPDATE tasks SET title=?2, body=?3, status=?4, type=?5, priority=?6, blocked_by=?7, updated_at=?8,
+                    version = version + 1
+              WHERE id=?1 AND (?9 IS NULL OR version = ?9)",
+            params![id, title, body, status, task_type, priority, blocked_by, ts, patch.expected_version],
         )?;
+        if changed == 0 {
+            // The row exists -- `self.task()` above proved it is here and on this board --
+            // so the only way to match nothing is the version guard.
+            let actual = self.task(project_id, id)?.version;
+            return Err(Error::Conflict { id, expected: patch.expected_version.unwrap_or(0), actual });
+        }
 
         // One event per call, not one per field. Per-field events would bury the reason in
         // noise; the reason is the part worth keeping.

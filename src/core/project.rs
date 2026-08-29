@@ -137,16 +137,35 @@ impl Store {
             rusqlite::params![key, name, now()],
         )?;
         let p = self.project_by_key(key)?.expect("just inserted");
+        // A board coming into existence is history, and it is also a change the HTTP live
+        // stream has to see -- it polls MAX(events.id), so a new project that wrote no event
+        // would simply never appear until something else happened on it.
+        self.write_event(p.id, None, crate::core::model::Actor::System, "project_created", name)?;
         Ok((p, true))
     }
 
     /// Idempotent: a path already claimed by another project is left alone rather than
     /// stolen. Silently reassigning would move history out from under the other board.
     pub fn add_path_alias(&self, project_id: i64, path: &Path) -> Result<()> {
-        self.conn.execute(
+        let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO project_paths (path, project_id, created_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![path.to_string_lossy(), project_id, now()],
         )?;
+        // Only when a path is genuinely new. `INSERT OR IGNORE` reports 0 rows for a path
+        // already known -- which is most calls, since this runs on every resolve -- so the
+        // event fires once per path rather than once per session.
+        //
+        // Recorded because alias learning is the mechanism that keeps a board from splitting
+        // in two, and until now it happened with no trace at all: if a directory ended up
+        // attached to the wrong board there was nothing saying when, or from where. It is
+        // filtered out of the agent's `recent` (see `HOUSEKEEPING_KINDS`) -- this is for the
+        // history and the live stream, not for the board.
+        if inserted > 0 {
+            self.write_event(
+                project_id, None, crate::core::model::Actor::System,
+                "path_learned", &path.to_string_lossy(),
+            )?;
+        }
         Ok(())
     }
 

@@ -20,6 +20,14 @@ A kanban board whose first-class consumer is an **agent**, not a human. A person
 and update it, but the agent is the primary user, and every design decision resolves in the
 agent's favour when the two conflict.
 
+**One exception, and it is a real amendment to priority #1.** A person can *forget* a task or
+a note — permanently, along with its history. No agent can. It exists because the alternative
+turned out to be worse: `update_note` keeps the previous body so superseded facts stay
+recoverable, event bodies are searchable, and the result was that nothing could ever be
+removed from the store at all. Overwriting a note preserved exactly what you were trying to
+replace. A memory with no way to forget is not a feature, and the store is global across every
+project on the machine. See `docs/http-api.md`.
+
 That inversion is the point. A board built for humans optimises for at-a-glance overview,
 drag-and-drop, and reporting. A board built for an agent optimises for: one call per
 intention, responses complete enough to need no follow-up, and a token cost low enough that

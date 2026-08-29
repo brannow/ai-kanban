@@ -31,6 +31,11 @@ pub enum Error {
     #[error("could not determine a project directory")]
     NoProjectContext,
 
+    /// Someone else changed the row between the caller reading it and writing it back.
+    /// Carries both versions so the caller can say what happened rather than just refusing.
+    #[error("#{id} changed since you read it (you had v{expected}, it is now v{actual})")]
+    Conflict { id: i64, expected: i64, actual: i64 },
+
     #[error("{0}")]
     Other(String),
 }

@@ -1,4 +1,13 @@
--- ai-kanban schema (v1)
+-- ai-kanban schema -- BASELINE (version 1). See `migrate.rs`.
+--
+-- THIS FILE IS FROZEN. Do not add columns or tables here; add a migration instead.
+-- A schema file that keeps changing means a freshly created store and a migrated one
+-- can drift apart, and that difference shows up as a bug nobody can reproduce because
+-- it depends on when the user first ran the tool.
+--
+-- The connection pragmas (journal_mode=WAL, foreign_keys=ON) are deliberately NOT here.
+-- They are set in `Store::init`, because `PRAGMA journal_mode=WAL` fails when it runs
+-- inside a transaction and migrations run inside one.
 --
 -- Conventions, stated once so nothing below has to re-explain itself:
 --
@@ -18,9 +27,6 @@
 --  * Enumerations use CHECK constraints rather than free TEXT so a wrong value fails
 --    loudly at write time. The adapter turns the failure into a message listing the
 --    valid values, per the design law that errors self-correct.
-
-PRAGMA journal_mode = WAL;      -- concurrent sessions across projects, no daemon
-PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS projects (
     id          INTEGER PRIMARY KEY,

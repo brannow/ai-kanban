@@ -146,12 +146,15 @@ impl Store {
     ///
     /// `created` and `note_added` events are excluded. Their bodies are copies of the task
     /// or note title, so including them makes every entity match twice: once as itself and
-    /// once as an event repeating its own name. That is pure duplication in a response
+    /// once as an event repeating its own name. Housekeeping kinds go too: a `path_learned`
+    /// body is a filesystem path, so searching for a directory name would return the record
+    /// of visiting it instead of the work done there. That is pure duplication in a response
     /// whose budget is the thing keeping the board cheap enough to use. The event kinds
     /// that survive are the ones carrying reasoning the entity does not already hold --
     /// status transitions, logs, and the previous value of an edited note.
     fn recall_events(&self, m: &str, project: Option<i64>, limit: usize) -> Result<Vec<RecallHit>> {
-        let mut st = self.conn.prepare(
+        let housekeeping = crate::core::event::housekeeping_filter().replace("kind", "e.kind");
+        let mut st = self.conn.prepare(&format!(
             "SELECT e.id, p.name, COALESCE(t.title, ''),
                     snippet(events_fts, 0, '>>', '<<', '...', 20),
                     e.ts, events_fts.rank, e.task_id
@@ -160,9 +163,9 @@ impl Store {
                JOIN projects p ON p.id = e.project_id
                LEFT JOIN tasks t ON t.id = e.task_id
               WHERE events_fts MATCH ?1 AND (?2 IS NULL OR e.project_id = ?2)
-                AND e.kind NOT IN ('created', 'note_added')
-              ORDER BY events_fts.rank, e.id DESC LIMIT ?3",
-        )?;
+                AND e.kind NOT IN ('created', 'note_added') AND {housekeeping}
+              ORDER BY events_fts.rank, e.id DESC LIMIT ?3"
+        ))?;
         let rows = st.query_map(params![m, project, limit as i64], |r| {
             let task_id: Option<i64> = r.get(6)?;
             let title: String = r.get(2)?;

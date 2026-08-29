@@ -114,6 +114,16 @@ detect is precisely the one that will not bother. The count is biased in the fla
 direction. The honest signal is task *content*: did the board fill with things nobody
 asked for?
 
+`version` starts at 1 and increments on every update. It exists because `updated_at` cannot
+do this job: timestamps are whole seconds, and same-second writes are routine here — it is
+why every `ORDER BY` in this schema carries an `id` tie-break. A guard of
+`WHERE updated_at = <what I read>` therefore passes for a second writer that committed inside
+the same second, which is the exact case a guard is for. A counter has no such window. Notes
+carry the same column for the same reason.
+
+Passing it is **optional**, and the two consumers differ: the HTTP API always sends it, the
+MCP agent never does. The reasoning is in `docs/http-api.md` and on `TaskPatch::expected_version`.
+
 ### `events`
 
 Append-only. A NULL `task_id` means project-level history — a decision, a session summary —

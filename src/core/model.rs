@@ -127,6 +127,9 @@ pub struct Task {
     pub blocked_by: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Bumped on every update. The token a caller passes back to prove it is changing the
+    /// row it actually read -- see `TaskPatch::expected_version`.
+    pub version: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +154,8 @@ pub struct Note {
     pub paths: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Bumped on every update. See `NotePatch::expected_version`.
+    pub version: i64,
 }
 
 // ---------------------------------------------------------------------------

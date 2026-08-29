@@ -24,11 +24,45 @@ fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     })
 }
 
+/// Events that record how the **store** changed, not how the **work** changed.
+///
+/// They are written because the events table is the change feed the HTTP live stream polls
+/// (`docs/http-api.md`): a mutation that writes no event is invisible to it. They are kept
+/// out of the agent's `recent` section because that is eight lines of the most expensive
+/// space in the product, and "learned path /Users/x/repo/src/core" is not what an agent
+/// asking "what happened here lately" means.
+///
+/// `path_learned` in particular fires the first time a board is used from any new
+/// subdirectory, so left unfiltered it would both bury real history and -- through
+/// `last_activity` -- make an untouched project report as recently active.
+pub(crate) const HOUSEKEEPING_KINDS: &[&str] = &["path_learned"];
+
+/// Built from the list above rather than written out, so the two cannot drift. The values
+/// are compile-time constants, never caller input, so inlining them is safe.
+pub(crate) fn housekeeping_filter() -> String {
+    let list = HOUSEKEEPING_KINDS.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(", ");
+    format!("kind NOT IN ({list})")
+}
+
 impl Store {
     pub fn write_event(&self, project_id: i64, task_id: Option<i64>, actor: Actor, kind: &str, body: &str) -> Result<i64> {
+        self.write_event_for(project_id, task_id, None, actor, kind, body)
+    }
+
+    /// `write_event` plus the note the event is about.
+    ///
+    /// Only note events pass a `note_id`, and they must: it is how `forget_note` finds the
+    /// history to remove. A `note_updated` body embeds the note's previous body verbatim, so
+    /// an event with no note reference is content that can never be located again, let alone
+    /// deleted. See migration 003.
+    pub(crate) fn write_event_for(
+        &self, project_id: i64, task_id: Option<i64>, note_id: Option<i64>,
+        actor: Actor, kind: &str, body: &str,
+    ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO events (project_id, task_id, ts, actor, kind, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![project_id, task_id, now(), actor, kind, body],
+            "INSERT INTO events (project_id, task_id, note_id, ts, actor, kind, body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![project_id, task_id, note_id, now(), actor, kind, body],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -60,14 +94,18 @@ impl Store {
     /// "what changed lately", not the whole story.
     pub fn recent_events(&self, project_id: i64, limit: usize) -> Result<Vec<Event>> {
         let mut st = self.conn.prepare(&format!(
-            "SELECT {EVENT_COLS} FROM events WHERE project_id = ?1 ORDER BY ts DESC, id DESC LIMIT ?2"
+            "SELECT {EVENT_COLS} FROM events WHERE project_id = ?1 AND {}
+              ORDER BY ts DESC, id DESC LIMIT ?2",
+            housekeeping_filter()
         ))?;
         Ok(st.query_map(params![project_id, limit as i64], row_to_event)?.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Drives "last active 3d ago" in project summaries, so it asks about *work*. Counting
+    /// housekeeping here would make a project an agent merely walked through look busy.
     pub fn last_activity(&self, project_id: i64) -> Result<Option<i64>> {
         Ok(self.conn.query_row(
-            "SELECT MAX(ts) FROM events WHERE project_id = ?1",
+            &format!("SELECT MAX(ts) FROM events WHERE project_id = ?1 AND {}", housekeeping_filter()),
             [project_id],
             |r| r.get::<_, Option<i64>>(0),
         )?)

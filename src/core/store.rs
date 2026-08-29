@@ -1,8 +1,7 @@
 use crate::core::error::{Error, Result};
+use crate::core::migrate;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
-
-const SCHEMA: &str = include_str!("schema.sql");
 
 /// Owns the connection and the schema. One global DB; projects are rows, not files.
 pub struct Store {
@@ -50,8 +49,18 @@ impl Store {
         // Wait rather than fail when another session holds the write lock. Multiple
         // concurrent agent sessions are the normal case, not the exception.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.execute_batch(SCHEMA)?;
+        // Creates the schema on a new store and upgrades an old one. This is the only place
+        // that happens -- see `migrate.rs` for why the read-only path must not.
+        migrate::run(&conn)?;
         Ok(Self { conn })
+    }
+}
+
+impl Store {
+    /// This store's schema version. `docs/http-api.md` has `/api/meta` reporting it, and it
+    /// is the first thing worth knowing about a store that is behaving oddly.
+    pub fn schema_version(&self) -> Result<i64> {
+        Ok(self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
     }
 }
 
@@ -74,10 +83,11 @@ impl Store {
     /// Two deliberate differences from `open`:
     ///
     /// * `SQLITE_OPEN_READ_ONLY`, so a write is impossible rather than merely unintended.
-    /// * The schema batch is **not** run. It is a no-op against an up-to-date store today,
-    ///   but the moment a real migration is added it would execute at session start, in
-    ///   every directory, under the host's hook timeout. Migrations belong in the paths that
-    ///   already intend to write.
+    /// * Migrations are **not** run. They would execute at session start, in every directory
+    ///   the user opens Claude Code in, under the host's hook timeout -- and they write.
+    ///   Migrations belong in the paths that already intend to write. The cost is that this
+    ///   path can meet a store older than its own queries, which `migrate::is_readable`
+    ///   turns into silence.
     pub fn open_existing() -> Result<Option<Self>> {
         let path = Self::default_path()?;
         if !path.exists() {
@@ -90,6 +100,12 @@ impl Store {
         // Still worth waiting briefly: a reader can block behind a checkpoint. Kept well
         // under the hook timeout so a stall ends in silence rather than a killed process.
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
+        // A store older than this binary's read queries is reported as "nothing to read",
+        // so the caller stays silent instead of running a query against a column that is
+        // not there yet. It cannot be fixed here: this path must never write.
+        if !migrate::is_readable(&conn)? {
+            return Ok(None);
+        }
         Ok(Some(Self { conn }))
     }
 }

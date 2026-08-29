@@ -14,9 +14,10 @@
 use crate::core::error::Result;
 use crate::core::model::*;
 use crate::core::store::{now, Store};
-use crate::core::task::row_to_task;
-
-const TASK_COLS: &str = "id, project_id, title, body, status, type, origin, priority, blocked_by, created_at, updated_at";
+// One column list, shared with the task layer. It was duplicated here, which is a quiet
+// trap: both files hand rows to the same `row_to_task`, so a column added to one list and
+// not the other shifts every index after it and reads the wrong field into the wrong place.
+use crate::core::task::{row_to_task, TASK_COLS};
 
 impl Store {
     /// The snapshot. Always carries its project, so the agent never has to guess which

@@ -43,6 +43,12 @@ use std::sync::{Arc, Mutex};
 /// The literal an agent passes to search or list every board.
 const ALL: &str = "all";
 
+// There is deliberately no `forget` tool, and its absence is a decision rather than an
+// oversight. `Store::forget_task` / `forget_note` destroy history permanently; that is a
+// human act, exposed only over HTTP. An agent that can delete history is an agent that can
+// cover its own tracks, on a board whose whole purpose is that the record survives. The
+// agent's answer to a mistake stays `archive`, or an overwrite that keeps the old value.
+
 pub struct AiKanban {
     store: Arc<Mutex<Store>>,
     /// Captured once at startup. The server is spawned inside the project by the host, so
@@ -313,6 +319,8 @@ impl AiKanban {
             // survives an optional field, and inventing a magic string would be worse.
             blocked_by: p.blocked_by.map(|b| if b > 0 { Some(b) } else { None }),
             log: p.log.clone(),
+            // Unguarded, deliberately -- see `TaskPatch::expected_version`.
+            expected_version: None,
             actor: Actor::Agent,
         };
         store.update_task(resolved.project.id, p.task, patch).map_err(fail)?;
@@ -363,6 +371,9 @@ impl AiKanban {
             tags: csv(&p.tags),
             paths: csv(&p.paths),
             actor: Actor::Agent,
+            // Unguarded, deliberately. Requiring a version here would make every update a
+            // two-call sequence -- see `TaskPatch::expected_version`.
+            expected_version: None,
         };
         let note = store.update_note(resolved.project.id, p.note, patch).map_err(fail)?;
         Ok(format!("Board: {}\n\nnote #{} \"{}\" updated. The previous version is in the project history.\n",
