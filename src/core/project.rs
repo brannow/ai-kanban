@@ -120,6 +120,34 @@ impl Store {
         ).optional()?)
     }
 
+    /// A board named by key or by name, for consumers that have no directory to resolve
+    /// from -- the CLI, and the named half of the MCP adapter's `Scope`.
+    ///
+    /// Key is tried first and exactly: it is unique by construction, so an exact key match
+    /// is never ambiguous. Name is matched case-insensitively and may hit several boards
+    /// (two clones both called `api` is the normal way a split looks), and that is returned
+    /// as an ambiguity rather than resolved. Picking one silently would act on a board the
+    /// caller did not mean, and nothing downstream would ever surface it.
+    pub fn project_by_name_or_key(&self, query: &str) -> Result<Project> {
+        let q = query.trim();
+        if let Some(p) = self.project_by_key(q)? {
+            return Ok(p);
+        }
+        let all = self.all_projects()?;
+        let matches: Vec<&Project> = all.iter().filter(|p| p.name.eq_ignore_ascii_case(q)).collect();
+        match matches.len() {
+            1 => Ok(matches[0].clone()),
+            0 => Err(crate::core::Error::ProjectNotFound {
+                query: q.to_string(),
+                existing: all.iter().map(|p| p.name.clone()).collect(),
+            }),
+            _ => Err(crate::core::Error::AmbiguousProject {
+                query: q.to_string(),
+                candidates: matches.iter().map(|p| format!("{} ({})", p.name, p.key)).collect(),
+            }),
+        }
+    }
+
     pub fn all_projects(&self) -> Result<Vec<Project>> {
         let mut st = self.conn.prepare(
             "SELECT id, key, name, created_at FROM projects ORDER BY name, id",

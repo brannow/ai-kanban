@@ -7,6 +7,7 @@
 pub mod board;
 pub mod error;
 pub mod forget;
+pub mod merge;
 pub mod migrate;
 pub mod model;
 pub mod event;

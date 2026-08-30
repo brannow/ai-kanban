@@ -75,29 +75,19 @@ impl AiKanban {
             None => store.resolve_project(&self.cwd),
             Some(n) => {
                 let n = n.trim();
-                if let Some(p) = store.project_by_key(n)? {
-                    return Ok(Resolved { project: p, how: crate::core::project::Resolution::KnownPath, created: false });
-                }
-                let all = store.all_projects()?;
-                let matches: Vec<&Project> = all.iter().filter(|p| p.name.eq_ignore_ascii_case(n)).collect();
-                match matches.len() {
-                    1 => Ok(Resolved { project: matches[0].clone(), how: crate::core::project::Resolution::KnownPath, created: false }),
-                    // Ambiguity is never resolved silently -- picking one would write to a
-                    // board the agent did not mean, and nothing would surface it.
-                    n_matches if n_matches > 1 => Err(Error::AmbiguousProject {
-                        query: n.to_string(),
-                        candidates: matches.iter().map(|p| format!("{} ({})", p.name, p.key)).collect(),
-                    }),
-                    _ => {
-                        let path = PathBuf::from(n);
-                        if path.is_dir() {
-                            return store.resolve_project(&path);
-                        }
-                        Err(Error::ProjectNotFound {
-                            query: n.to_string(),
-                            existing: all.iter().map(|p| p.name.clone()).collect(),
-                        })
+                // Key and name matching lives in core, so the CLI and this agree on what
+                // "ambiguous" means. Ambiguity is never resolved silently in either --
+                // picking one would write to a board the caller did not mean, and nothing
+                // downstream would surface it.
+                match store.project_by_name_or_key(n) {
+                    Ok(p) => Ok(Resolved { project: p, how: crate::core::project::Resolution::KnownPath, created: false }),
+                    // A directory is the adapter's fallback, not core's: only a consumer
+                    // with a filesystem to stand in has any use for it, and unlike the
+                    // other two it may *create* a board.
+                    Err(Error::ProjectNotFound { .. }) if PathBuf::from(n).is_dir() => {
+                        store.resolve_project(&PathBuf::from(n))
                     }
+                    Err(e) => Err(e),
                 }
             }
         }

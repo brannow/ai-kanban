@@ -245,6 +245,70 @@ pub fn project_summaries(sums: &[ProjectSummary], total: usize, now: i64) -> Str
     out
 }
 
+/// The board listing for a **person** at a terminal, which is why it prints the key that
+/// `project_summaries` leaves out.
+///
+/// Two consumers, two renderers, for the same reason `docs/http-api.md` gives two limits:
+/// the agent pays for every character of `project_summaries` on calls it makes constantly,
+/// while this is a scrollable page someone asked for. And without the key this listing
+/// cannot do its job -- a split board is two rows with the *same name*, so a listing that
+/// shows only names makes the very thing it exists to reveal invisible, and leaves the
+/// reader with no string they can pass to `merge`.
+pub fn project_list(sums: &[ProjectSummary], now: i64) -> String {
+    if sums.is_empty() {
+        return "No boards yet.\n".to_string();
+    }
+    let mut out = format!("{} board{}\n", sums.len(), plural(sums.len()));
+    // Names that appear more than once are the signature of a split, so say so rather than
+    // leaving the reader to notice two identical-looking rows.
+    let mut seen = std::collections::HashMap::new();
+    for s in sums {
+        *seen.entry(s.project.name.to_lowercase()).or_insert(0usize) += 1;
+    }
+    for s in sums {
+        let when = s.last_activity.map(|t| since(now, t)).unwrap_or_else(|| "never".into());
+        out.push_str(&format!(
+            "\n{}  ({} open, last active {})\n  {}\n",
+            s.project.name, s.open, when, s.project.key
+        ));
+    }
+    let split: Vec<&String> = seen.iter().filter(|(_, n)| **n > 1).map(|(k, _)| k).collect();
+    if !split.is_empty() {
+        out.push_str(&format!(
+            "\nMore than one board is called {}. That is what a split board looks like: \n\
+             one project remembered as two half-memories. `ai-kanban merge <keep> <gone>` \n\
+             joins them -- name them by key, since the names collide.\n",
+            split.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    out
+}
+
+/// A merge is destructive and irreversible, so its report names what moved and states
+/// plainly that one board is gone. A count alone would leave the reader unsure whether the
+/// key they used to resolve against still works.
+pub fn merge_report(r: &crate::core::merge::MergeReport) -> String {
+    // A split board is two rows with the SAME name, which is the common case here -- so
+    // naming both sides by name alone would print "Merged widget into widget" exactly when
+    // the reader most needs to know which one went. Fall back to the key, which is unique.
+    let (gone, kept) = if r.merged.name.eq_ignore_ascii_case(&r.into.name) {
+        (r.merged.key.clone(), r.into.key.clone())
+    } else {
+        (r.merged.name.clone(), r.into.name.clone())
+    };
+    format!(
+        "Merged \"{gone}\" into \"{kept}\".\n\n\
+         Moved {} task{}, {} note{}, {} event{} and {} path{}.\n\
+         The board {} no longer exists, and every directory that pointed at it now resolves \
+         to \"{kept}\".\n",
+        r.tasks, plural(r.tasks),
+        r.notes, plural(r.notes),
+        r.events, plural(r.events),
+        r.paths, plural(r.paths),
+        r.merged.key,
+    )
+}
+
 /// An import reports what it wrote **and what it declined to write**. The second half is
 /// the one that matters: a skip here is silent in the data, so a run that restored nothing
 /// because every project already existed must not read as a success.

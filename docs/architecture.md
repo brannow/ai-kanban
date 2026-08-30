@@ -115,6 +115,18 @@ than something discovered after a disk failure.
   all of them. `import` restores boards that are not present and **refuses** to merge into
   one that is — see `src/core/transfer.rs`. Choosing which side of a divergent history wins
   is task #3, and answering it halfway inside an importer would leave two half-answers.
+- **A board that already split is repairable.** `project_paths` prevents splits; it does
+  nothing for one that already happened, and prevention alone is a one-way mitigation.
+  `ai-kanban merge <keep> <gone>` reparents tasks, notes, events and path aliases onto the
+  surviving board and deletes the other. Order is load-bearing — every child table cascades
+  on project delete and `tasks.blocked_by` is `ON DELETE SET NULL`, so deleting before
+  reparenting would silently drop exactly the cross-board references a split produces.
+
+  Scope is **two projects in one store**, where the id spaces are already disjoint and
+  nothing has to be renumbered. Merging two stores' histories of the same board is task #20
+  and is a genuinely different problem: ids collide meaninglessly and "both sides edited
+  task #7" has no answer in the data.
+
 - **Multi-machine sync: deliberately out of scope for v1.** A desktop and a laptop are two
   disjoint memories — the same split-memory failure `project_paths` prevents within a
   machine, recurring at machine level. Naming it is not solving it, but an unnamed version of

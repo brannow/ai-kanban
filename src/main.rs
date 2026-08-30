@@ -20,6 +20,8 @@ USAGE:
     ai-kanban backup <file>        Copy the whole store to one consistent file
     ai-kanban export [project...]  Write the store as JSON on stdout
     ai-kanban import <file>        Restore projects from an export
+    ai-kanban projects             List every board in the store
+    ai-kanban merge <keep> <gone>  Repair a board that split into two
     ai-kanban where                Print the path to the store
     ai-kanban --help
 
@@ -42,7 +44,22 @@ Override the store location with AI_KANBAN_DB.
 ";
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    // Core errors go through `render::error` here for the same reason the MCP and HTTP
+    // adapters do it: those messages state what went wrong, what exists instead, and what
+    // to do next. Letting `?` bubble a core error out of `main` prints the derived Debug
+    // form -- `AmbiguousProject { query: "widget", candidates: [...] }` -- which buries the
+    // list of candidates the person needs in Rust struct syntax.
+    if let Err(e) = run().await {
+        match e.downcast::<ai_kanban::core::Error>() {
+            Ok(core) => eprint!("{}", ai_kanban::render::error(&core)),
+            Err(other) => eprintln!("ai-kanban: {other}"),
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("mcp") => run_mcp().await,
         Some("serve") => {
@@ -98,6 +115,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let store = Store::open_default()?;
             let report = store.import(&data)?;
             print!("{}", ai_kanban::render::import_report(&report));
+            Ok(())
+        }
+        Some("projects") => {
+            let store = Store::open_default()?;
+            // No cap: the point of this listing is spotting a board that should not exist,
+            // and a truncated list is exactly where a split would hide.
+            let (sums, _) = store.project_summaries(usize::MAX)?;
+            print!("{}", ai_kanban::render::project_list(&sums, ai_kanban::core::now()));
+            Ok(())
+        }
+        Some("merge") => {
+            // Both boards are named explicitly, and the first one survives. A merge is
+            // irreversible and it deletes a board, so it must never be inferred from where
+            // the caller happens to be standing.
+            let (keep, gone) = (std::env::args().nth(2), std::env::args().nth(3));
+            let (Some(keep), Some(gone)) = (keep, gone) else {
+                eprintln!("usage: ai-kanban merge <board-to-keep> <board-to-merge-in>");
+                eprintln!("\nBoth are a board name or key -- `ai-kanban projects` lists them.");
+                std::process::exit(2);
+            };
+            let store = Store::open_default()?;
+            let into = store.project_by_name_or_key(&keep)?;
+            let from = store.project_by_name_or_key(&gone)?;
+            let report = store.merge_projects(into.id, from.id)?;
+            print!("{}", ai_kanban::render::merge_report(&report));
             Ok(())
         }
         Some("where") => {
