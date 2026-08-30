@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "ai-kanban": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/bin/ai-kanban",
-      "args": ["mcp"]
-    }
-  }
-}
