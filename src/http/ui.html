@@ -176,6 +176,17 @@ function ago(ts) {
   if (d < 31536000) return `${Math.round(d / 2592000)}mo`;
   return `${Math.round(d / 31536000)}y`;
 }
+// Absolute time, for the hover title. The relative number is the scannable one; this is
+// what you check when it surprises you.
+function when(ts) { return new Date(ts * 1000).toLocaleString(); }
+
+// The newest thing that happened on a task, which is NOT updated_at: a `log` entry records a
+// comment without touching the task row, deliberately -- the board sorts by updated_at, so
+// letting a remark bump it would float a task nobody actually moved to the top of a column.
+function lastActivity(events) {
+  return events && events.length ? Math.max(...events.map(e => e.ts)) : null;
+}
+
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 function fillSelect(el, values, selected) {
@@ -204,7 +215,7 @@ function render() {
           ${t.priority !== 'normal' ? `<span class="pri-${esc(t.priority)}">${esc(t.priority)}</span>` : ''}
           ${t.origin === 'user' ? '<span class="badge-user">user</span>' : ''}
           ${t.blocked_by ? `<span>blocked by #${t.blocked_by}</span>` : ''}
-          <span class="dim2">${ago(t.updated_at)}</span>
+          <span class="dim2" title="updated ${when(t.updated_at)}&#10;created ${when(t.created_at)}">upd ${ago(t.updated_at)}</span>
         </span>
       </div>`).join('');
     return `<div class="col ${esc(col.status)}">
@@ -231,7 +242,9 @@ async function openTask(id) {
       <button id="close">close</button>
     </div>
     <div class="m dim2" style="font-size:11px">
-      ${esc(t.task_type)} · ${esc(t.origin)} · filed ${ago(t.created_at)} ago · v${t.version}
+      ${esc(t.task_type)} · ${esc(t.origin)} · v${t.version}<br>
+      created ${ago(t.created_at)} ago · updated ${ago(t.updated_at)} ago${lastActivity(body.events) !== null
+        ? ` · last activity ${ago(lastActivity(body.events))} ago` : ''}
     </div>
 
     <section>
