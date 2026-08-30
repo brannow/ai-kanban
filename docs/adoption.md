@@ -181,16 +181,27 @@ cargo build --release
 The plugin is discovered at session start, so it does not appear in `claude plugin list`
 until the next session. Turn it off with `claude plugin disable ai-kanban@skills-dir`.
 
-### Why project-local, and not `~/.claude/skills`
+### Project-local here, personal everywhere else
 
-A global install needs the plugin directory to *be* the repo, so the binary at
-`target/release/` is reachable — which means symlinking the whole repository into
-`~/.claude/skills`, dragging a 757MB `target/`, 208 vendored reference files and `.git` into
-a directory scanned at session start. Symlinking it *inside* the repo instead would be a
-symlink loop.
+Both locations work, and they answer different questions:
 
-A real directory holding a few small files avoids both. It is 12K and it travels with the
-repo.
+| Location | Applies to | Trust dialog |
+|---|---|---|
+| `~/.claude/skills/ai-kanban/` | every project | no |
+| `<repo>/.claude/skills/ai-kanban/` | that repo | yes, once |
+
+This repository uses the project-local one, because the plugin is part of the thing being
+developed and should travel with it in version control. That is a dogfooding choice, not a
+constraint.
+
+It **was** a constraint, and the note is worth keeping because the reasoning is easy to
+re-derive wrongly. Before the resolver (task #1), both configs named
+`${CLAUDE_PLUGIN_ROOT}/../../../target/release/ai-kanban`, so the plugin directory had to
+sit inside the checkout for the binary to be reachable at all. A global install would have
+meant symlinking the whole repository into `~/.claude/skills` — a 757MB `target/`, 208
+vendored reference files and `.git`, in a directory scanned at session start — and
+symlinking it *inside* the repo would be a loop. The resolver removed that constraint
+entirely; nothing about the layout depends on it any more.
 
 ### How the binary is found
 
