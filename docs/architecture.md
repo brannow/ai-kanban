@@ -7,7 +7,7 @@ core  (SQLite + domain)  ──> structured data
   │     ├── MCP adapter    ──> the tools an agent calls        (shipped)
   │     └── hook adapter   ──> context the agent never asked for (shipped)
   │
-  └── HTTP API             ──> JSON for a web UI               (designed for, not built)
+  └── HTTP API             ──> JSON + web UI, for a human      (shipped)
 ```
 
 ## Why prose lives outside core
@@ -24,11 +24,13 @@ ai-kanban mcp                  MCP server on stdio -- what an agent connects to
 ai-kanban hook session-start   Board as SessionStart context
 ai-kanban hook post-tool-use   Notes about the file a tool just touched
 ai-kanban where                Path to the store
+ai-kanban serve [--port N]     Web UI + HTTP API on 127.0.0.1
 ```
 
 Subcommands rather than separate binaries because "little setup overhead" is the pitch: one
-file to install, one to update. `ai-kanban serve` (HTTP) will land here rather than in a
-second stack.
+file to install, one to update. `serve` landed here rather than in a second stack, and the
+web UI is embedded in the binary for the same reason — a page that needs its assets beside it
+is no longer one file.
 
 The hook subcommands speak Claude Code's hook protocol directly — hook JSON in on stdin, hook
 JSON out on stdout. `SessionStart` fires before the host finishes connecting to MCP servers,
@@ -116,13 +118,19 @@ Battle-tested crates by preference:
 | `tokio` | Required by the MCP transport. |
 | `thiserror` | The standard error-derive. |
 | `dirs` | Platform data directory. More widely used than the `directories` alternative. |
+| `axum` | The HTTP server. Same maintainers as `tokio`, which was already a dependency, and the most-used Rust web framework. |
+| `async-stream` | Writing the SSE stream as a generator rather than a hand-rolled `Stream` impl. |
 | `schemars` | Tool input schemas, required by `rmcp`. |
 | `rmcp` | **The deliberate exception.** New and not widely used, but it is the official Rust MCP SDK and there is no mature alternative. The core/adapter split is what limits the blast radius if it churns. |
 
 No date/time crate: timestamps are unix integers and "2h ago" is arithmetic.
 
-## The v1 boundary
+## What the layering actually bought
 
-Core is built with a clean structured API from day one, but only the MCP and hook adapters
-ship. HTTP is designed for, not built — and "designed for" means the layering makes it
-additive, not that a stub exists.
+The claim was that core returning structs rather than prose would make a second consumer
+additive. That is now tested rather than asserted: adding the whole HTTP API and web UI
+required **no change to any existing core function** — only new ones (`core::page`), because
+the old ones already returned objects.
+
+The measured proof is `tests/budget.rs`: the agent's response costs are byte-identical before
+and after the web UI exists. A second consumer cost the first one nothing.

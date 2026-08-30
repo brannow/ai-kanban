@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-stream = "0.3.6"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 dirs = "6.0.0"
 rmcp = { version = "3.1.4", features = ["macros", "schemars", "server", "transport-io"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
@@ -11,7 +13,8 @@ schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-std"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-std", "net", "sync"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }

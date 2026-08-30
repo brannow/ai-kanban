@@ -2,7 +2,7 @@
 //!
 //!   core ──> structured data
 //!     ├── MCP adapter  -> prose for agents
-//!     └── HTTP API     -> JSON for a web UI (designed for, not built)
+//!     └── HTTP API     -> JSON + the web UI, for a human
 
 pub mod board;
 pub mod error;
@@ -11,6 +11,7 @@ pub mod migrate;
 pub mod model;
 pub mod event;
 pub mod note;
+pub mod page;
 pub mod project;
 pub mod recall;
 pub mod task;

@@ -4,19 +4,11 @@ The second consumer. `docs/vision.md` names it: the agent gets MCP, the human ge
 API and a web UI on top of it. This document defines that API's shape and the decisions
 behind it, before any of it is built.
 
-Status: **designed, not built.**
+Status: **built.** `ai-kanban serve` runs it; the page is embedded in the binary.
 
-Done: schema migrations (#9) and the row-version concurrency guard (#10) — the two core
-changes that had to land before any of this could be built on.
-
-Still open, and none of it is optional:
-
-- **#13, code.** Three mutations write no event, so they would be invisible to the live
-  stream described below.
-- **#11, a decision.** Delete semantics. `events` cascades from `tasks`, so a delete button
-  wired straight through would destroy history.
-- **#12, a decision.** How the API names a project, given there is no ambient `cwd`. It
-  shapes every route, so it is settled before the first one is written, not after.
+Everything it depended on landed first: schema migrations (#9), the row-version concurrency
+guard (#10), delete semantics (#11), project resolution over HTTP (#12) and the rule that
+every mutation writes an event (#13).
 
 ## What makes this consumer different
 

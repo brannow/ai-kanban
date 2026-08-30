@@ -6,7 +6,7 @@
 //!     ├── render       -> prose, shared by every agent-facing adapter
 //!     ├── MCP adapter  -> the tools an agent calls
 //!     ├── hook adapter -> context injected without the agent asking
-//!     └── HTTP API     -> JSON for a web UI (designed for, not built)
+//!     └── HTTP API     -> JSON + the web UI, for a human
 //!
 //! Core never returns prose. That is not stylistic: the human's access to this data is
 //! meant to be an API, and text in core would force every future consumer to parse
@@ -14,5 +14,6 @@
 
 pub mod core;
 pub mod hook;
+pub mod http;
 pub mod mcp;
 pub mod render;

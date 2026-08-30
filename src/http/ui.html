@@ -1,0 +1,443 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ai-kanban</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1b1e24; --panel2: #21252c; --line: #2c313a;
+    --fg: #dfe3ea; --dim: #8a93a3; --dim2: #626b7a;
+    --accent: #6aa9ff; --user: #d19a66; --bug: #e06c75; --idea: #c678dd;
+    --chore: #56b6c2; --urgent: #e06c75; --high: #d19a66; --ok: #98c379;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9; --panel: #fff; --panel2: #f0f2f5; --line: #dde1e7;
+      --fg: #1c2027; --dim: #5c6472; --dim2: #8a93a3; --accent: #2f6fd0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    display: flex; gap: 12px; align-items: center; padding: 10px 14px;
+    border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 10; flex-wrap: wrap;
+  }
+  header h1 { font-size: 13px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  select, input, button, textarea {
+    font: inherit; background: var(--panel2); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 5px; padding: 4px 7px;
+  }
+  input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #07101f; border-color: var(--accent); font-weight: 600; }
+  button.danger:hover { border-color: var(--bug); color: var(--bug); }
+  .grow { flex: 1; }
+  .dim { color: var(--dim); }
+  .dim2 { color: var(--dim2); }
+  #live { font-size: 11px; color: var(--dim2); }
+  #live.on { color: var(--ok); }
+
+  #columns { display: flex; gap: 12px; padding: 14px; align-items: flex-start; overflow-x: auto; }
+  .col { flex: 1 1 0; min-width: 220px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+  .col > h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .08em; margin: 0;
+    padding: 9px 11px; border-bottom: 1px solid var(--line); color: var(--dim);
+    display: flex; justify-content: space-between;
+  }
+  .col.done > h2, .col.archived > h2 { opacity: .6; }
+  .cards { padding: 8px; display: flex; flex-direction: column; gap: 7px; min-height: 12px; }
+  .card {
+    background: var(--panel2); border: 1px solid var(--line); border-left-width: 3px;
+    border-radius: 6px; padding: 8px 10px; cursor: pointer;
+  }
+  .card:hover { border-color: var(--accent); }
+  .card .t { display: block; margin-bottom: 5px; word-break: break-word; }
+  .card .m { font-size: 11px; color: var(--dim2); display: flex; gap: 8px; flex-wrap: wrap; }
+  .card.bug { border-left-color: var(--bug); }
+  .card.idea { border-left-color: var(--idea); }
+  .card.chore { border-left-color: var(--chore); }
+  .card.task { border-left-color: var(--line); }
+  .pri-urgent { color: var(--urgent); font-weight: 600; }
+  .pri-high { color: var(--high); }
+  .badge-user { color: var(--user); }
+  .empty { padding: 10px; color: var(--dim2); font-size: 11px; }
+
+  #panel {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(620px, 100%);
+    background: var(--panel); border-left: 1px solid var(--line);
+    overflow-y: auto; padding: 16px 18px; z-index: 20;
+    box-shadow: -12px 0 32px rgba(0,0,0,.35);
+  }
+  #panel[hidden] { display: none; }
+  #panel h2 { font-size: 15px; margin: 0 0 4px; }
+  #panel section { margin-top: 18px; }
+  #panel h3 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--dim); margin: 0 0 8px; border-bottom: 1px solid var(--line); padding-bottom: 5px;
+  }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  pre.body {
+    white-space: pre-wrap; word-break: break-word; background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 6px; padding: 10px; margin: 0; font-size: 12px;
+  }
+  .ev { padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
+  .ev:last-child { border-bottom: 0; }
+  .ev .k { color: var(--accent); }
+  .note { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 9px; margin-bottom: 8px; }
+  .note .paths { font-size: 11px; color: var(--dim2); margin-top: 5px; word-break: break-all; }
+  .hit { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 9px; margin-bottom: 7px; }
+  .hit mark { background: transparent; color: var(--accent); font-weight: 600; }
+  #err {
+    position: fixed; bottom: 14px; left: 14px; z-index: 40; max-width: 520px;
+    background: var(--panel); border: 1px solid var(--bug); color: var(--bug);
+    border-radius: 6px; padding: 9px 12px; font-size: 12px;
+  }
+  #err[hidden] { display: none; }
+  dialog { background: var(--panel); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+  dialog::backdrop { background: rgba(0,0,0,.55); }
+  dialog input, dialog textarea, dialog select { width: 100%; margin-bottom: 8px; }
+</style>
+
+<header>
+  <h1>ai-kanban</h1>
+  <select id="project"></select>
+  <span id="live">connecting</span>
+  <span class="grow"></span>
+  <input id="search" placeholder="recall across boards…" size="26">
+  <button id="new">+ task</button>
+</header>
+
+<div id="columns"></div>
+<div id="panel" hidden></div>
+<div id="err" hidden></div>
+
+<dialog id="newdlg">
+  <form method="dialog">
+    <h3 style="margin-top:0">New task</h3>
+    <input name="title" placeholder="What needs doing" required autofocus>
+    <textarea name="body" rows="4" placeholder="Detail worth keeping: what you saw, where, why it matters"></textarea>
+    <div class="row">
+      <select name="type"></select>
+      <select name="priority"></select>
+      <select name="status"></select>
+    </div>
+    <div class="row" style="margin-top:10px; justify-content:flex-end">
+      <button value="cancel">Cancel</button>
+      <button value="ok" class="primary">File it</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+const $ = s => document.querySelector(s);
+let META = null, PROJECT = null, CURSOR = 0, BOARD = null, SKEW = 0, OPEN_TASK = null;
+
+// ---- helpers ---------------------------------------------------------------
+
+function fail(msg) {
+  const el = $('#err');
+  el.textContent = msg;
+  el.hidden = false;
+  clearTimeout(fail._t);
+  fail._t = setTimeout(() => { el.hidden = true; }, 6000);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, opts);
+  if (res.status === 204) return null;
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    const e = body && body.error || {};
+    let msg = e.message || `${res.status} ${res.statusText}`;
+    if (e.code === 'conflict') {
+      msg = 'Someone else changed this while you had it open. Reloading.';
+    } else if (e.valid) {
+      msg += ` — valid: ${e.valid.join(', ')}`;
+    }
+    const err = new Error(msg);
+    err.code = e.code;
+    err.etag = res.headers.get('etag');
+    throw err;
+  }
+  return { body, etag: res.headers.get('etag') };
+}
+
+// Raw timestamps come from the server with its `now`, so relative times tick here without
+// refetching. Mirrors render::ago on the Rust side.
+function ago(ts) {
+  let d = Math.floor(Date.now() / 1000) - SKEW - ts;
+  if (d < 45) return 'just now';
+  if (d < 5400) return `${Math.round(d / 60)}m`;
+  if (d < 86400) return `${Math.round(d / 3600)}h`;
+  if (d < 2592000) return `${Math.round(d / 86400)}d`;
+  if (d < 31536000) return `${Math.round(d / 2592000)}mo`;
+  return `${Math.round(d / 31536000)}y`;
+}
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function fillSelect(el, values, selected) {
+  el.innerHTML = values.map(v => `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(v)}</option>`).join('');
+}
+
+// ---- board -----------------------------------------------------------------
+
+async function loadBoard() {
+  if (!PROJECT) return;
+  const { body } = await api(`/api/projects/${PROJECT}/board`);
+  BOARD = body;
+  SKEW = Math.floor(Date.now() / 1000) - body.now;
+  CURSOR = body.cursor;
+  render();
+}
+
+function render() {
+  const b = BOARD;
+  $('#columns').innerHTML = b.columns.map(col => {
+    const cards = col.tasks.map(t => `
+      <div class="card ${esc(t.task_type)}" data-id="${t.id}">
+        <span class="t">#${t.id} ${esc(t.title)}</span>
+        <span class="m">
+          <span>${esc(t.task_type)}</span>
+          ${t.priority !== 'normal' ? `<span class="pri-${esc(t.priority)}">${esc(t.priority)}</span>` : ''}
+          ${t.origin === 'user' ? '<span class="badge-user">user</span>' : ''}
+          ${t.blocked_by ? `<span>blocked by #${t.blocked_by}</span>` : ''}
+          <span class="dim2">${ago(t.updated_at)}</span>
+        </span>
+      </div>`).join('');
+    return `<div class="col ${esc(col.status)}">
+      <h2><span>${esc(col.status)}</span><span>${col.total}</span></h2>
+      <div class="cards">${cards || '<div class="empty">nothing here</div>'}</div>
+    </div>`;
+  }).join('');
+
+  document.querySelectorAll('.card').forEach(c =>
+    c.onclick = () => openTask(Number(c.dataset.id)));
+}
+
+// ---- task detail -----------------------------------------------------------
+
+async function openTask(id) {
+  const { body, etag } = await api(`/api/projects/${PROJECT}/tasks/${id}`);
+  OPEN_TASK = { id, version: body.task.version, etag };
+  const t = body.task;
+
+  const statuses = META.statuses.map(s => s.value);
+  $('#panel').innerHTML = `
+    <div class="row" style="justify-content:space-between">
+      <h2>#${t.id} ${esc(t.title)}</h2>
+      <button id="close">close</button>
+    </div>
+    <div class="m dim2" style="font-size:11px">
+      ${esc(t.task_type)} · ${esc(t.origin)} · filed ${ago(t.created_at)} ago · v${t.version}
+    </div>
+
+    <section>
+      <div class="row">
+        <select id="st"></select>
+        <select id="pr"></select>
+        <input id="log" class="grow" placeholder="why (recorded in history)">
+        <button id="save" class="primary">save</button>
+      </div>
+    </section>
+
+    ${t.body ? `<section><h3>detail</h3><pre class="body">${esc(t.body)}</pre></section>` : ''}
+
+    ${body.blocker ? `<section><h3>blocked by</h3><div class="card" data-id="${body.blocker.id}">
+      <span class="t">#${body.blocker.id} ${esc(body.blocker.title)}</span></div></section>` : ''}
+
+    ${body.blocking.length ? `<section><h3>blocking</h3>${body.blocking.map(x =>
+      `<div class="card" data-id="${x.id}"><span class="t">#${x.id} ${esc(x.title)}</span></div>`).join('')}</section>` : ''}
+
+    ${body.notes.length ? `<section><h3>notes</h3>${body.notes.map(n => `
+      <div class="note">
+        <b>#${n.id} ${esc(n.title)}</b> <span class="dim2">${ago(n.updated_at)}</span>
+        ${n.body ? `<div style="margin-top:5px">${esc(n.body)}</div>` : ''}
+        ${n.paths.length ? `<div class="paths">${n.paths.map(esc).join(' · ')}</div>` : ''}
+      </div>`).join('')}</section>` : ''}
+
+    <section><h3>history</h3>${body.events.map(e => `
+      <div class="ev">
+        <span class="dim2">${ago(e.ts)}</span>
+        <span class="k">${esc(e.kind)}</span>
+        <span class="dim2">${esc(e.actor)}</span>
+        <div>${esc(e.body)}</div>
+      </div>`).reverse().join('') || '<div class="empty">nothing yet</div>'}
+    </section>
+
+    <section>
+      <h3>danger</h3>
+      <button id="forget" class="danger">forget permanently</button>
+      <div class="dim2" style="margin-top:6px; font-size:11px">
+        Deletes this task and its history. Notes written while working on it survive.
+        Not recoverable except from a backup.
+      </div>
+    </section>`;
+
+  fillSelect($('#st'), statuses, t.status);
+  fillSelect($('#pr'), META.priorities, t.priority);
+  $('#panel').hidden = false;
+  $('#close').onclick = () => { $('#panel').hidden = true; OPEN_TASK = null; };
+  $('#save').onclick = () => saveTask(id);
+  $('#forget').onclick = () => forgetTask(id, t.title);
+  $('#panel').querySelectorAll('.card').forEach(c =>
+    c.onclick = () => openTask(Number(c.dataset.id)));
+}
+
+async function saveTask(id) {
+  try {
+    await api(`/api/projects/${PROJECT}/tasks/${id}`, {
+      method: 'PATCH',
+      // The version this edit is based on. Without it the server refuses the write rather
+      // than silently overwriting a change made while the panel was open.
+      headers: { 'content-type': 'application/json', 'if-match': `"${OPEN_TASK.version}"` },
+      body: JSON.stringify({
+        status: $('#st').value,
+        priority: $('#pr').value,
+        log: $('#log').value || null,
+      }),
+    });
+    await loadBoard();
+    await openTask(id);
+  } catch (e) {
+    fail(e.message);
+    if (e.code === 'conflict') { await loadBoard(); await openTask(id); }
+  }
+}
+
+async function forgetTask(id, title) {
+  if (!confirm(`Permanently forget #${id} "${title}" and its history?\n\nThis cannot be undone.`)) return;
+  try {
+    await api(`/api/projects/${PROJECT}/tasks/${id}`, { method: 'DELETE' });
+    $('#panel').hidden = true;
+    OPEN_TASK = null;
+    await loadBoard();
+  } catch (e) { fail(e.message); }
+}
+
+// ---- search ----------------------------------------------------------------
+
+let searchTimer;
+$('#search').oninput = e => {
+  clearTimeout(searchTimer);
+  const q = e.target.value.trim();
+  if (!q) { $('#panel').hidden = true; return; }
+  searchTimer = setTimeout(() => runSearch(q), 250);
+};
+
+async function runSearch(q) {
+  try {
+    const { body } = await api(`/api/recall?q=${encodeURIComponent(q)}`);
+    $('#panel').innerHTML = `
+      <div class="row" style="justify-content:space-between">
+        <h2>recall: ${esc(q)}</h2><button id="close">close</button>
+      </div>
+      <div class="dim2" style="font-size:11px">${esc(body.scope)} · ${body.hits.length} hits${body.omitted ? ` (+${body.omitted} more)` : ''}</div>
+      <section>${body.hits.map(h => `
+        <div class="hit">
+          <div class="dim2" style="font-size:11px">
+            ${esc(h.kind)} · ${esc(h.project)} ${h.task_id ? `· #${h.task_id}` : ''} · ${ago(h.ts)}
+          </div>
+          <b>${esc(h.title)}</b>
+          <div style="margin-top:4px">${esc(h.snippet).replace(/&gt;&gt;/g, '<mark>').replace(/&lt;&lt;/g, '</mark>')}</div>
+        </div>`).join('') || '<div class="empty">nothing found</div>'}
+      </section>`;
+    $('#panel').hidden = false;
+    $('#close').onclick = () => { $('#panel').hidden = true; };
+  } catch (e) { fail(e.message); }
+}
+
+// ---- new task --------------------------------------------------------------
+
+$('#new').onclick = () => {
+  const f = $('#newdlg form');
+  fillSelect(f.type, META.types, 'task');
+  fillSelect(f.priority, META.priorities, 'normal');
+  fillSelect(f.status, META.open_statuses, 'backlog');
+  f.reset();
+  fillSelect(f.type, META.types, 'task');
+  fillSelect(f.priority, META.priorities, 'normal');
+  fillSelect(f.status, META.open_statuses, 'backlog');
+  $('#newdlg').showModal();
+};
+
+$('#newdlg').addEventListener('close', async () => {
+  const d = $('#newdlg');
+  if (d.returnValue !== 'ok') return;
+  const f = d.querySelector('form');
+  if (!f.title.value.trim()) return;
+  try {
+    await api(`/api/projects/${PROJECT}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        title: f.title.value, body: f.body.value,
+        type: f.type.value, priority: f.priority.value, status: f.status.value,
+      }),
+    });
+    await loadBoard();
+  } catch (e) { fail(e.message); }
+});
+
+// ---- live updates ----------------------------------------------------------
+
+// The stream carries a cursor, never rows: we refetch what we are showing. See
+// docs/http-api.md for why that is cheaper than maintaining a second representation of
+// every mutation.
+function connect() {
+  const es = new EventSource(`/api/stream?project=${PROJECT}`);
+  const mark = (on, text) => { $('#live').className = on ? 'on' : ''; $('#live').textContent = text; };
+
+  es.onopen = () => mark(true, 'live');
+  es.onerror = () => mark(false, 'reconnecting');
+  const onChange = async ev => {
+    const d = JSON.parse(ev.data);
+    if (d.reset || d.cursor > CURSOR) {
+      await loadBoard();
+      if (OPEN_TASK) { try { await openTask(OPEN_TASK.id); } catch { /* it may be gone */ } }
+    }
+    mark(true, 'live');
+  };
+  es.addEventListener('change', onChange);
+  es.addEventListener('reset', onChange);
+  return es;
+}
+
+// ---- boot ------------------------------------------------------------------
+
+(async function boot() {
+  try {
+    META = (await api('/api/meta')).body;
+    const { body } = await api('/api/projects');
+    if (!body.projects.length) {
+      $('#columns').innerHTML = '<div class="empty">No boards yet. An agent creates one the first time it uses ai-kanban in a project.</div>';
+      return;
+    }
+    const sel = $('#project');
+    sel.innerHTML = body.projects.map(p =>
+      `<option value="${p.project.id}">${esc(p.project.name)} (${p.open} open)</option>`).join('');
+
+    const wanted = new URLSearchParams(location.search).get('project');
+    if (wanted && body.projects.some(p => String(p.project.id) === wanted)) sel.value = wanted;
+    PROJECT = Number(sel.value);
+
+    let es = connect();
+    sel.onchange = async () => {
+      PROJECT = Number(sel.value);
+      history.replaceState(null, '', `?project=${PROJECT}`);
+      $('#panel').hidden = true;
+      es.close();
+      await loadBoard();
+      es = connect();
+    };
+
+    await loadBoard();
+    // Re-render once a minute so relative times stay honest on an idle board.
+    setInterval(() => { if (BOARD) render(); }, 60000);
+  } catch (e) {
+    fail(e.message);
+  }
+})();
+</script>

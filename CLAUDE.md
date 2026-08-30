@@ -37,7 +37,7 @@ Apply it to every change to the tool surface. Details and worked examples in
 | `docs/data-model.md` | Schema and why each column exists. Read before changing `schema.sql`. |
 | `docs/tool-design.md` | The agent-facing surface and its response shapes. |
 | `docs/adoption.md` | Hooks and the plugin — the load-bearing risk. |
-| `docs/http-api.md` | The human-facing API and live updates. Designed, not built. |
+| `docs/http-api.md` | The human-facing API, the web UI, and live updates. |
 | `docs/architecture.md` | Layering, the store, durability, dependencies. |
 | `docs/plan.md` | Founding record. Superseded by the above where they disagree. |
 
@@ -69,9 +69,10 @@ Apply it to every change to the tool surface. Details and worked examples in
 ## Commands
 
 ```sh
-cargo test                      # 99 tests
+cargo test                      # 110 tests
 cargo test --test budget -- --nocapture   # prints measured token costs
 cargo build --release           # the plugin's hook and MCP configs both need this
+AI_KANBAN_DB=/tmp/x.db ./target/release/ai-kanban serve   # web UI on :7373
 claude plugin validate .claude/skills/ai-kanban   # the plugin is project-local
 ```
 
