@@ -8,8 +8,6 @@
 
 use ai_kanban::core::migrate::{migration_versions, BASELINE_VERSION, MIN_READABLE_VERSION, SCHEMA_VERSION};
 use ai_kanban::core::model::*;
-use ai_kanban::core::note::NoteDraft;
-use ai_kanban::core::task::TaskDraft;
 use ai_kanban::core::Store;
 
 /// A file-backed store. Migrations are about what survives a reopen, so in-memory will not do.

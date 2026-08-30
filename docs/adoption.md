@@ -45,8 +45,9 @@ useless hook if assumed the other way:
 **`SessionStart` fires before MCP servers finish connecting** (`hooks.md:549`). A hook on
 this event therefore *cannot* call ai-kanban's own MCP tools. It has to be a command — which
 is why the binary itself speaks the hook protocol (`ai-kanban hook session-start`, hook JSON
-in on stdin, hook JSON out on stdout). That also means no wrapper script, no `jq`
-dependency, and it works on Windows.
+in on stdin, hook JSON out on stdout). That also means no `jq` dependency and no shell
+pipeline parsing hook JSON. There is a wrapper script, but it only locates the binary and
+`exec`s it -- see *Installing* -- so the protocol still has exactly one implementation.
 
 **`FileChanged` is the wrong event for contextual recall.** Its `matcher` builds a *literal
 filename watch list* in the working directory (`hooks.md:2764`) — it exists for config files,
@@ -188,17 +189,40 @@ A global install needs the plugin directory to *be* the repo, so the binary at
 a directory scanned at session start. Symlinking it *inside* the repo instead would be a
 symlink loop.
 
-A real directory holding three small files avoids both. It is 12K, it travels with the repo,
-and `${CLAUDE_PLUGIN_ROOT}/../../../target/release/ai-kanban` reaches the binary.
+A real directory holding a few small files avoids both. It is 12K and it travels with the
+repo.
 
-> **This is the dogfooding setup, not the distribution story.** It makes ai-kanban work *on
-> ai-kanban*. Using it in another repository still needs a real install, and that is still
-> unsolved: `target/` is gitignored, so any copy-install lands without a binary. The obvious
-> cheaper fix — a bare `ai-kanban` found on `PATH` — was tried and reverted, because
-> `cargo install` puts it in `~/.cargo/bin`, which is not on `PATH` on every machine (it is
-> not on this one; rust here is from Homebrew). A hook that cannot find its binary at all is
-> strictly worse than one that only works where it is checked out. Distribution needs
-> per-platform prebuilt binaries.
+### How the binary is found
+
+`bin/ai-kanban` in the plugin is a resolver: it searches for the real binary and `exec`s it
+with the arguments untouched. Both `hooks.json` and `mcp.json` invoke it, since
+`${CLAUDE_PLUGIN_ROOT}` is set for both.
+
+It searches, in order: `$AI_KANBAN_BIN`; `target/release` then `target/debug` relative to a
+surrounding checkout; `~/.cargo/bin`; the Homebrew and `/usr/local` bin directories; and
+finally `PATH`.
+
+Two of those orderings are deliberate. **The checkout comes before `PATH`** so that
+developing ai-kanban tests the build you just made rather than a global install silently
+shadowing it. **`PATH` comes last and is skipped if it resolves back into the plugin's own
+`bin/`**, because a plugin directory on `PATH` would otherwise make the script re-exec
+itself forever.
+
+This replaced a hard-coded `${CLAUDE_PLUGIN_ROOT}/../../../target/release/ai-kanban`, which
+only resolved when the plugin sat inside a checkout — so a copied plugin, which is how
+plugins are normally installed, pointed at nothing. The cheaper fix of naming a bare
+`ai-kanban` on `PATH` was tried before and reverted: `cargo install` puts it in
+`~/.cargo/bin`, which is not on `PATH` on every machine (it is not on this one; rust here is
+from Homebrew). Searching several locations is what makes both setups work at once.
+
+When nothing is found, `hook` exits 0 in silence — a hook that complains on every session
+start is a hook the user removes, taking the bundled MCP server with it. Every other
+subcommand explains what to install, because an MCP server that dies without a reason is a
+board that is mysteriously absent.
+
+> **Known gap: Windows.** The resolver is a `#!/bin/sh` script, so it needs a POSIX shell.
+> This is tracked as a task rather than hidden here, and the `AI_KANBAN_BIN` override plus a
+> `.cmd` shim is the likely fix.
 
 ## `instructions` — the channel that needs no hook
 

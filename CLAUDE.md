@@ -69,7 +69,7 @@ Apply it to every change to the tool surface. Details and worked examples in
 ## Commands
 
 ```sh
-cargo test                      # 110 tests
+cargo test                      # the whole suite
 cargo test --test budget -- --nocapture   # prints measured token costs
 cargo build --release           # the plugin's hook and MCP configs both need this
 AI_KANBAN_DB=/tmp/x.db ./target/release/ai-kanban serve   # web UI on :7373

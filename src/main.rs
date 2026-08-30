@@ -44,7 +44,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ai_kanban::http::serve(Store::open_default()?, port).await
         }
         // Hooks are invoked by the host, never by a person. They read hook JSON on stdin
-        // and write hook JSON on stdout, so the plugin needs no wrapper script.
+        // and write hook JSON on stdout, so the plugin's wrapper only has to locate this
+        // binary -- it never parses or rewrites the protocol.
         Some("hook") => {
             match std::env::args().nth(2).as_deref() {
                 Some("session-start") => hook::session_start(),

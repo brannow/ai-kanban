@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/../../../target/release/ai-kanban hook session-start",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/ai-kanban hook session-start",
             "timeout": 5
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/../../../target/release/ai-kanban hook post-tool-use",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/ai-kanban hook post-tool-use",
             "timeout": 5
           }
         ]
