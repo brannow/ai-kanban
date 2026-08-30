@@ -12,13 +12,34 @@ Two pieces: a binary, and a plugin that points Claude Code at it.
 
 ```sh
 git clone <this repo> && cd ai-kanban
-cargo install --path .          # binary -> ~/.cargo/bin/ai-kanban
+cargo build --release
+install -m 755 target/release/ai-kanban ~/.local/bin/    # no sudo, already on most PATHs
 cp -R .claude/skills/ai-kanban ~/.claude/skills/
 ```
 
 Restart Claude Code. That is the whole setup.
 
-`~/.cargo/bin` does **not** need to be on your `PATH` — the plugin looks there directly.
+### Putting the binary somewhere else
+
+Any directory works — the plugin searches `~/.local/bin`, `~/.cargo/bin`,
+`/opt/homebrew/bin`, `/usr/local/bin` and then your `PATH`. Pick one **your shell already
+knows about**, so you can run `ai-kanban backup` yourself:
+
+```sh
+echo $PATH | tr ':' '\n'                                  # what yours actually is
+```
+
+```sh
+install -m 755 target/release/ai-kanban ~/.local/bin/     # no sudo
+sudo install -m 755 target/release/ai-kanban /usr/local/bin/   # traditional, needs sudo
+cargo install --path .                                    # -> ~/.cargo/bin
+```
+
+`cargo install` is the odd one out: the plugin finds it there, but `~/.cargo/bin` is often
+**not** on `PATH` (it isn't by default on macOS with Homebrew Rust), so the commands below
+won't work in your terminal. Use it only if that directory is already on yours.
+
+`/usr/bin` is not an option on macOS — it is protected and unwritable.
 
 ### Per-project instead of everywhere
 
@@ -81,7 +102,7 @@ Moving boards between machines, or keeping a readable copy in git:
 
 ```sh
 ai-kanban export > board.json          # every board
-ai-kanban export ai-kanban > one.json  # one of them
+ai-kanban export [PROJECT_NAME] > one.json  # one of them
 ai-kanban import board.json            # restores boards that aren't here yet
 ```
 

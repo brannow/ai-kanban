@@ -210,8 +210,16 @@ with the arguments untouched. Both `hooks.json` and `mcp.json` invoke it, since
 `${CLAUDE_PLUGIN_ROOT}` is set for both.
 
 It searches, in order: `$AI_KANBAN_BIN`; `target/release` then `target/debug` relative to a
-surrounding checkout; `~/.cargo/bin`; the Homebrew and `/usr/local` bin directories; and
-finally `PATH`.
+surrounding checkout; `~/.local/bin`; `~/.cargo/bin`; the Homebrew and `/usr/local` bin
+directories; and finally `PATH`.
+
+Those directories are named explicitly rather than left to `PATH` because **a hook is not a
+login shell** — the host may invoke it with a minimal environment containing none of the
+user's directories. Anything the README tells someone to install into therefore has to be on
+this list, or the plugin works when they type the command themselves and silently does
+nothing in a session. That failure is close to undiagnosable from the outside, so
+`tests/plugin_install.rs` asserts the documented location resolves with `PATH` stripped to
+`/usr/bin:/bin`.
 
 Two of those orderings are deliberate. **The checkout comes before `PATH`** so that
 developing ai-kanban tests the build you just made rather than a global install silently

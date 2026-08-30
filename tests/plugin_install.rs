@@ -131,3 +131,49 @@ fn an_explicit_binary_override_wins() {
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "where", "the override was not used");
 }
+
+#[test]
+fn the_documented_install_location_is_found_without_help_from_path() {
+    // README tells people to install into a directory on their PATH, and recommends
+    // ~/.local/bin because it needs no sudo. A hook is not a login shell, though -- the host
+    // may invoke it with a minimal PATH that contains none of the user's directories. So the
+    // recommended location has to be searched by name, not left to PATH.
+    //
+    // This is the test that fails if someone trims the resolver's candidate list: the
+    // symptom otherwise is a plugin that works when you type the command yourself and
+    // silently does nothing in a session, which is close to undiagnosable.
+    if cfg!(not(unix)) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let local_bin = home.join(".local/bin");
+    std::fs::create_dir_all(&local_bin).unwrap();
+    // A stub rather than a copy of a real system binary: on macOS, copying a signed system
+    // executable and running the copy is killed by the signature check, with no stderr.
+    let stub = local_bin.join("ai-kanban");
+    std::fs::write(&stub, "#!/bin/sh\necho \"$@\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let copied = tmp.path().join("plugin");
+    Command::new("cp").arg("-R").arg(plugin_dir()).arg(&copied).status().unwrap();
+
+    let out = Command::new(copied.join("bin/ai-kanban"))
+        .arg("where")
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env_remove("AI_KANBAN_BIN")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "where",
+        "~/.local/bin is the install location the README recommends and was not searched"
+    );
+}
