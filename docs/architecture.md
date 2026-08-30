@@ -93,15 +93,28 @@ in between).
 versioned, and does not travel between machines. Said plainly here so it is a decision rather
 than something discovered after a disk failure.
 
-- **Backup is `.backup`, not `cp`:**
-  `sqlite3 "$(ai-kanban where)" ".backup ~/backups/kanban.db"`
+- **Backup is `ai-kanban backup <file>`, not `cp`.**
 
   This doc previously said to copy the file. Under WAL that silently loses recent work: the
   newest writes sit in a `-wal` sidecar until a checkpoint, so a plain `cp` of `kanban.db`
   restores a board that is missing everything since the last checkpoint, with no error. It
   was found for real — a live store's main file was four days and six tasks behind its WAL.
-- **`export` / `import`:** roadmap (#2), and the proper fix for the above. Nobody should have
-  to know what a WAL is to keep their own history.
+
+  The advice then became `sqlite3 "$(ai-kanban where)" ".backup out.db"`, which is correct
+  and still requires knowing what a WAL is, owning `sqlite3`, and getting a two-part shell
+  incantation right. `backup` is the same operation (`VACUUM INTO`) behind a command that
+  states its intent — the design law applied to the human rather than to the agent.
+
+- **The store checkpoints when it closes.** `Drop for Store` runs `wal_checkpoint(TRUNCATE)`,
+  best-effort. This does not make `cp` correct, and nothing should treat it as though it
+  does; it narrows the window in which the naive copy that people and backup tools take
+  anyway is a silent rollback. Failure is ignored: a busy checkpoint means another session
+  will do it shortly, and the read-only hook connection cannot run one at all.
+
+- **`export` / `import` are the portable pair.** JSON, readable and diffable, one project or
+  all of them. `import` restores boards that are not present and **refuses** to merge into
+  one that is — see `src/core/transfer.rs`. Choosing which side of a divergent history wins
+  is task #3, and answering it halfway inside an importer would leave two half-answers.
 - **Multi-machine sync: deliberately out of scope for v1.** A desktop and a laptop are two
   disjoint memories — the same split-memory failure `project_paths` prevents within a
   machine, recurring at machine level. Naming it is not solving it, but an unnamed version of

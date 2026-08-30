@@ -16,6 +16,7 @@ pub mod project;
 pub mod recall;
 pub mod task;
 pub mod store;
+pub mod transfer;
 
 pub use error::{Error, Result};
 pub use store::{now, Store};

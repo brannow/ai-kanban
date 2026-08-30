@@ -17,14 +17,26 @@ USAGE:
     ai-kanban mcp                  Run the MCP server on stdio (what an agent connects to)
     ai-kanban hook session-start   Emit the board as Claude Code SessionStart context
     ai-kanban hook post-tool-use   Emit notes about the file a tool just touched
+    ai-kanban backup <file>        Copy the whole store to one consistent file
+    ai-kanban export [project...]  Write the store as JSON on stdout
+    ai-kanban import <file>        Restore projects from an export
     ai-kanban where                Print the path to the store
     ai-kanban --help
 
-The store is a single SQLite file, but it runs in WAL mode, so recent work lives in a
-`-wal` sidecar until it is checkpointed. Copying `kanban.db` on its own can therefore
-silently leave the newest tasks and notes behind. Back it up with:
+Everything you have recorded lives in one SQLite file outside version control. Keep it
+with:
 
-    sqlite3 \"$(ai-kanban where)\" \".backup /path/to/backup.db\"
+    ai-kanban backup ~/kanban-backup.db
+
+Restore it by copying that file back over the store (`ai-kanban where` prints the path).
+
+Do not just copy `kanban.db`: the store runs in WAL mode, so recent work can still be in
+a `kanban.db-wal` sidecar, and a copy of the main file alone silently leaves it behind.
+`backup` goes through SQLite and cannot lose it.
+
+`export` is the other direction -- JSON you can read, diff and commit, for one project or
+all of them. `import` restores projects that are not here yet; it will not merge into a
+project that already exists.
 
 Override the store location with AI_KANBAN_DB.
 ";
@@ -54,6 +66,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // hook the user removes, taking the bundled MCP server with it.
                 _ => {}
             }
+            Ok(())
+        }
+        Some("backup") => {
+            let Some(dest) = std::env::args().nth(2) else {
+                eprintln!("usage: ai-kanban backup <file>");
+                std::process::exit(2);
+            };
+            let store = Store::open_default()?;
+            store.backup_to(std::path::Path::new(&dest))?;
+            println!("Backed up to {dest}");
+            Ok(())
+        }
+        Some("export") => {
+            // Positional project names/keys, so `export ai-kanban` reads the way it looks.
+            let keys: Vec<String> = std::env::args().skip(2).collect();
+            let store = Store::open_default()?;
+            let data = store.export(&keys)?;
+            // Pretty, not compact: the reason to choose JSON over `backup` is that a person
+            // can read and diff it, and one line of minified JSON is neither.
+            println!("{}", serde_json::to_string_pretty(&data)?);
+            Ok(())
+        }
+        Some("import") => {
+            let Some(src) = std::env::args().nth(2) else {
+                eprintln!("usage: ai-kanban import <file>");
+                std::process::exit(2);
+            };
+            let data: ai_kanban::core::transfer::Export =
+                serde_json::from_str(&std::fs::read_to_string(&src)?)?;
+            let store = Store::open_default()?;
+            let report = store.import(&data)?;
+            print!("{}", ai_kanban::render::import_report(&report));
             Ok(())
         }
         Some("where") => {

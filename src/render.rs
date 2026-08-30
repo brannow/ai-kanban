@@ -245,6 +245,41 @@ pub fn project_summaries(sums: &[ProjectSummary], total: usize, now: i64) -> Str
     out
 }
 
+/// An import reports what it wrote **and what it declined to write**. The second half is
+/// the one that matters: a skip here is silent in the data, so a run that restored nothing
+/// because every project already existed must not read as a success.
+pub fn import_report(r: &crate::core::transfer::ImportReport) -> String {
+    let mut out = String::new();
+    if r.projects.is_empty() && r.skipped_existing.is_empty() {
+        return "The export contained no projects.\n".to_string();
+    }
+    for p in &r.projects {
+        out.push_str(&format!(
+            "Imported {}: {} task{}, {} note{}, {} event{}.\n",
+            p.name,
+            p.tasks, plural(p.tasks),
+            p.notes, plural(p.notes),
+            p.events, plural(p.events),
+        ));
+        for path in &p.paths_skipped {
+            // Named individually rather than counted: the consequence is that opening that
+            // directory keeps landing on the board that already owns it, and only the
+            // actual path tells the reader whether that matters.
+            out.push_str(&format!("  path already claimed by another board, left alone: {path}\n"));
+        }
+    }
+    for key in &r.skipped_existing {
+        out.push_str(&format!("Skipped {key}: a board with this key is already here.\n"));
+    }
+    if !r.skipped_existing.is_empty() {
+        out.push_str(
+            "\nImport never merges into an existing board -- deciding which side of a \
+             divergent history wins is a separate problem.\n",
+        );
+    }
+    out
+}
+
 /// Errors state what went wrong, what the current state is, and what to do next. A bare
 /// failure message costs three follow-up calls; this costs none.
 pub fn error(e: &crate::core::Error) -> String {

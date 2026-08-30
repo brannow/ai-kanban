@@ -64,6 +64,24 @@ impl Store {
     }
 }
 
+/// Fold the WAL back into the main file when the last handle goes away.
+///
+/// This does not make `cp kanban.db` correct -- `backup_to` is the correct way, and the
+/// WAL can still be non-empty here because another session holds the lock. It makes the
+/// *usual* case safe: after a clean exit the main file is current, so the naive copy that
+/// people and backup tools take anyway is usually not a silent four-day rollback (task
+/// #14, where exactly that happened on the real store).
+///
+/// Failure is ignored on purpose. Every caller of this is a process already on its way
+/// out, a busy checkpoint means another session will do the same job shortly, and on the
+/// read-only connection the session-start hook uses it cannot run at all -- none of which
+/// is worth a message in a destructor.
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.checkpoint();
+    }
+}
+
 /// Unix epoch seconds. Every timestamp in the store is this.
 pub fn now() -> i64 {
     std::time::SystemTime::now()
