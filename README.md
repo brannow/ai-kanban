@@ -106,9 +106,8 @@ The first board survives and the second is folded into it.
 | `AI_KANBAN_DB` | Use a different store. **Set this for any experiment** — otherwise you are writing to your real memory. |
 | `AI_KANBAN_BIN` | Point the plugin at a specific binary. Searched before everything else. |
 
-**macOS and Linux only.** The plugin's entry point is a `#!/bin/sh` script, so the hooks and
-the MCP server do not start on Windows. The `ai-kanban` binary itself is fine there; it is
-the plugin that isn't.
+**macOS and Linux.** Windows is a stated non-goal, not a gap — the plugin's entry point is a
+`#!/bin/sh` script. The `ai-kanban` binary itself builds and runs there; the plugin does not.
 
 ## Docs
 

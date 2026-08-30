@@ -69,6 +69,8 @@ ecosystems, to solve "remember what happened last week".
   humans.
 - **Not a team planning tool.** One person and their agents.
 - **Not a chat log.** Events record what happened and why, not a transcript.
+- **Not cross-platform.** macOS and Linux. Windows support means platform code written
+  blind on a machine that cannot run it, and shipping that is worse than not claiming it.
 
 The test for any proposed feature: does an agent starting cold work better because of it? If
 the honest answer is "it would look more complete", it does not belong.

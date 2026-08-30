@@ -231,9 +231,12 @@ start is a hook the user removes, taking the bundled MCP server with it. Every o
 subcommand explains what to install, because an MCP server that dies without a reason is a
 board that is mysteriously absent.
 
-> **Known gap: Windows.** The resolver is a `#!/bin/sh` script, so it needs a POSIX shell.
-> This is tracked as a task rather than hidden here, and the `AI_KANBAN_BIN` override plus a
-> `.cmd` shim is the likely fix.
+> **Windows is not supported, by decision.** The resolver is a `#!/bin/sh` script, so the
+> hooks and the MCP server need a POSIX shell. A `bin/ai-kanban.cmd` shim with the same
+> search order would fix it, and it is deliberately not being written: there is no Windows
+> machine here, so it would ship untested, and untested platform code is a support burden
+> that reads as a promise. The binary itself builds and runs on Windows — it is the plugin
+> entry point that does not.
 
 ## `instructions` — the channel that needs no hook
 
