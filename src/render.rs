@@ -16,6 +16,7 @@
 
 use crate::core::event::status_transition;
 use crate::core::model::*;
+use crate::core::staleness::MissingSubjects;
 
 /// `ago` returns a bare duration ("3mo") for old things but a complete phrase ("just now")
 /// for recent ones. These two wrap it so callers never staple a suffix onto the phrase and
@@ -174,7 +175,7 @@ pub fn task_detail(d: &TaskDetail) -> String {
 
 /// Recall. Each hit states its kind, its age and its project, and carries a snippet --
 /// a list of titles is a search result; a list of snippets is an answer.
-pub fn recall(r: &RecallResult, cross_project: bool) -> String {
+pub fn recall(r: &RecallResult, cross_project: bool, missing: &MissingSubjects) -> String {
     if r.hits.is_empty() {
         return empty_recall(r, cross_project);
     }
@@ -197,6 +198,16 @@ pub fn recall(r: &RecallResult, cross_project: bool) -> String {
         out.push_str(&format!("\n{kind} {:<5} {}  ({})\n", id, truncate(&h.title, 46), tail.join(", ")));
         if !h.snippet.is_empty() {
             out.push_str(&format!("       {}\n", h.snippet.replace('\n', " ")));
+        }
+        // Only ever on note hits, and only when the check was calibrated -- see
+        // `core::staleness`. Phrased as the fact ("the file is not there") rather than as a
+        // verdict ("this note is wrong"), because the file being gone is what is actually
+        // known. A note about deleted code may still be the reason the code was deleted.
+        if h.kind == HitKind::Note {
+            let gone = missing.for_note(h.id);
+            if !gone.is_empty() {
+                out.push_str(&format!("       (no longer in the repo: {})\n", gone.join(", ")));
+            }
         }
     }
 

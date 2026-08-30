@@ -94,11 +94,22 @@ fn filing_a_side_quest_stays_cheap() {
 fn recall_with_a_full_page_of_hits_stays_affordable() {
     let (s, pid) = year_old_project();
     let r = s.recall(&RecallQuery { text: "middleware redirect", project_id: Some(pid), limit: DEFAULT_LIMIT }).unwrap();
-    let text = render::recall(&r, false);
+    // The real staleness set, not an empty stand-in: this fixture's notes name files that
+    // do not exist, which is precisely the case `core::staleness` must stay silent about.
+    // Passing `default()` here would test nothing and hide a regression that would put a
+    // line under all ten hits.
+    let notes: Vec<i64> = r.hits.iter().filter(|h| h.kind == HitKind::Note).map(|h| h.id).collect();
+    let missing = s.missing_subjects(pid, &notes).unwrap();
+    let text = render::recall(&r, false, &missing);
     eprintln!("\n=== recall (10 hits) -- ~{} tokens ===\n{}", tokens(&text), text);
 
     assert_eq!(r.hits.len(), DEFAULT_LIMIT);
     assert!(tokens(&text) < 900, "recall cost {} tokens", tokens(&text));
+    assert!(
+        !text.contains("no longer in the repo"),
+        "no note path in this fixture resolves, so the check is uncalibrated and must say \
+         nothing -- flagging all of them is the noise failure it was designed around"
+    );
 }
 
 #[test]

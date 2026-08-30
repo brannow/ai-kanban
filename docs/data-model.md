@@ -242,17 +242,34 @@ caller name the board costs nothing, since every adapter resolves a project befo
 
 Named, not solved.
 
-**Note staleness.** Nothing decides when a note stops being true, and confidently wrong
-memory is worse than none. Today: `updated_at`, and `recall` shows each hit's age so the
-agent can discount old claims. Automatic detection — flagging notes whose `note_paths`
-files have changed substantially — is roadmap.
+**Note staleness — partly answered.** Nothing decides when a note stops being *true*, and
+confidently wrong memory is worse than none. Two signals now exist, and the gap between
+them is the point:
 
-**Project merge.** Alias learning prevents most splits; nothing repairs one that already
-happened. The mitigation is one-way until a merge path exists.
+- `updated_at`, with each `recall` hit's age, so an old claim can be discounted.
+- **Deleted subjects.** A note naming a file that is no longer in the repo is flagged on
+  recall. `src/core/staleness.rs` carries the reasoning, including three approaches that
+  were rejected — git last-commit time (needs a subprocess, which `project.rs` deliberately
+  avoids), file mtime (a fresh clone rewrites every one, flagging the whole board), and a
+  stored content hash (accurately answers "did the file change", which is not the same
+  question as "is the note wrong", and fires on every reformat).
 
-**Durability.** Everything of value is one SQLite file outside version control. Backing it
-up is `cp $(ai-kanban where) somewhere`. `export`/`import` are roadmap. Multi-machine sync
-is deliberately **out of scope for v1** — a decision, not an oversight.
+  The check is calibrated: it stays silent unless at least one of the paths it is looking
+  at resolves. Note paths are repo-relative while the store is global, so on a machine
+  where the project was never checked out *nothing* resolves — and flagging every note
+  there would be noise that trains the reader to ignore the flag, destroying the true
+  positives with it.
+
+What is still open is the harder half: a note can be about code that still exists and still
+be wrong. Nothing detects that, and file-watching does not, either.
+
+**Project merge — solved.** `ai-kanban merge <keep> <gone>` reparents one board onto
+another and deletes the empty one; see `docs/architecture.md`. Merging boards from two
+*different stores* remains open (#20) and is a different problem: ids collide meaninglessly.
+
+**Durability — solved for one machine.** `ai-kanban backup` writes one consistent file, and
+`export`/`import` move boards as JSON. Multi-machine sync is deliberately **out of scope for
+v1** — a decision, not an oversight.
 
 **Adoption.** Still open, and still the load-bearing risk: a good tool surface makes
 adoption possible, it does not cause it. See `docs/plan.md`.

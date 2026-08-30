@@ -388,7 +388,20 @@ impl AiKanban {
             project_id,
             limit: p.limit.map(|l| l.clamp(1, 50) as usize).unwrap_or(DEFAULT_LIMIT),
         }).map_err(fail)?;
-        Ok(render::recall(&result, cross))
+
+        // Only for a single-project search. Cross-project hits come from repos whose
+        // checkouts are mostly not on this machine, so the calibration in `staleness` would
+        // decline to say anything for nearly all of them anyway -- and computing it per
+        // project to reach that conclusion is work with no output.
+        let missing = match project_id {
+            Some(pid) => {
+                let notes: Vec<i64> = result.hits.iter()
+                    .filter(|h| h.kind == HitKind::Note).map(|h| h.id).collect();
+                store.missing_subjects(pid, &notes).unwrap_or_default()
+            }
+            None => Default::default(),
+        };
+        Ok(render::recall(&result, cross, &missing))
     }
 
     /// Record what happened or what was decided. Use it for decisions and session summaries
