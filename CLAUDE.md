@@ -71,9 +71,11 @@ Apply it to every change to the tool surface. Details and worked examples in
 ```sh
 cargo test                      # the whole suite
 cargo test --test budget -- --nocapture   # prints measured token costs
-cargo build --release           # the plugin's hook and MCP configs both need this
+cargo build --release           # the plugin's hook and MCP configs both point at this
 AI_KANBAN_DB=/tmp/x.db ./target/release/ai-kanban serve   # web UI on :7373
-claude plugin validate .claude/skills/ai-kanban   # the plugin is project-local
+make install-dev                # plugin pointed at this checkout, so a global install
+                                # cannot shadow the build you are testing
+make where                      # every path an install would touch
 ```
 
 **Set `AI_KANBAN_DB` when running anything by hand.** Without it you are writing to your real

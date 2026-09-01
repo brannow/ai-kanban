@@ -198,13 +198,20 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
     // thirteen cards. A deferred read costs nothing and removes the class.
     let tx = store.conn.unchecked_transaction()?;
 
-    let counts = store.status_counts(project.id)?;
+    // The human board follows the SAME current workstream the agent's does. One board, one
+    // active workstream, shared by the person and their agents -- a UI that showed a
+    // different slice than the agent is working in would make the two disagree about what
+    // "the board" means, which is the confusion this whole feature removes.
+    let current = store.current_workstream(project.id)?;
+    let ws = current.as_ref().map(|w| w.id);
+
+    let counts = store.status_counts_in(project.id, ws)?;
     let mut statuses: Vec<Status> = Status::ALL.to_vec();
     statuses.sort_by_key(|s| s.board_rank());
 
     let mut columns = Vec::new();
     for s in statuses {
-        let page = store.tasks_page(project.id, &[s], None, PAGE)?;
+        let page = store.tasks_page_in(project.id, &[s], None, PAGE, ws)?;
         columns.push(json!({
             "status": s.as_str(),
             "total": counts.iter().find(|(k, _)| *k == s).map(|(_, n)| *n).unwrap_or(0),
@@ -221,7 +228,77 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
         "project": project,
         "counts": counts.iter().map(|(s, n)| json!({ "status": s.as_str(), "count": n })).collect::<Vec<_>>(),
         "columns": columns,
+        // Both halves are needed by the UI: `workstream` is what the board is scoped to and
+        // what a new task will join, `workstreams` is everything selectable. Sent even when
+        // nothing is scoped, so the control can offer the list without a second request.
+        "workstream": current,
+        "workstreams": store.all_open_workstreams(project.id)?,
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Workstream
+// ---------------------------------------------------------------------------
+
+/// Resolve a workstream by name, **without creating one**.
+///
+/// The human API deliberately cannot create workstreams; only the agent can, as a side
+/// effect of being told what it is working on. A person picks from what exists.
+///
+/// Enforced here rather than by omitting a button, because a UI-only restriction is
+/// bypassed by any direct call or a stale page still holding the old form. The error lists
+/// the existing names, following the same self-correcting shape every other invalid value
+/// in this API uses.
+fn existing_workstream(store: &Store, project_id: i64, name: &str) -> ApiResult<i64> {
+    if let Some(w) = store.workstream_by_name(project_id, name)? {
+        return Ok(w.id);
+    }
+    let mut names: Vec<String> = store.all_open_workstreams(project_id)?
+        .into_iter().map(|w| w.workstream.name).collect();
+    names.sort();
+    Err(ApiError(Error::InvalidValue {
+        field: "workstream",
+        value: name.to_string(),
+        valid: if names.is_empty() {
+            "no workstreams on this board yet -- an agent starts one when you tell it what \
+             you are working on".to_string()
+        } else {
+            names.join(", ")
+        },
+    }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct WorkstreamBody {
+    /// An existing workstream to work in. `null` or absent widens back out to the whole
+    /// board. Unknown names are refused, not created -- see `existing_workstream`.
+    pub name: Option<String>,
+}
+
+/// Set (or clear) the board's current workstream. The name must already exist.
+///
+/// A `PUT` because it is idempotent and replaces one value -- and it exists on the human
+/// side even though the agent surface deliberately has no such tool. The two consumers get
+/// different affordances on purpose: an agent enters a workstream as a side effect of
+/// asking to see it, because an extra call is one it would skip. A person clicking a
+/// control is already stating intent, and hiding that behind a side effect would make the
+/// scope change something they did not know they did.
+pub async fn set_workstream(
+    State(api): State<Api>, Path(p): Path<String>, Json(b): Json<WorkstreamBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let store = api.store();
+    let project = resolve(&store, &p)?;
+    match b.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => {
+            let id = existing_workstream(&store, project.id, name)?;
+            store.set_current_workstream(project.id, id)?;
+            Ok(Json(json!({ "workstream": store.workstream(project.id, id)? })))
+        }
+        None => {
+            store.clear_current_workstream(project.id)?;
+            Ok(Json(json!({ "workstream": serde_json::Value::Null })))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +345,13 @@ pub async fn task(
         "notes": detail.notes,
         "events": detail.events,
         "project": detail.project,
+        // Looked up rather than read off the task: `workstream_id` is kept out of
+        // `TASK_COLS` (see migration 005), so no `Task` carries it. The panel needs the
+        // name to preselect the move control.
+        "workstream": match store.task_workstream(project.id, t)? {
+            Some(w) => json!(store.workstream(project.id, w)?),
+            None => serde_json::Value::Null,
+        },
     }))))
 }
 
@@ -283,6 +367,14 @@ pub struct TaskBody {
     pub blocked_by: Option<Option<i64>>,
     /// The *why*. Recorded as the event body -- the field that makes history worth reading.
     pub log: Option<String>,
+    /// Which **existing** workstream this task joins, by name. Omitted means "inherit the
+    /// board's current one", which is what the agent does. Present-and-empty files it
+    /// unscoped. An unknown name is an error listing the ones that exist.
+    ///
+    /// This override exists because a person can see the field and an agent cannot afford
+    /// one: filing is the call an agent under pressure skips, so its workstream is
+    /// inherited silently, while a human filling in a form is choosing.
+    pub workstream: Option<String>,
 }
 
 pub async fn create_task(
@@ -308,7 +400,17 @@ pub async fn create_task(
         origin: Origin::User,
         blocked_by: b.blocked_by.flatten(),
     };
-    let task = store.create_task(project.id, draft)?;
+    let task = match b.workstream.as_ref().map(|w| w.trim()) {
+        // Absent: inherit whatever the board is scoped to, exactly as `task_add` does.
+        None => store.create_task(project.id, draft)?,
+        // Present but empty: an explicit "no workstream", which is the only way a person
+        // can file general project work while the board is scoped to something.
+        Some("") => store.create_task_in(project.id, draft, None)?,
+        Some(name) => {
+            let id = existing_workstream(&store, project.id, name)?;
+            store.create_task_in(project.id, draft, Some(id))?
+        }
+    };
     let version = task.version;
     Ok((StatusCode::CREATED, etag(version), Json(json!({ "task": task }))))
 }
@@ -321,6 +423,13 @@ pub async fn update_task(
     let store = api.store();
     let project = resolve(&store, &p)?;
 
+    // Same three-way reading as on create, so one field means one thing across both verbs:
+    // absent leaves it alone, "" makes it general work, a name moves it there.
+    let workstream = match b.workstream.as_ref().map(|w| w.trim()) {
+        None => None,
+        Some("") => Some(None),
+        Some(name) => Some(Some(existing_workstream(&store, project.id, name)?)),
+    };
     let patch = TaskPatch {
         title: b.title.clone(),
         body: b.body.clone(),
@@ -328,6 +437,7 @@ pub async fn update_task(
         priority: enum_field("priority", &b.priority, Priority::parse)?,
         task_type: enum_field("type", &b.task_type, TaskType::parse)?,
         blocked_by: b.blocked_by,
+        workstream,
         log: b.log.clone(),
         actor: Actor::User,
         expected_version: Some(expected),

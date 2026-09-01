@@ -35,7 +35,11 @@ fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
 /// `path_learned` in particular fires the first time a board is used from any new
 /// subdirectory, so left unfiltered it would both bury real history and -- through
 /// `last_activity` -- make an untouched project report as recently active.
-pub(crate) const HOUSEKEEPING_KINDS: &[&str] = &["path_learned"];
+///
+/// `workstream_entered` is here and `workstream_created` deliberately is not: starting a
+/// piece of work is history a cold agent benefits from ("we began the contact-form work"),
+/// whereas switching which slice you are looking at is navigation, not news.
+pub(crate) const HOUSEKEEPING_KINDS: &[&str] = &["path_learned", "workstream_entered"];
 
 /// Built from the list above rather than written out, so the two cannot drift. The values
 /// are compile-time constants, never caller input, so inlining them is safe.
@@ -93,12 +97,62 @@ impl Store {
     /// Newest first, capped -- this feeds the board's `recent` section, where the point is
     /// "what changed lately", not the whole story.
     pub fn recent_events(&self, project_id: i64, limit: usize) -> Result<Vec<Event>> {
-        let mut st = self.conn.prepare(&format!(
-            "SELECT {EVENT_COLS} FROM events WHERE project_id = ?1 AND {}
-              ORDER BY ts DESC, id DESC LIMIT ?2",
-            housekeeping_filter()
-        ))?;
-        Ok(st.query_map(params![project_id, limit as i64], row_to_event)?.collect::<rusqlite::Result<Vec<_>>>()?)
+        self.recent_events_in(project_id, limit, None)
+    }
+
+    /// `recent_events` restricted to a workstream.
+    ///
+    /// Scoping this matters as much as scoping the task list, and it was measured
+    /// separately: on the 300-task board of note #16, all eight `recent` entries came from
+    /// one workstream nobody was working on. A `recent` section that reports somebody
+    /// else's activity is worse than none -- it is the section an agent reads to answer
+    /// "what has been happening here", and it was answering about the wrong work.
+    ///
+    /// Two kinds of event survive any scope, and both deliberately:
+    ///
+    /// * **Project-level events** (`task_id IS NULL`) -- a decision, a session summary, a
+    ///   `log`. They were never about one workstream, and they are the entries most worth
+    ///   carrying across a scope change.
+    /// * **Events on unscoped tasks**, for the same reason unscoped tasks stay on the
+    ///   board: general project work belongs to every view.
+    pub fn recent_events_in(&self, project_id: i64, limit: usize, workstream: Option<i64>) -> Result<Vec<Event>> {
+        // LEFT JOIN, not JOIN: an event whose task has since been deleted still belongs in
+        // the history, and an inner join would silently drop it.
+        // Unscoped takes the plain query, which never names `workstream_id`. On a store
+        // this binary has not migrated the column does not exist, and naming it anywhere --
+        // WHERE included -- fails the query and silently costs the hook its board.
+        let Some(ws) = workstream else {
+            let sql = format!(
+                "SELECT {EVENT_COLS} FROM events WHERE project_id = ?1 AND {}
+                  ORDER BY ts DESC, id DESC LIMIT ?2",
+                housekeeping_filter()
+            );
+            let mut st = self.conn.prepare(&sql)?;
+            return Ok(st.query_map(params![project_id, limit as i64], row_to_event)?
+                .collect::<rusqlite::Result<Vec<_>>>()?);
+        };
+        let sql = format!(
+            "SELECT {} FROM events e
+               LEFT JOIN tasks t ON t.id = e.task_id
+              WHERE e.project_id = ?1 AND {}
+                AND (e.task_id IS NULL OR t.workstream_id = ?3 OR t.workstream_id IS NULL)
+              ORDER BY e.ts DESC, e.id DESC LIMIT ?2",
+            EVENT_COLS.split(", ").map(|c| format!("e.{c}")).collect::<Vec<_>>().join(", "),
+            housekeeping_filter().replace("kind ", "e.kind "),
+        );
+        let r = (|| -> rusqlite::Result<Vec<Event>> {
+            let mut st = self.conn.prepare(&sql)?;
+            let rows = st.query_map(params![project_id, limit as i64, ws], row_to_event)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })();
+        match r {
+            Ok(v) => Ok(v),
+            // Same tolerance as the rest of the workstream reads: a store this binary has
+            // not migrated has no `tasks.workstream_id`, and the hook must still render.
+            Err(e) if e.to_string().contains("no such column") => self.recent_events(project_id, limit),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Drives "last active 3d ago" in project summaries, so it asks about *work*. Counting

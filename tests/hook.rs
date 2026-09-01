@@ -195,3 +195,31 @@ fn one_note_covering_several_files_is_returned_once_per_file() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].paths.len(), 3, "the note still knows every file it covers");
 }
+
+#[test]
+fn the_cold_start_view_honours_the_boards_workstream() {
+    // The load-bearing case for the whole feature. SessionStart passes no arguments and
+    // never can, so if the scope were something a caller supplies, the one view that
+    // motivated workstreams -- the board an agent reads before the first prompt -- would
+    // stay unscoped.
+    let s = Store::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let pid = s.resolve_project(dir.path()).unwrap().project.id;
+
+    let w = s.ensure_workstream(pid, "contact-form").unwrap();
+    s.set_current_workstream(pid, w.id).unwrap();
+    s.create_task(pid, TaskDraft::new("dynamic field validator")).unwrap();
+    s.clear_current_workstream(pid).unwrap();
+
+    let other = s.ensure_workstream(pid, "seo-redirects").unwrap();
+    s.set_current_workstream(pid, other.id).unwrap();
+    s.create_task(pid, TaskDraft::new("canonical tags are wrong")).unwrap();
+
+    s.set_current_workstream(pid, w.id).unwrap();
+    let out = ai_kanban::hook::context_for(&s, dir.path()).expect("a board exists here");
+
+    assert!(out.contains("dynamic field validator"), "the active workstream must be shown: {out}");
+    assert!(!out.contains("canonical tags are wrong"), "another workstream's work must not be: {out}");
+    assert!(out.contains("contact-form"), "the header must name the scope: {out}");
+    assert!(out.contains("seo-redirects"), "the other workstream must still be reported: {out}");
+}

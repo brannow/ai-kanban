@@ -86,6 +86,14 @@ pub fn board(snap: &BoardSnapshot) -> String {
     out
 }
 
+/// How many workstreams the directory names before collapsing the rest into a count.
+///
+/// Four, because the directory is paid for on every board call and its whole justification
+/// is that it stays ONE line however many workstreams exist. A board with twenty of them
+/// must not turn its header into a listing -- that is the "grouped rendering" this design
+/// rejected.
+const DIRECTORY_LIMIT: usize = 4;
+
 fn header(snap: &BoardSnapshot) -> String {
     let open = snap.open_count();
     let doing = snap.count_of(Status::Doing);
@@ -93,7 +101,28 @@ fn header(snap: &BoardSnapshot) -> String {
     if doing > 0 { bits.push(format!("{doing} doing")); }
     let done = snap.count_of(Status::Done);
     if done > 0 { bits.push(format!("{done} done")); }
-    format!("Board: {}  ({})\n", snap.project.name, bits.join(", "))
+
+    // The scope is named in the header for the same reason the project is: an agent must
+    // never have to guess what it is looking at. A board silently showing a subset is the
+    // confusion this feature was built to fix, so it would be perverse to reintroduce it.
+    let title = match &snap.workstream {
+        Some(w) => format!("{} / {}", snap.project.name, w.name),
+        None => snap.project.name.clone(),
+    };
+    let mut out = format!("Board: {}  ({})\n", title, bits.join(", "));
+
+    if !snap.other_workstreams.is_empty() {
+        let shown = snap.other_workstreams.iter().take(DIRECTORY_LIMIT)
+            .map(|w| format!("{} {}", w.workstream.name, w.open))
+            .collect::<Vec<_>>().join(", ");
+        let rest = snap.other_workstreams.len().saturating_sub(DIRECTORY_LIMIT);
+        let more = if rest > 0 { format!(", +{rest} more") } else { String::new() };
+        // Named "other workstreams" even when nothing is scoped, because the list is
+        // literally the workstreams other than the current one -- and when there is no
+        // current one, telling the agent they exist at all is the point.
+        out.push_str(&format!("other workstreams: {shown}{more}\n"));
+    }
+    out
 }
 
 /// One task, one line. The trailing parenthetical carries only what is *not* obvious from
@@ -121,6 +150,13 @@ fn event_line(e: &Event, now: i64) -> String {
             "note_added"   => format!("note \"{}\"", truncate(&e.body, 50)),
             "note_updated" => format!("note revised: {}", truncate(&e.body, 60)),
             "log"          => truncate(&e.body, 70),
+            // Kept out of HOUSEKEEPING_KINDS on purpose -- starting or finishing a slice of
+            // work is project history a cold agent benefits from. That decision only pays
+            // off if the line says so: the body is just the name, so the generic fallback
+            // below would render a bare "contact-form" with no indication of what happened
+            // to it.
+            "workstream_created" => format!("started workstream \"{}\"", truncate(&e.body, 50)),
+            "workstream_closed"  => format!("closed workstream \"{}\"", truncate(&e.body, 50)),
             _ => match e.task_id {
                 Some(id) => format!("#{id} {}", truncate(&e.body, 55)),
                 None => truncate(&e.body, 70),
@@ -307,9 +343,16 @@ pub fn merge_report(r: &crate::core::merge::MergeReport) -> String {
     } else {
         (r.merged.name.clone(), r.into.name.clone())
     };
+    // Mentioned only when there were any. Most merges repair a board that never had a
+    // workstream, and a line reading "and 0 workstreams" is noise on the common path.
+    let workstreams = if r.workstreams > 0 {
+        format!(" and {} workstream{}", r.workstreams, plural(r.workstreams))
+    } else {
+        String::new()
+    };
     format!(
         "Merged \"{gone}\" into \"{kept}\".\n\n\
-         Moved {} task{}, {} note{}, {} event{} and {} path{}.\n\
+         Moved {} task{}, {} note{}, {} event{} and {} path{}{workstreams}.\n\
          The board {} no longer exists, and every directory that pointed at it now resolves \
          to \"{kept}\".\n",
         r.tasks, plural(r.tasks),

@@ -226,3 +226,161 @@ async fn the_ui_is_served_from_the_binary() {
     assert!(html.contains("EventSource"), "the page must actually subscribe to live updates");
 }
 
+
+// ---------------------------------------------------------------------------
+// Workstreams
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_board_reports_its_scope_and_everything_selectable() {
+    let (api, pid) = api();
+    {
+        let s = api.store.lock().unwrap();
+        // Deliberately left with no tasks: a workstream created a moment ago must still be
+        // offered by the picker, or the control is quietly lossy. The agent's directory
+        // hides empty ones; the human's selector must not.
+        s.ensure_workstream(pid, "brand-new").unwrap();
+    }
+    let (status, body, _) = call(&api, get(&format!("/api/projects/{pid}/board"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["workstream"].is_null(), "nothing is scoped yet");
+    let names: Vec<&str> = body["workstreams"].as_array().unwrap().iter()
+        .map(|w| w["workstream"]["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["brand-new"], "an empty workstream must still be selectable");
+}
+
+#[tokio::test]
+async fn setting_the_workstream_scopes_the_human_board_too() {
+    let (api, pid) = api();
+    {
+        let s = api.store.lock().unwrap();
+        let w = s.ensure_workstream(pid, "contact-form").unwrap();
+        s.set_current_workstream(pid, w.id).unwrap();
+        s.create_task(pid, TaskDraft::new("field validator")).unwrap();
+        s.clear_current_workstream(pid).unwrap();
+        let o = s.ensure_workstream(pid, "seo-redirects").unwrap();
+        s.set_current_workstream(pid, o.id).unwrap();
+        s.create_task(pid, TaskDraft::new("canonical tags")).unwrap();
+        s.clear_current_workstream(pid).unwrap();
+    }
+
+    let (status, body, _) = call(&api, json_req(
+        "PUT", &format!("/api/projects/{pid}/workstream"),
+        serde_json::json!({ "name": "contact-form" }), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["workstream"]["name"], "contact-form");
+
+    let (_, board, _) = call(&api, get(&format!("/api/projects/{pid}/board"))).await;
+    assert_eq!(board["workstream"]["name"], "contact-form", "the board must state its scope");
+    let titles: Vec<&str> = board["columns"].as_array().unwrap().iter()
+        .flat_map(|c| c["tasks"].as_array().unwrap())
+        .map(|t| t["title"].as_str().unwrap()).collect();
+    assert!(titles.contains(&"field validator"), "scoped work shows: {titles:?}");
+    assert!(!titles.contains(&"canonical tags"), "another workstream's work does not: {titles:?}");
+
+    // And widening back out has to be possible, or a board entered once is stuck.
+    let (status, _, _) = call(&api, json_req(
+        "PUT", &format!("/api/projects/{pid}/workstream"),
+        serde_json::json!({ "name": null }), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, board, _) = call(&api, get(&format!("/api/projects/{pid}/board"))).await;
+    assert!(board["workstream"].is_null(), "clearing must widen the board back out");
+}
+
+#[tokio::test]
+async fn a_person_filing_a_task_decides_its_workstream_rather_than_inheriting_silently() {
+    let (api, pid) = api();
+    {
+        let s = api.store.lock().unwrap();
+        let w = s.ensure_workstream(pid, "contact-form").unwrap();
+        s.set_current_workstream(pid, w.id).unwrap();
+        // Created through the store, the way an agent starts one. The HTTP API can only
+        // pick from what already exists.
+        s.ensure_workstream(pid, "seo-redirects").unwrap();
+    }
+    let file = |ws: Value| json_req("POST", &format!("/api/projects/{pid}/tasks"),
+        {
+            let mut v = serde_json::json!({ "title": "t" });
+            if !ws.is_null() { v["workstream"] = ws; }
+            v["title"] = Value::String(format!("task {}", v["workstream"]));
+            v
+        }, None);
+
+    // Omitted: inherits, exactly like the agent's task_add.
+    let (status, inherited, _) = call(&api, file(Value::Null)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Present-but-empty: the explicit "general work" escape, the only way a person can file
+    // outside the scope while the board is scoped to something.
+    let (_, general, _) = call(&api, file(Value::String(String::new()))).await;
+    // Named: joins that one, creating it if new.
+    let (_, named, _) = call(&api, file(Value::String("seo-redirects".into()))).await;
+
+    let s = api.store.lock().unwrap();
+    let cf = s.workstream_by_name(pid, "contact-form").unwrap().unwrap();
+    let scoped = s.board(pid, &BoardQuery::board().with_workstream(Some(cf.id))).unwrap();
+    let in_scope: Vec<i64> = scoped.tasks.iter().map(|t| t.id).collect();
+
+    assert!(in_scope.contains(&inherited["task"]["id"].as_i64().unwrap()),
+        "an omitted workstream must inherit the board's scope");
+    assert!(!in_scope.contains(&named["task"]["id"].as_i64().unwrap()),
+        "a named workstream must win over the current scope");
+
+    // The general task carries no workstream, so it shows from every scope -- the assertion
+    // that distinguishes it is that it is NOT in contact-form's own listing.
+    let seo = s.workstream_by_name(pid, "seo-redirects").unwrap().unwrap();
+    let seo_board = s.board(pid, &BoardQuery::board().with_workstream(Some(seo.id))).unwrap();
+    let seo_ids: Vec<i64> = seo_board.tasks.iter().map(|t| t.id).collect();
+    assert!(seo_ids.contains(&general["task"]["id"].as_i64().unwrap()),
+        "general work is visible from every scope");
+    assert!(seo_ids.contains(&named["task"]["id"].as_i64().unwrap()));
+}
+
+#[tokio::test]
+async fn a_mis_filed_task_can_be_moved_from_the_panel() {
+    let (api, pid) = api();
+    let (tid, ver) = {
+        let s = api.store.lock().unwrap();
+        let w = s.ensure_workstream(pid, "contact-form").unwrap();
+        s.set_current_workstream(pid, w.id).unwrap();
+        s.ensure_workstream(pid, "typo3-v13-upgrade").unwrap();
+        let t = s.create_task(pid, TaskDraft::new("deprecated TCA calls")).unwrap();
+        (t.id, t.version)
+    };
+
+    let (status, _, _) = call(&api, json_req(
+        "PATCH", &format!("/api/projects/{pid}/tasks/{tid}"),
+        serde_json::json!({ "workstream": "typo3-v13-upgrade", "log": "belongs to the upgrade" }),
+        Some(&ver.to_string()))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The detail response must carry the workstream, or the panel cannot preselect the
+    // control and a person editing a task would silently re-file it.
+    let (_, detail, _) = call(&api, get(&format!("/api/projects/{pid}/tasks/{tid}"))).await;
+    assert_eq!(detail["workstream"]["name"], "typo3-v13-upgrade");
+}
+
+#[tokio::test]
+async fn an_unknown_workstream_is_refused_with_the_ones_that_exist() {
+    let (api, pid) = api();
+    {
+        let s = api.store.lock().unwrap();
+        s.ensure_workstream(pid, "contact-form").unwrap();
+        s.ensure_workstream(pid, "typo3-v13-upgrade").unwrap();
+    }
+    // The human API lists workstreams, it does not mint them -- an agent starts one when it
+    // is told what it is working on, which is the moment the name is actually known. The
+    // value here is the typo case: `contact-forms` should say what exists rather than
+    // silently becoming a third workstream nobody meant to create.
+    let (status, body, _) = call(&api, json_req(
+        "PUT", &format!("/api/projects/{pid}/workstream"),
+        serde_json::json!({ "name": "contact-forms" }), None)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let msg = body.to_string();
+    assert!(msg.contains("contact-form") && msg.contains("typo3-v13-upgrade"),
+        "the error must list what does exist: {msg}");
+
+    let (_, board, _) = call(&api, get(&format!("/api/projects/{pid}/board"))).await;
+    assert_eq!(board["workstreams"].as_array().unwrap().len(), 2,
+        "and must not have created a third");
+}

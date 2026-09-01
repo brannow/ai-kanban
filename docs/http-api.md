@@ -300,6 +300,84 @@ project's detail view — they are the record of how a board came to claim the d
 claims, which is exactly what someone debugging a split board needs — but never in a feed
 that answers "what happened lately".
 
+## Workstreams
+
+Migration 005 added workstreams — named slices of work inside a board (see
+`docs/data-model.md`). The human board follows the **same** current workstream the agent's
+does. One board, one active workstream, shared by a person and their agents; a UI showing a
+different slice than the agent is working in would make the two disagree about what "the
+board" is, which is the confusion workstreams exist to remove.
+
+`GET /board` therefore returns two extra fields:
+
+| Field | What it is |
+|---|---|
+| `workstream` | What the board is scoped to, or `null`. Also what a new task joins by default. |
+| `workstreams` | Everything selectable — **including workstreams with no open tasks** |
+
+That second point is a real difference from the agent's board, which hides empty
+workstreams because a line reading `contact-form 0` is noise in a response with a token
+budget. A person's selector must list them, or a workstream created a moment ago is one
+nobody can pick.
+
+### `PUT /api/projects/{p}/workstream`
+
+`{"name": "contact-form"}` scopes the board to an **existing** workstream; `{"name": null}`
+widens back out. Names are normalized, so `TYPO3 v13 Upgrade` and `typo3-v13-upgrade` are one
+workstream rather than two.
+
+**This API lists workstreams; it does not create them.** An unknown name is a `400` naming
+the ones that exist. Creation belongs to the agent, which starts a workstream when it is told
+what it is working on — the moment the name is actually known.
+
+The value of refusing is not access control; this is a local, single-user tool. It is the
+typo. `normalize_name` folds `Contact Form` into `contact-form`, but nothing folds
+`contact-forms`, and a near-miss that silently becomes a third workstream is the same
+split-memory failure `project_paths` exists to prevent, one level down. Refusing turns that
+into an error that says what exists, which is the self-correcting shape every other invalid
+value in this API uses.
+
+**Why the human gets an endpoint when the agent gets no tool.** The agent enters a
+workstream as a side effect of asking to see one (`board(workstream: …)`), because for an
+agent an extra call is one that gets skipped. A person clicking a control is already stating
+intent, and hiding the change behind a side effect would move where their work is filed
+without them knowing. Different consumers, different affordances — the same reasoning that
+put `origin: user` on every write from this API.
+
+### Filing states where the task lands
+
+`POST /tasks` takes an optional `workstream` name:
+
+- **omitted** — inherit the board's current workstream, exactly as the agent's `task_add` does
+- **`""`** — file it unscoped, the explicit escape for general project work while the board
+  is scoped to something
+- **a name** — join that existing workstream; an unknown one is refused, not created
+
+The new-task dialog always shows the field, prefilled with the current workstream. That is
+the point: a task landing in a scope the person could not see was the bug this replaced.
+
+### Moving a task that was filed into the wrong one
+
+`PATCH /tasks/{t}` takes the same `workstream` field, with the same three readings: absent
+leaves it alone, `""` moves it out of every workstream, an existing name moves it there. The task
+detail response carries `workstream` so the panel can preselect the control with the task's
+**own** workstream — not the board's, which would silently re-file every task the panel
+touched.
+
+This matters more than it looks. Agents inherit their workstream silently, so a task landing
+in the wrong one is the expected error, and before this it was the only field on a task that
+could never be corrected.
+
+### Known gap
+
+Task cards do not show which workstream they belong to, so when the board is scoped, work in
+that workstream and general unscoped work look alike. `workstream_id` is deliberately absent
+from `TASK_COLS` — one of the two things holding `MIN_READABLE_VERSION` at 2, the other being
+that unscoped queries never name the column at all (see `docs/data-model.md`; assuming
+`TASK_COLS` alone was enough is what shipped a bug). So surfacing it per card needs a separate
+lookup, as `GET /tasks/{t}` already does, rather than a wider column list. Worth doing; not
+worth reopening that decision for.
+
 ## Explicitly not in v1
 
 - **Drag-to-reorder.** There is no `position` column and there should not be one.

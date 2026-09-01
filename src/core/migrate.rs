@@ -51,6 +51,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration { version: 2, sql: include_str!("migrations/002_row_version.sql") },
     Migration { version: 3, sql: include_str!("migrations/003_event_note_id.sql") },
     Migration { version: 4, sql: include_str!("migrations/004_events_autoincrement.sql") },
+    Migration { version: 5, sql: include_str!("migrations/005_workstreams.sql") },
 ];
 
 /// The version this binary brings a store up to.
@@ -72,6 +73,16 @@ pub const SCHEMA_VERSION: i64 = if MIGRATIONS.len() == 0 {
 /// reading a store that a newer one has migrated simply asks for fewer columns and works.
 ///
 /// This is `2` because migration 002 added `tasks.version`, which `TASK_COLS` now selects.
+///
+/// Migration 005 deliberately did **not** raise it, and the reasoning is worth keeping
+/// because it is the pattern to copy rather than the exception. It adds
+/// `tasks.workstream_id`, two tables, and a sticky pointer -- but nothing it adds is ever
+/// named in a `SELECT` list that a read path uses. `workstream_id` is used only in `WHERE`
+/// and `GROUP BY`, and the sticky pointer went into its own table precisely so that
+/// `row_to_project`'s column list would not change. Reads against a store still on 2 or 4
+/// therefore work unchanged; they simply find no workstreams and render the whole board,
+/// which is exactly the pre-005 behaviour. Cost: one extra table. Bought: the SessionStart
+/// hook keeps working through the upgrade instead of going silent for a session.
 ///
 /// # What it buys
 ///

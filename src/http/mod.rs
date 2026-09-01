@@ -18,7 +18,7 @@ pub mod stream;
 use crate::core::{Error, Store};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch};
+use axum::routing::{delete, get, patch, put};
 use axum::{Json, Router};
 use std::sync::{Arc, Mutex};
 
@@ -49,6 +49,7 @@ pub fn router(api: Api) -> Router {
         .route("/api/projects", get(routes::projects))
         .route("/api/projects/{p}", get(routes::project))
         .route("/api/projects/{p}/board", get(routes::board))
+        .route("/api/projects/{p}/workstream", put(routes::set_workstream))
         .route("/api/projects/{p}/tasks", get(routes::tasks).post(routes::create_task))
         .route("/api/projects/{p}/tasks/{t}", get(routes::task))
         .route("/api/projects/{p}/tasks/{t}", patch(routes::update_task))

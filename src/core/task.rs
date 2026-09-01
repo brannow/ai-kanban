@@ -47,6 +47,13 @@ pub struct TaskPatch {
     pub priority: Option<Priority>,
     pub task_type: Option<TaskType>,
     pub blocked_by: Option<Option<i64>>,
+    /// Move the task between workstreams. Nested `Option` like `blocked_by`: `None` leaves
+    /// it alone, `Some(None)` makes it general project work, `Some(Some(id))` moves it.
+    ///
+    /// This exists because the agent inherits its workstream silently, which makes
+    /// mis-filing the EXPECTED error rather than an edge case -- and without this it was
+    /// the only field on a task that could never be corrected afterwards.
+    pub workstream: Option<Option<i64>>,
     /// The *why*. Recorded as the event body -- this is the field that makes the history
     /// worth reading six months later.
     pub log: Option<String>,
@@ -70,9 +77,14 @@ pub struct TaskPatch {
 }
 
 impl TaskPatch {
+    /// Every field must be listed here. A field missing from this check makes a patch that
+    /// changes only that field look like no change at all, and `update_task` returns early
+    /// without writing -- silently, since nothing errors. `workstream` was added and missed
+    /// exactly that way.
     pub fn is_empty(&self) -> bool {
         self.title.is_none() && self.body.is_none() && self.status.is_none()
             && self.priority.is_none() && self.task_type.is_none() && self.blocked_by.is_none()
+            && self.workstream.is_none()
             && self.log.is_none()
     }
 }
@@ -97,14 +109,31 @@ pub(crate) fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
 }
 
 impl Store {
+    /// Files a task. The board's current workstream is **inherited**, never passed in.
+    ///
+    /// That is the whole reason `task_add` gained no new argument. Per `docs/tool-design.md`
+    /// -- "every argument we don't bother the agent with is a win" -- and per note #12,
+    /// filing is already the call least able to afford friction: it is the one an agent
+    /// under pressure skips, and skipping it is the failure this project exists to fix.
+    /// A workstream the agent has to remember to supply is one that ends up unset.
     pub fn create_task(&self, project_id: i64, draft: TaskDraft) -> Result<Task> {
+        let workstream = self.current_workstream(project_id)?.map(|w| w.id);
+        self.create_task_in(project_id, draft, workstream)
+    }
+
+    /// `create_task` with the workstream chosen explicitly rather than inherited.
+    ///
+    /// Only the human API uses this. An agent gets inheritance because an extra argument on
+    /// the call it is most likely to skip is a cost the design will not pay; a person
+    /// filling in a form can see the field and choose, including choosing "none".
+    pub fn create_task_in(&self, project_id: i64, draft: TaskDraft, workstream: Option<i64>) -> Result<Task> {
         let ts = now();
         self.conn.execute(
-            "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, blocked_by, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+            "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, blocked_by, workstream_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
             params![
                 project_id, draft.title, draft.body, draft.status, draft.task_type,
-                draft.origin, draft.priority, draft.blocked_by, ts
+                draft.origin, draft.priority, draft.blocked_by, workstream, ts
             ],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -179,15 +208,25 @@ impl Store {
         let priority = patch.priority.unwrap_or(before.priority);
         let task_type = patch.task_type.unwrap_or(before.task_type);
         let blocked_by = match patch.blocked_by { Some(v) => v, None => before.blocked_by };
+        // Read separately because `workstream_id` is deliberately not in `TASK_COLS`, so
+        // `before` does not carry it. See migration 005 on why that column stays out.
+        let before_ws = self.task_workstream(project_id, id)?;
+        let workstream = match patch.workstream { Some(v) => v, None => before_ws };
+        if let Some(w) = workstream {
+            // Same-board check, for the same reason `blocked_by` has one: the store is
+            // global, and a workstream id from another board would file this task into a
+            // group that does not exist on the board showing it.
+            self.workstream(project_id, w)?;
+        }
 
         // `?9 IS NULL OR version = ?9` keeps the guarded and unguarded writes on one
         // statement: a caller that read a version gets a compare-and-swap, one that did not
         // gets the plain update. Two statements would be two chances to fix a bug once.
         let changed = self.conn.execute(
             "UPDATE tasks SET title=?2, body=?3, status=?4, type=?5, priority=?6, blocked_by=?7, updated_at=?8,
-                    version = version + 1
+                    workstream_id=?10, version = version + 1
               WHERE id=?1 AND (?9 IS NULL OR version = ?9)",
-            params![id, title, body, status, task_type, priority, blocked_by, ts, patch.expected_version],
+            params![id, title, body, status, task_type, priority, blocked_by, ts, patch.expected_version, workstream],
         )?;
         if changed == 0 {
             // The row exists -- `self.task()` above proved it is here and on this board --
@@ -206,10 +245,32 @@ impl Store {
         } else {
             "updated".to_string()
         };
-        let summary = patch.log.clone().unwrap_or_else(|| describe_change(&before, &title, &body, status, priority, blocked_by));
+        // Resolved to a NAME here rather than in `describe_change`, which has no store to
+        // look one up with. An id in the history would be unreadable six months later,
+        // which is the one thing this line exists to avoid.
+        let moved = if workstream != before_ws {
+            Some(match workstream {
+                Some(w) => format!("moved to workstream \"{}\"", self.workstream(project_id, w)?.name),
+                None => "moved out of its workstream".to_string(),
+            })
+        } else {
+            None
+        };
+        let summary = patch.log.clone()
+            .unwrap_or_else(|| describe_change(&before, &title, &body, status, priority, blocked_by, moved));
         self.write_event(before.project_id, Some(id), patch.actor, &kind, &summary)?;
 
         self.task(project_id, id)
+    }
+
+    /// A task's workstream id. A query of its own because `workstream_id` is kept out of
+    /// `TASK_COLS` -- see migration 005 -- so no `Task` carries it.
+    pub fn task_workstream(&self, project_id: i64, id: i64) -> Result<Option<i64>> {
+        use rusqlite::OptionalExtension;
+        Ok(self.conn.query_row(
+            "SELECT workstream_id FROM tasks WHERE id = ?1 AND project_id = ?2",
+            params![id, project_id], |r| r.get(0),
+        ).optional()?.flatten())
     }
 
     pub fn tasks_blocked_by(&self, project_id: i64, id: i64) -> Result<Vec<Task>> {
@@ -239,8 +300,14 @@ impl Store {
 /// Fallback event text when the caller gave no reason. States what changed, so the history
 /// is at least factual -- but it is deliberately duller than a real `log`, because "what"
 /// without "why" is the weaker half.
-fn describe_change(before: &Task, title: &str, body: &str, status: Status, priority: Priority, blocked_by: Option<i64>) -> String {
+fn describe_change(
+    before: &Task, title: &str, body: &str, status: Status, priority: Priority,
+    blocked_by: Option<i64>, moved: Option<String>,
+) -> String {
     let mut parts = Vec::new();
+    // First: a move is the most significant thing that can happen to a task without its
+    // status changing, and it is the change a reader is least able to reconstruct later.
+    if let Some(m) = moved { parts.push(m); }
     if status != before.status { parts.push(format!("{} -> {}", before.status, status)); }
     if priority != before.priority { parts.push(format!("priority {} -> {}", before.priority, priority)); }
     if blocked_by != before.blocked_by {

@@ -257,3 +257,66 @@ fn the_json_survives_a_trip_through_text() {
     let pid = dst.all_projects().unwrap()[0].id;
     assert!(all_tasks(&dst, pid).unwrap().iter().any(|t| t.title == "migrate the store"));
 }
+
+#[test]
+fn a_round_trip_keeps_workstreams_and_which_tasks_are_in_them() {
+    // The failure this guards is silent by construction: every assertion in this file
+    // predates `workstream_id`, so an export that dropped it stayed green while quietly
+    // stripping the grouping off every task in the backup.
+    let dir = tempfile::tempdir().unwrap();
+    let src = Store::open(&dir.path().join("a.db")).unwrap();
+    let pid = src.resolve_project(&dir.path().join("repo")).unwrap().project.id;
+
+    let w = src.ensure_workstream(pid, "contact-form").unwrap();
+    src.set_current_workstream(pid, w.id).unwrap();
+    src.create_task(pid, TaskDraft::new("inside the workstream")).unwrap();
+    src.clear_current_workstream(pid).unwrap();
+    src.create_task(pid, TaskDraft::new("general work")).unwrap();
+    // An empty, closed workstream: the case a "rebuild the list from the tasks" export
+    // would lose entirely.
+    let old = src.ensure_workstream(pid, "last-years-migration").unwrap();
+    src.close_workstream(pid, old.id).unwrap();
+
+    let export = src.export(&[]).unwrap();
+    let json = serde_json::to_string(&export).unwrap();
+
+    let dst = Store::open(&dir.path().join("b.db")).unwrap();
+    dst.import(&serde_json::from_str::<Export>(&json).unwrap()).unwrap();
+
+    let restored = dst.project_by_key(&src.project(pid).unwrap().key).unwrap().unwrap();
+    let names: Vec<String> = {
+        let mut v = dst.workstream_summaries(restored.id, None).unwrap()
+            .into_iter().map(|w| w.workstream.name).collect::<Vec<_>>();
+        v.sort();
+        v
+    };
+    assert_eq!(names, vec!["contact-form"], "open workstreams must survive: {names:?}");
+
+    let closed = dst.workstream_by_name(restored.id, "last-years-migration").unwrap();
+    assert!(closed.is_some(), "an empty closed workstream must survive the trip");
+    assert!(closed.unwrap().closed_at.is_some(), "and must still be closed");
+
+    let ws = dst.workstream_by_name(restored.id, "contact-form").unwrap().unwrap();
+    let scoped = dst.board(restored.id, &BoardQuery::board().with_workstream(Some(ws.id))).unwrap();
+    let inside: Vec<_> = scoped.tasks.iter().filter(|t| t.title == "inside the workstream").collect();
+    assert_eq!(inside.len(), 1, "the task must come back still in its workstream");
+}
+
+#[test]
+fn an_export_written_before_workstreams_existed_still_imports() {
+    // `serde(default)` is what makes this work, and it is easy to lose. An old backup that
+    // stopped restoring would be discovered at exactly the wrong moment.
+    let dir = tempfile::tempdir().unwrap();
+    let old = r#"{"format":1,"schema_version":4,"exported_at":0,"projects":[
+        {"key":"path:/old","name":"old","created_at":0,"paths":[],
+         "tasks":[{"id":1,"title":"a task","body":"","status":"backlog","type":"task",
+                   "origin":"agent","priority":"normal","blocked_by":null,
+                   "created_at":0,"updated_at":0}],
+         "notes":[],"events":[]}]}"#;
+    let s = Store::open(&dir.path().join("s.db")).unwrap();
+    let parsed: Export = serde_json::from_str(old).expect("a pre-005 export must still parse");
+    s.import(&parsed).unwrap();
+
+    let p = s.project_by_key("path:/old").unwrap().expect("the project must be restored");
+    assert_eq!(all_tasks(&s, p.id).unwrap().len(), 1);
+}

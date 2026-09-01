@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ai-kanban": {
+      "command": "@BIN@",
+      "args": ["mcp"]
+    }
+  }
+}

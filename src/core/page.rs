@@ -83,14 +83,38 @@ impl Store {
     pub fn tasks_page(
         &self, project_id: i64, statuses: &[Status], cursor: Option<Cursor>, limit: usize,
     ) -> Result<Page<Task>> {
+        self.tasks_page_in(project_id, statuses, cursor, limit, None)
+    }
+
+    /// `tasks_page` restricted to a workstream, for the human board's scope control.
+    ///
+    /// Unscoped tasks come along, exactly as they do on the agent's board -- work with no
+    /// workstream is general project work and belongs to every view. The two consumers
+    /// disagreeing about what "in this workstream" contains would be worse than either
+    /// answer.
+    pub fn tasks_page_in(
+        &self, project_id: i64, statuses: &[Status], cursor: Option<Cursor>, limit: usize,
+        workstream: Option<i64>,
+    ) -> Result<Page<Task>> {
         let filter = if statuses.is_empty() {
             String::new()
         } else {
             let list = statuses.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", ");
             format!(" AND status IN ({list})")
         };
+        // Inlined rather than bound, matching how the status list above is built: the
+        // positional parameters here are already load-bearing for the cursor, and this is
+        // an `i64` this code looked up itself, never caller text.
+        //
+        // Emitting NOTHING when unscoped is required, not an optimisation: a store this
+        // binary has not migrated has no `workstream_id`, and naming a missing column in a
+        // WHERE clause fails the query. See `board::scope_filter`.
+        let ws = match workstream {
+            Some(id) => format!(" AND (workstream_id = {id} OR workstream_id IS NULL)"),
+            None => String::new(),
+        };
         let sql = format!(
-            "SELECT {TASK_COLS} FROM tasks WHERE project_id = ?1{filter}{}
+            "SELECT {TASK_COLS} FROM tasks WHERE project_id = ?1{filter}{ws}{}
              ORDER BY updated_at DESC, id DESC LIMIT ?2",
             after("updated_at", cursor)
         );

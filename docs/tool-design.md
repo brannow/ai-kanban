@@ -106,6 +106,51 @@ Each is one call. `task_update` takes status, priority, body **and** the `log` e
 together, because splitting them would make recording the reason a separate call — and a
 separate call is the one that gets skipped.
 
+### Workstreams add no tool
+
+Migration 005 added workstreams — named slices of work inside a board. It added **zero
+tools**, and that is the design rather than an economy.
+
+"Manage a workstream" is not an intent an agent has. It is bookkeeping, and the table above
+maps tools to intents. So workstreams ride the intents that already exist:
+
+| The agent's intent | What happens |
+|---|---|
+| "Where do things stand?" | `board()` renders the current workstream plus a one-line directory of the others |
+| "Show me the contact-form work" | `board(workstream: "contact-form")` — **looking at a workstream is entering it** |
+| "I found something, file it" | `task_add(title)` inherits the current workstream, with **no new argument** |
+
+| "This belongs to different work" | `task_update(workstream: …)` — `""` moves it out of every workstream |
+
+The `task_add` row is load-bearing. Per *"every argument we don't bother the agent with is a
+win"*, and because filing is the call an agent under pressure skips, a workstream the agent
+must remember to supply is one that ends up unset.
+
+The `task_update` row is the consequence of that choice. Because filing inherits **silently**,
+mis-filing is the expected error rather than an edge case — so the move has to exist, and it
+belongs on `task_update` ("move it, and say why") rather than on a tool of its own. Without a
+`log`, the automatic summary names the destination workstream, because an id in the history
+would be unreadable six months later.
+
+State-as-a-side-effect-of-use has precedent: `add_path_alias` learns a path because a board
+was *used*, not through a call of its own. But the analogy has one sharp edge, and it is why
+`board` prints `Now working in: X` when the scope changes. Alias learning **converges** — the
+same directory always learns the same board. Entering-by-looking does not: an agent glancing
+at an adjacent workstream has silently changed where its next `task_add` lands. So the switch
+announces itself rather than relying on the agent noticing a changed header.
+
+For the same reason `board` is annotated **`read_only_hint = false`**. A `board` call carrying
+a `workstream` is not a pure read — it records where work is happening, and every later
+`task_add` inherits it. Annotating it read-only would be convenient and untrue, and the client
+that trusts the annotation is exactly the one that gets surprised. Plain `board()` writes
+nothing, but annotations cannot be conditional, so it describes the wider case.
+
+The bound on all of this: a tool may do more **work** internally, never return more **text**.
+The directory is one line with counts however many workstreams exist. Rendering each
+workstream's tasks is the "grouped rendering" this design rejected — it would force
+`compute_omitted` to account per group or the *nothing is dropped silently* guarantee starts
+lying.
+
 ### `task_show`
 
 ```

@@ -141,6 +141,11 @@ pub struct BoardParams {
     pub status: Option<String>,
     /// Show more than the default. Pass "all" to lift the cap on listed tasks.
     pub include: Option<String>,
+    /// Narrow the board to one workstream -- a feature, an upgrade, a migration -- and
+    /// work there. Unknown names start a new one. Pass "all" to widen back out.
+    ///
+    /// Tasks you file afterwards join this workstream automatically.
+    pub workstream: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Default)]
@@ -169,6 +174,12 @@ pub struct TaskUpdateParams {
     pub task: i64,
     /// backlog, doing, blocked, done or archived.
     pub status: Option<String>,
+    /// Move it to another workstream. Pass "" to make it general work with no workstream.
+    ///
+    /// Worth reaching for when a task turns out to belong to different work than the one
+    /// you were in when you filed it -- tasks join the current workstream automatically,
+    /// so that happens.
+    pub workstream: Option<String>,
     pub priority: Option<String>,
     #[serde(rename = "type")]
     pub task_type: Option<String>,
@@ -240,7 +251,18 @@ pub struct LogParams {
 impl AiKanban {
     /// Show the board: what is in flight, what is blocked and why, and what happened
     /// recently. Call this when starting work on a project to find out where things stand.
-    #[tool(name = "board", annotations(read_only_hint = true, idempotent_hint = true))]
+    ///
+    /// Pass `workstream` when the user says what you are working on ("we're doing the
+    /// contact form now") -- the board narrows to it and tasks you file afterwards join it.
+    ///
+    /// `read_only_hint` is **false** because of that argument, and the honesty costs
+    /// something worth paying for. A `board` call with a `workstream` is no longer a pure
+    /// read: it records where work is happening, which every later `task_add` inherits.
+    /// Annotating it read-only would be convenient and untrue, and a client that trusts the
+    /// annotation is exactly the one that would be surprised. Plain `board()` writes
+    /// nothing; the annotation cannot be conditional, so it describes the wider case.
+    /// `idempotent_hint` still holds -- entering the same workstream twice is one state.
+    #[tool(name = "board", annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true))]
     fn board(&self, Parameters(p): Parameters<BoardParams>) -> Result<String, ErrorData> {
         let store = self.store();
 
@@ -266,8 +288,43 @@ impl AiKanban {
             q.limit = usize::MAX;
         }
 
-        let snap = store.board(resolved.project.id, &q).map_err(fail)?;
-        Ok(render::board(&snap))
+        let pid = resolved.project.id;
+        let before = store.current_workstream(pid).map_err(fail)?;
+        let mut switched = None;
+        match p.workstream.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            // "all" leaves the workstream rather than naming one, mirroring how `project`
+            // and `include` already use the word. Without a way out, a board entered once
+            // could never be widened again except by naming another workstream.
+            Some(w) if w.eq_ignore_ascii_case(ALL) => {
+                store.clear_current_workstream(pid).map_err(fail)?;
+                q.workstream = None;
+            }
+            Some(w) => {
+                let ws = store.ensure_workstream(pid, w).map_err(fail)?;
+                if before.as_ref().map(|b| b.id) != Some(ws.id) {
+                    store.set_current_workstream(pid, ws.id).map_err(fail)?;
+                    switched = Some(ws.name.clone());
+                }
+                q.workstream = Some(ws.id);
+            }
+            // No argument: inherit whatever the board is already scoped to. This is what
+            // makes the scope survive between calls and, more importantly, what lets the
+            // SessionStart hook honour it -- the hook passes no arguments at all.
+            None => q.workstream = before.as_ref().map(|b| b.id),
+        }
+
+        let snap = store.board(pid, &q).map_err(fail)?;
+        let mut out = String::new();
+        // Say the switch out loud. Entering by looking is convenient and has one sharp
+        // edge: an agent that glances at an adjacent workstream has silently changed where
+        // its next `task_add` lands. Unlike alias learning -- the precedent for
+        // state-as-a-side-effect-of-use -- this does not converge, so it has to announce
+        // itself rather than rely on the agent inferring it from a changed header.
+        if let Some(name) = switched {
+            out.push_str(&format!("Now working in: {name}. Tasks you file join it.\n\n"));
+        }
+        out.push_str(&render::board(&snap));
+        Ok(out)
     }
 
     /// File a task. Use this the moment you notice something worth doing -- an unrelated
@@ -308,6 +365,15 @@ impl AiKanban {
             // 0 is the clear signal: JSON has no way to say "set this to null" that
             // survives an optional field, and inventing a magic string would be worse.
             blocked_by: p.blocked_by.map(|b| if b > 0 { Some(b) } else { None }),
+            // Empty string clears, matching how 0 clears `blocked_by` just above: an
+            // optional JSON field cannot express "set this to null" on its own.
+            workstream: match p.workstream.as_deref().map(str::trim) {
+                None => None,
+                Some("") => Some(None),
+                Some(name) => Some(Some(
+                    store.ensure_workstream(resolved.project.id, name).map_err(fail)?.id,
+                )),
+            },
             log: p.log.clone(),
             // Unguarded, deliberately -- see `TaskPatch::expected_version`.
             expected_version: None,

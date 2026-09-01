@@ -58,6 +58,18 @@ fn every_mutation_moves_the_change_cursor() {
 
     s.log(pid, Actor::Agent, "a decision").unwrap();
     moved(&s, "logging");
+
+    let w = s.ensure_workstream(pid, "contact-form").unwrap();
+    moved(&s, "creating a workstream");
+
+    s.set_current_workstream(pid, w.id).unwrap();
+    moved(&s, "entering a workstream");
+
+    s.clear_current_workstream(pid).unwrap();
+    moved(&s, "leaving a workstream");
+
+    s.close_workstream(pid, w.id).unwrap();
+    moved(&s, "closing a workstream");
 }
 
 #[test]

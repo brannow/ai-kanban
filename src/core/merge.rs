@@ -31,6 +31,7 @@ pub struct MergeReport {
     pub notes: usize,
     pub events: usize,
     pub paths: usize,
+    pub workstreams: usize,
 }
 
 impl Store {
@@ -53,6 +54,7 @@ impl Store {
                 |r| r.get::<_, i64>(0),
             )? as usize)
         };
+        let workstreams = counted("workstreams")?;
         let tasks = counted("tasks")?;
         let notes = counted("notes")?;
         let events = counted("events")?;
@@ -64,6 +66,42 @@ impl Store {
         // the blocker on one half and the blocked task on the other). Reparent everything,
         // and only then remove a project that owns nothing.
         let tx = self.conn.unchecked_transaction()?;
+
+        // Workstreams move FIRST, and this is not cosmetic ordering. Deleting the source
+        // project cascades to its `workstreams` rows, and `tasks.workstream_id` is
+        // ON DELETE SET NULL -- so a merge that reparented only tasks would silently strip
+        // every workstream assignment on the way through, with nothing reporting it. That
+        // is the same class of quiet loss `blocked_by` is protected from two comments up.
+        //
+        // Names can collide: both halves of a split board plausibly have a `contact-form`.
+        // The survivor's row wins and the source's tasks are repointed at it, because two
+        // workstreams with one name on one board is precisely the split this whole file
+        // exists to repair.
+        tx.execute(
+            "UPDATE tasks
+                SET workstream_id = (
+                    SELECT keep.id FROM workstreams keep
+                     WHERE keep.project_id = ?1
+                       AND keep.name = (SELECT gone.name FROM workstreams gone
+                                         WHERE gone.id = tasks.workstream_id))
+              WHERE workstream_id IN (
+                    SELECT gone.id FROM workstreams gone
+                     WHERE gone.project_id = ?2
+                       AND EXISTS (SELECT 1 FROM workstreams keep
+                                    WHERE keep.project_id = ?1 AND keep.name = gone.name))",
+            params![into, from],
+        )?;
+        tx.execute(
+            "DELETE FROM workstreams
+              WHERE project_id = ?2
+                AND EXISTS (SELECT 1 FROM workstreams keep
+                             WHERE keep.project_id = ?1 AND keep.name = workstreams.name)",
+            params![into, from],
+        )?;
+        tx.execute(
+            "UPDATE workstreams SET project_id = ?1 WHERE project_id = ?2",
+            params![into, from],
+        )?;
 
         // Reparenting fires the FTS `_au` triggers, which re-index title and body with
         // unchanged rowids. Wasted work, not wrong work -- and cheaper than teaching the
@@ -93,12 +131,13 @@ impl Store {
             "project_merged",
             &format!(
                 "Merged board \"{}\" ({}) into this one: {tasks} tasks, {notes} notes, \
-                 {events} events, {paths} paths. That board no longer exists.",
+                 {events} events, {paths} paths, {workstreams} workstreams. That board no \
+                 longer exists.",
                 source.name, source.key
             ),
         )?;
 
-        Ok(MergeReport { into: target, merged: source, tasks, notes, events, paths })
+        Ok(MergeReport { into: target, merged: source, tasks, notes, events, paths, workstreams })
     }
 
     /// `merge_projects` with the survivor chosen: the older board wins.

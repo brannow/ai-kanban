@@ -94,6 +94,75 @@ would be designing toward a removal date.
 Every resolved path is recorded as an alias. That is the mitigation for split memory; the
 detection is that every response states the board it resolved.
 
+### `workstreams` / `current_workstream`
+
+Added in migration 005. A workstream is a named slice of work inside one board — a feature,
+an upgrade, a migration. It is a **grouping dimension, never an identity**.
+
+**Why this exists.** `board()` had exactly two selection knobs, status and limit, and ordered
+by recency. That is fine for one repo with one stream of work. Measured on 300 tasks across
+12 workstreams, the 30 rows the board listed came from 4 workstreams picked purely by
+recency, and the workstream actually being worked on contributed **1 row**; all 8 `recent`
+entries came from a workstream nobody was touching. A cold agent was told, confidently and in
+detail, about work that was not its own. Cost was never the problem — that board was ~583
+tokens, well inside budget. *Selection* was.
+
+**Why not separate boards**, which is the intuitive fix and was rejected twice:
+
+- `blocked_by` is same-project by design (`task.rs` rejects a cross-project blocker), so
+  splitting features onto their own boards breaks cross-feature blocking — usually the first
+  thing anyone actually wants.
+- Project resolution is path-derived, and a feature is not a directory. A finished feature's
+  board becomes unreachable.
+- `merge` reparents rows and deletes the source with no provenance, so merging a finished
+  feature back produces exactly the undifferentiated pile you started from.
+
+**Why a table and not `tags`.** The directory line needs `name, COUNT(*)` per workstream on
+every board call. `tags` is a comma-joined TEXT column and nothing enumerates it; answering
+that from joined text means splitting every row in the project. Tags remain what they are —
+freeform, multi-valued, human-facing labels. A workstream is single-valued, enumerable and
+closable. Different shape, different job, and they are **not** the same feature.
+
+**`closed_at` is about the directory, not the tasks.** Closing hides a workstream from the
+listing; its tasks stay on the board and stay counted. Task-level collapsing is already
+`status`'s job — done work occupies zero rows. A site maintained for three years would
+otherwise list forty dead workstreams on every session start.
+
+**Unscoped tasks (`workstream_id IS NULL`) are in scope always.** A task with no workstream is
+general project work: it belongs to every view, not to none. This is also what makes the
+feature safe to turn on — every board that predates 005 is entirely unscoped, and scoping such
+a board strictly would blank it.
+
+**The sticky pointer is its own table, and `workstream_id` is not in `TASK_COLS`.** Both
+choices exist to avoid raising `MIN_READABLE_VERSION`. Read paths select explicit column
+lists, so a new column in one of them makes a store this binary has not migrated unreadable —
+and the `SessionStart` hook opens read-only and must never migrate. The pointer went into
+`current_workstream` so `row_to_project`'s list would not change. Cost: one extra table.
+Bought: the hook keeps working through the upgrade instead of going silent for a session.
+See note #13 for why the "adding a column is backward compatible" intuition is backwards.
+
+> **Keeping a column out of `TASK_COLS` is not sufficient, and assuming it was shipped a
+> bug.** Naming a column *anywhere* in SQL requires it to exist — `WHERE` and `ORDER BY`
+> included. The first version of this feature emitted its scope filter unconditionally, so
+> every board query against a pre-005 store failed; because every hook path is `.ok()?`,
+> nothing errored and the `SessionStart` board simply vanished. That is the exact regression
+> all of the above exists to prevent, reintroduced one clause further down.
+>
+> So when nothing is scoped, the generated SQL must not mention `workstream_id` at all. The
+> unscoped filter is `(?2 IS NULL)` rather than a bare `1`, which keeps `?2` referenced so
+> the parameter numbering is identical in both arms — drop the only use of `?2` and SQLite
+> reports the statement as taking one parameter while the caller binds two.
+>
+> `tests/workstream.rs` drops the index, the tables and the column, then asserts an unscoped
+> board and the hook still render. Any future migration that adds a column *without* raising
+> `MIN_READABLE_VERSION` needs the same test, or the claim is untested folklore.
+
+**Ordering puts the active workstream ahead of status.** This is the feature, not a detail.
+Ordered by status alone, fifty unscoped legacy tickets crowd three active-workstream tasks
+straight out of a 30-row limit — shipping the original failure with a new column that was
+supposed to fix it. The trade, stated because it is real: an unscoped `doing` task now sorts
+below an active-workstream `backlog` one. Displaced work is counted, never dropped.
+
 ### `tasks`
 
 `status` is one of `backlog | doing | blocked | done | archived`. There is no `next` —

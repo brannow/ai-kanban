@@ -99,11 +99,18 @@
   dialog { background: var(--panel); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
   dialog::backdrop { background: rgba(0,0,0,.55); }
   dialog input, dialog textarea, dialog select { width: 100%; margin-bottom: 8px; }
+/* The scope control. Deliberately labelled rather than a bare dropdown: an unlabelled
+   select next to the project one reads as a second filter, and this both narrows the board
+   and decides where new work is filed. */
+.ws { display:flex; align-items:center; gap:6px; font-size:12px; color:#6b7280; }
+.ws select { font-size:12px; }
+.wsfield { margin-top:10px; }
 </style>
 
 <header>
   <h1>ai-kanban</h1>
   <select id="project"></select>
+  <label class="ws">working in <select id="workstream"></select></label>
   <span id="live">connecting</span>
   <span class="grow"></span>
   <input id="search" placeholder="recall across boards…" size="26">
@@ -124,6 +131,7 @@
       <select name="priority"></select>
       <select name="status"></select>
     </div>
+    <label class="ws wsfield">joins workstream <select name="workstream"></select></label>
     <div class="row" style="margin-top:10px; justify-content:flex-end">
       <button value="cancel">Cancel</button>
       <button value="ok" class="primary">File it</button>
@@ -204,8 +212,33 @@ async function loadBoard() {
   render();
 }
 
+// Options for a workstream picker. The empty value means two different things depending on
+// where it is used -- "the whole board" in the topbar, "no workstream" in the new-task
+// dialog -- so the label is passed in rather than assumed.
+//
+// Lists only. Creating a workstream is the AGENT's job: it starts one when you tell it what
+// you are working on, which is the moment the name is actually known. Offering "+ new" here
+// would invite a name typed in isolation, and a near-miss spelling is how one workstream
+// quietly becomes two. The server refuses unknown names for the same reason, so this is not
+// the only thing holding the rule up.
+function workstreamOptions(blank, selected) {
+  const list = (BOARD && BOARD.workstreams) || [];
+  const opts = list.map(w => {
+    const name = w.workstream.name;
+    const on = name === selected ? ' selected' : '';
+    return `<option value="${esc(name)}"${on}>${esc(name)} (${w.open})</option>`;
+  });
+  return `<option value=""${selected ? '' : ' selected'}>${esc(blank)}</option>` + opts.join('');
+}
+
+function renderWorkstream() {
+  const current = BOARD.workstream ? BOARD.workstream.name : '';
+  $('#workstream').innerHTML = workstreamOptions('all work', current);
+}
+
 function render() {
   const b = BOARD;
+  renderWorkstream();
   $('#columns').innerHTML = b.columns.map(col => {
     const cards = col.tasks.map(t => `
       <div class="card ${esc(t.task_type)}" data-id="${t.id}">
@@ -227,6 +260,26 @@ function render() {
   document.querySelectorAll('.card').forEach(c =>
     c.onclick = () => openTask(Number(c.dataset.id)));
 }
+
+// ---- workstream ------------------------------------------------------------
+
+// Setting the scope is an explicit PUT, not a side effect of looking. The agent enters a
+// workstream by asking to see it, because for an agent an extra call is one that gets
+// skipped -- but a person clicking a control is already stating intent, and making the
+// change implicit would move where their work is filed without them knowing.
+async function setWorkstream(name) {
+  try {
+    await api(`/api/projects/${PROJECT}/workstream`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: name || null }),
+    });
+    $('#panel').hidden = true;
+    await loadBoard();
+  } catch (e) { fail(e.message); }
+}
+
+$('#workstream').onchange = e => setWorkstream(e.target.value);
 
 // ---- task detail -----------------------------------------------------------
 
@@ -251,6 +304,7 @@ async function openTask(id) {
       <div class="row">
         <select id="st"></select>
         <select id="pr"></select>
+        <select id="ws"></select>
         <input id="log" class="grow" placeholder="why (recorded in history)">
         <button id="save" class="primary">save</button>
       </div>
@@ -291,6 +345,11 @@ async function openTask(id) {
 
   fillSelect($('#st'), statuses, t.status);
   fillSelect($('#pr'), META.priorities, t.priority);
+  // Preselected with the task's OWN workstream, not the board's -- this control moves the
+  // task, and defaulting it to the current scope would silently re-file everything the
+  // panel touched.
+  $('#ws').innerHTML = workstreamOptions('no workstream',
+    body.workstream ? body.workstream.name : '');
   $('#panel').hidden = false;
   $('#close').onclick = () => { $('#panel').hidden = true; OPEN_TASK = null; };
   $('#save').onclick = () => saveTask(id);
@@ -309,6 +368,9 @@ async function saveTask(id) {
       body: JSON.stringify({
         status: $('#st').value,
         priority: $('#pr').value,
+        // Always sent: the control shows the task's current workstream, so leaving it
+        // alone and moving it are both explicit rather than one being an omission.
+        workstream: $('#ws').value,
         log: $('#log').value || null,
       }),
     });
@@ -373,6 +435,10 @@ $('#new').onclick = () => {
   fillSelect(f.type, META.types, 'task');
   fillSelect(f.priority, META.priorities, 'normal');
   fillSelect(f.status, META.open_statuses, 'backlog');
+  // Prefilled with the board's current workstream and shown, never silent. A task landing
+  // in a scope the person could not see is the whole bug this UI change exists to fix.
+  f.workstream.innerHTML = workstreamOptions('no workstream (general)',
+    BOARD && BOARD.workstream ? BOARD.workstream.name : '');
   $('#newdlg').showModal();
 };
 
@@ -388,6 +454,9 @@ $('#newdlg').addEventListener('close', async () => {
       body: JSON.stringify({
         title: f.title.value, body: f.body.value,
         type: f.type.value, priority: f.priority.value, status: f.status.value,
+        // Always sent, including as "" for general work: the field is on screen, so the
+        // choice shown is the choice made. Omitting it would silently re-inherit.
+        workstream: f.workstream.value,
       }),
     });
     await loadBoard();

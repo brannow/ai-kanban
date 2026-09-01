@@ -1,179 +1,158 @@
-//! The plugin's own configuration, checked as a build artifact.
+//! The plugin's own configuration, checked as a **generated** artifact.
 //!
-//! These exist because the failure they guard is invisible in this repository. Every path
-//! in the plugin resolves correctly here, where the plugin sits inside a checkout; it is
-//! only a *copy* of the plugin -- the normal way to install one -- that breaks. Nothing in
-//! the test suite exercised that, so the plugin shipped for four days pointing at a binary
-//! it could only find in one directory on one machine.
+//! # Why these exist
+//!
+//! The failure they guard is invisible from inside this repository. The previous plugin
+//! shipped for four days pointing at
+//! `${CLAUDE_PLUGIN_ROOT}/../../../target/release/ai-kanban`, which resolves only when the
+//! plugin sits inside an ai-kanban checkout. Every path worked here, where it was the only
+//! place anyone ran it; only a *copy* broke, and copying is how a plugin is installed.
+//! See note #15 on the board.
+//!
+//! `make install` now generates the config with the binary's absolute path baked in, so
+//! there is no relative resolution left to get wrong. That removes the old bug class and
+//! introduces a smaller one: the generation itself. These tests are aimed at that, and they
+//! install into a temporary prefix rather than reading anything out of the working tree.
+//!
+//! They drive `make plugin` rather than `make install` on purpose — the generation is where
+//! the bugs are, and shelling out to `cargo build --release` from inside `cargo test` is
+//! slow and serialises on the build lock for no added coverage.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn plugin_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".claude/skills/ai-kanban")
+fn repo() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
 }
 
-fn config(name: &str) -> String {
-    std::fs::read_to_string(plugin_dir().join(name)).expect("plugin config must exist")
+/// Renders the plugin into `claude_dir`, pointed at `bin`. Returns the plugin directory.
+fn generate(claude_dir: &Path, bin: &Path) -> PathBuf {
+    let out = Command::new("make")
+        .arg("plugin")
+        .arg(format!("CLAUDE_DIR={}", claude_dir.display()))
+        .arg(format!("PLUGIN_BIN={}", bin.display()))
+        .current_dir(repo())
+        .output()
+        .expect("make must be available");
+    assert!(out.status.success(), "make plugin failed: {}", String::from_utf8_lossy(&out.stderr));
+    claude_dir.join("skills/ai-kanban")
+}
+
+/// An executable stand-in, so these tests never need a release build.
+fn stub(dir: &Path) -> PathBuf {
+    let p = dir.join("ai-kanban");
+    std::fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    p
+}
+
+fn read(plugin: &Path, name: &str) -> String {
+    std::fs::read_to_string(plugin.join(name))
+        .unwrap_or_else(|e| panic!("{name} must be generated: {e}"))
+}
+
+/// The hook command as the host would run it: through a shell, from an unrelated directory.
+fn run_hook(plugin: &Path, event: &str) -> std::process::Output {
+    let hooks: serde_json::Value = serde_json::from_str(&read(plugin, "hooks.json")).unwrap();
+    let key = if event == "session-start" { "SessionStart" } else { "PostToolUse" };
+    let cmd = hooks["hooks"][key][0]["hooks"][0]["command"].as_str().expect("a command").to_string();
+    Command::new("sh").arg("-c").arg(&cmd).current_dir("/").output().unwrap()
 }
 
 #[test]
-fn no_plugin_config_reaches_outside_the_plugin_directory() {
-    // `${CLAUDE_PLUGIN_ROOT}/../../../target/release/ai-kanban` is the shape that broke:
-    // it only resolves when the plugin lives inside an ai-kanban checkout. Anything
-    // climbing out of the plugin root is making the same assumption.
+fn the_generated_config_names_the_binary_by_absolute_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = stub(tmp.path());
+    let plugin = generate(tmp.path(), &bin);
+
     for name in ["hooks.json", "mcp.json"] {
-        let body = config(name);
-        assert!(
-            !body.contains(".."),
-            "{name} escapes the plugin directory, so a copied plugin points at nothing"
-        );
+        let text = read(&plugin, name);
+        assert!(text.contains(bin.to_str().unwrap()), "{name} must name the binary: {text}");
+        // The bug this whole file exists for. A plugin is installed by being copied, so
+        // anything resolved relative to the plugin's own location points at nothing.
+        assert!(!text.contains("CLAUDE_PLUGIN_ROOT"),
+            "{name} must not resolve relative to the plugin directory: {text}");
+        assert!(!text.contains(".."), "{name} must not contain a relative hop: {text}");
     }
 }
 
 #[test]
-fn both_entry_points_go_through_the_resolver() {
-    // The MCP server and the hooks have to agree. When only one was fixed in the past, the
-    // board still appeared at session start while the tools were silently absent -- which
-    // reads as "the agent ignored the board" rather than as a broken install.
-    assert!(config("mcp.json").contains("${CLAUDE_PLUGIN_ROOT}/bin/ai-kanban"));
-    let hooks = config("hooks.json");
-    assert_eq!(
-        hooks.matches("/bin/ai-kanban").count(),
-        2,
-        "both SessionStart and PostToolUse must resolve the binary the same way"
-    );
-}
-
-#[test]
-fn the_resolver_is_executable() {
-    // A resolver committed without its executable bit fails exactly like a missing binary,
-    // and git preserves only this one permission bit.
-    let resolver = plugin_dir().join("bin/ai-kanban");
-    let meta = std::fs::metadata(&resolver).expect("resolver must be committed");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert!(meta.permissions().mode() & 0o111 != 0, "resolver is not executable");
-    }
-    let _ = meta;
-}
-
-#[test]
-fn a_copied_plugin_that_finds_no_binary_stays_silent_on_hooks() {
-    // The load-bearing half of `CLAUDE.md`'s "never fail loudly": this runs in every
-    // directory the user opens Claude Code in, including ones with no Rust toolchain.
-    if cfg!(not(unix)) {
-        return;
-    }
+fn the_generated_config_is_valid_json_and_wires_both_entry_points() {
     let tmp = tempfile::tempdir().unwrap();
-    let copied = tmp.path().join("ai-kanban");
-    let status = Command::new("cp").arg("-R").arg(plugin_dir()).arg(&copied).status().unwrap();
-    assert!(status.success());
+    let bin = stub(tmp.path());
+    let plugin = generate(tmp.path(), &bin);
 
-    let out = Command::new(copied.join("bin/ai-kanban"))
-        .args(["hook", "session-start"])
-        // An empty PATH and a HOME with nothing in it is the machine that has never built
-        // this project -- the case a copied plugin actually lands on.
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", tmp.path().join("empty"))
-        .env_remove("AI_KANBAN_BIN")
-        .output()
-        .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&read(&plugin, ".claude-plugin/plugin.json")).unwrap();
+    assert_eq!(manifest["name"], "ai-kanban");
+    assert_eq!(manifest["hooks"], "./hooks.json");
+    assert_eq!(manifest["mcpServers"], "./mcp.json");
 
-    assert!(out.status.success(), "a hook that cannot find its binary must still exit 0");
-    assert!(out.stdout.is_empty(), "silence means silence: {:?}", String::from_utf8_lossy(&out.stdout));
+    let hooks: serde_json::Value = serde_json::from_str(&read(&plugin, "hooks.json")).unwrap();
+    assert!(hooks["hooks"]["SessionStart"].is_array(), "the board must reach a cold session");
+    assert!(hooks["hooks"]["PostToolUse"].is_array(), "notes must reach a touched file");
+
+    let mcp: serde_json::Value = serde_json::from_str(&read(&plugin, "mcp.json")).unwrap();
+    assert_eq!(mcp["mcpServers"]["ai-kanban"]["command"], bin.to_str().unwrap());
+    assert_eq!(mcp["mcpServers"]["ai-kanban"]["args"][0], "mcp");
 }
 
 #[test]
-fn a_copied_plugin_explains_itself_for_everything_that_is_not_a_hook() {
-    // The mirror of the test above. Silence is right for hooks and wrong here: an MCP
-    // server that exits without a word is a board that is mysteriously missing.
-    if cfg!(not(unix)) {
-        return;
-    }
+fn the_generated_hook_runs_from_an_unrelated_directory() {
     let tmp = tempfile::tempdir().unwrap();
-    let copied = tmp.path().join("ai-kanban");
-    Command::new("cp").arg("-R").arg(plugin_dir()).arg(&copied).status().unwrap();
+    let bin = stub(tmp.path());
+    let plugin = generate(tmp.path(), &bin);
 
-    let out = Command::new(copied.join("bin/ai-kanban"))
-        .arg("mcp")
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", tmp.path().join("empty"))
-        .env_remove("AI_KANBAN_BIN")
-        .output()
-        .unwrap();
-
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("AI_KANBAN_BIN"), "the message must name the way out: {err}");
+    // From `/`, with nothing of this checkout in reach -- the situation an installed plugin
+    // is always in and the one the old relative path could not survive.
+    for event in ["session-start", "post-tool-use"] {
+        let out = run_hook(&plugin, event);
+        assert!(out.status.success(), "{event} hook failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
 }
 
 #[test]
-fn an_explicit_binary_override_wins() {
-    // AI_KANBAN_BIN is the escape hatch for every layout the search order does not know
-    // about -- including Windows, where the resolver itself does not run.
-    if cfg!(not(unix)) {
-        return;
-    }
+fn a_missing_binary_leaves_the_hooks_silent_rather_than_failing() {
     let tmp = tempfile::tempdir().unwrap();
-    let copied = tmp.path().join("ai-kanban");
-    Command::new("cp").arg("-R").arg(plugin_dir()).arg(&copied).status().unwrap();
+    let bin = stub(tmp.path());
+    let plugin = generate(tmp.path(), &bin);
+    // The binary moves or is uninstalled while the plugin stays. Hook code must never fail
+    // loudly (CLAUDE.md): a hook that complains on every session is a hook the user
+    // deletes, and deleting it takes the bundled MCP server with it.
+    std::fs::remove_file(&bin).unwrap();
 
-    let out = Command::new(copied.join("bin/ai-kanban"))
-        .arg("where")
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", tmp.path().join("empty"))
-        .env("AI_KANBAN_BIN", "/bin/echo")
-        .output()
-        .unwrap();
-
-    assert!(out.status.success());
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "where", "the override was not used");
+    for event in ["session-start", "post-tool-use"] {
+        let out = run_hook(&plugin, event);
+        assert!(out.status.success(), "{event} must still exit 0 when the binary is gone");
+        assert!(out.stderr.is_empty(), "{event} must say nothing: {:?}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.stdout.is_empty(), "{event} must emit no context: {:?}", String::from_utf8_lossy(&out.stdout));
+    }
 }
 
 #[test]
-fn the_documented_install_location_is_found_without_help_from_path() {
-    // README tells people to install into a directory on their PATH, and recommends
-    // ~/.local/bin because it needs no sudo. A hook is not a login shell, though -- the host
-    // may invoke it with a minimal PATH that contains none of the user's directories. So the
-    // recommended location has to be searched by name, not left to PATH.
-    //
-    // This is the test that fails if someone trims the resolver's candidate list: the
-    // symptom otherwise is a plugin that works when you type the command yourself and
-    // silently does nothing in a session, which is close to undiagnosable.
-    if cfg!(not(unix)) {
-        return;
-    }
+fn the_mcp_server_is_not_silenced_the_way_the_hooks_are() {
     let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path().join("home");
-    let local_bin = home.join(".local/bin");
-    std::fs::create_dir_all(&local_bin).unwrap();
-    // A stub rather than a copy of a real system binary: on macOS, copying a signed system
-    // executable and running the copy is killed by the signature check, with no stderr.
-    let stub = local_bin.join("ai-kanban");
-    std::fs::write(&stub, "#!/bin/sh\necho \"$@\"\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let bin = stub(tmp.path());
+    let plugin = generate(tmp.path(), &bin);
+    let mcp = read(&plugin, "mcp.json");
+    // Deliberately asymmetric with the hooks above. An MCP server that dies silently is a
+    // board that is mysteriously absent, which is harder to diagnose than a startup error.
+    assert!(!mcp.contains("|| true"), "mcp.json must not swallow a startup failure: {mcp}");
+}
 
-    let copied = tmp.path().join("plugin");
-    Command::new("cp").arg("-R").arg(plugin_dir()).arg(&copied).status().unwrap();
+#[test]
+fn installing_into_a_private_claude_directory_touches_nothing_else() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = stub(tmp.path());
+    let private = tmp.path().join(".claude-private");
+    let plugin = generate(&private, &bin);
 
-    let out = Command::new(copied.join("bin/ai-kanban"))
-        .arg("where")
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", &home)
-        .env_remove("AI_KANBAN_BIN")
-        .output()
-        .unwrap();
-
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout).trim(),
-        "where",
-        "~/.local/bin is the install location the README recommends and was not searched"
-    );
+    assert!(plugin.starts_with(&private), "the plugin must land under CLAUDE_DIR");
+    assert!(plugin.join("hooks.json").exists());
+    assert!(!tmp.path().join(".claude").exists(),
+        "a private install must not also write to the default directory");
 }

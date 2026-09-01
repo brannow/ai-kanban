@@ -159,6 +159,41 @@ pub struct Note {
 }
 
 // ---------------------------------------------------------------------------
+// Workstreams
+// ---------------------------------------------------------------------------
+
+/// A named slice of work inside one board -- a feature, an upgrade, a migration.
+///
+/// It is a grouping dimension, never an identity. Tasks in different workstreams share a
+/// board, so `blocked_by` still works across them and nothing has to be merged when a
+/// workstream finishes. See `migrations/005_workstreams.sql` for why that matters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Workstream {
+    pub id: i64,
+    pub project_id: i64,
+    pub name: String,
+    pub created_at: i64,
+    /// Set when the workstream is closed. Hides it from the directory; its tasks are
+    /// untouched and still counted by status.
+    pub closed_at: Option<i64>,
+}
+
+impl Workstream {
+    pub fn is_open(&self) -> bool { self.closed_at.is_none() }
+}
+
+/// One line of the directory: a workstream and how much open work it holds.
+///
+/// Counts rather than rows. The directory has to stay one line no matter how many
+/// workstreams exist, because it is paid for on every board call -- rendering each
+/// workstream's tasks is the "grouped rendering" this design deliberately does not do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkstreamSummary {
+    pub workstream: Workstream,
+    pub open: usize,
+}
+
+// ---------------------------------------------------------------------------
 // Board query + snapshot
 // ---------------------------------------------------------------------------
 
@@ -177,6 +212,12 @@ pub struct BoardQuery {
     pub limit: usize,
     /// Max entries in the `recent` section.
     pub recent_limit: usize,
+    /// Restrict to one workstream. `None` means no workstream filtering at all, which is
+    /// both the pre-005 behaviour and what a board with no workstreams still does.
+    ///
+    /// Set, it selects that workstream's tasks **plus unscoped ones** -- see `tasks_in`
+    /// for why unscoped work is never hidden.
+    pub workstream: Option<i64>,
 }
 
 /// Which board the caller means. Resolved by the *adapter* into a `project_id` (or into a
@@ -203,14 +244,15 @@ impl BoardQuery {
     pub const BOARD_RECENT: usize = 8;
 
     pub fn board() -> Self {
-        Self { status: vec![], limit: Self::BOARD_LIMIT, recent_limit: Self::BOARD_RECENT }
+        Self { status: vec![], limit: Self::BOARD_LIMIT, recent_limit: Self::BOARD_RECENT, workstream: None }
     }
 
     pub fn after_mutation() -> Self {
-        Self { status: vec![], limit: Self::MUTATION_LIMIT, recent_limit: Self::MUTATION_RECENT }
+        Self { status: vec![], limit: Self::MUTATION_LIMIT, recent_limit: Self::MUTATION_RECENT, workstream: None }
     }
     pub fn with_status(mut self, status: Vec<Status>) -> Self { self.status = status; self }
     pub fn with_limit(mut self, limit: usize) -> Self { self.limit = limit; self }
+    pub fn with_workstream(mut self, w: Option<i64>) -> Self { self.workstream = w; self }
 }
 
 /// The standard response shape. Always leads with the resolved project, so the agent never
@@ -226,6 +268,13 @@ pub struct BoardSnapshot {
     pub recent: Vec<Event>,
     /// Set when this snapshot followed a write, so the renderer can mark the changed row.
     pub highlight: Option<i64>,
+    /// The workstream this snapshot is scoped to, if any. Rendered in the header for the
+    /// same reason the project is: the agent must never have to guess what it is looking
+    /// at. A board that silently shows a subset is worse than one that shows everything.
+    pub workstream: Option<Workstream>,
+    /// The other open workstreams on this board, with their open counts. What the scope
+    /// excluded, stated rather than hidden -- the same rule `omitted` follows for statuses.
+    pub other_workstreams: Vec<WorkstreamSummary>,
     pub now: i64,
 }
 

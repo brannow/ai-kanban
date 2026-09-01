@@ -157,3 +157,40 @@ fn notes_stay_findable_by_their_files_after_moving() {
         .unwrap();
     assert!(!recalled.hits.is_empty(), "the note survived the merge but left the search index");
 }
+
+#[test]
+fn merging_keeps_workstreams_instead_of_cascading_them_away() {
+    // Silent loss, and the mechanism is worth naming: deleting the source project cascades
+    // to its `workstreams` rows, and `tasks.workstream_id` is ON DELETE SET NULL -- so a
+    // merge that reparented only tasks would strip every assignment on the way through.
+    let dir = tempfile::tempdir().unwrap();
+    let (s, a, b) = split(dir.path());
+
+    let wb = s.ensure_workstream(b, "contact-form").unwrap();
+    s.set_current_workstream(b, wb.id).unwrap();
+    s.create_task(b, TaskDraft::new("field validator")).unwrap();
+    s.clear_current_workstream(b).unwrap();
+
+    let only_on_b = s.ensure_workstream(b, "seo-redirects").unwrap();
+    s.set_current_workstream(b, only_on_b.id).unwrap();
+    s.create_task(b, TaskDraft::new("canonical tags")).unwrap();
+    s.clear_current_workstream(b).unwrap();
+
+    // The same name on both halves -- the normal shape of a split board.
+    let wa = s.ensure_workstream(a, "contact-form").unwrap();
+    s.set_current_workstream(a, wa.id).unwrap();
+    s.create_task(a, TaskDraft::new("label rendering")).unwrap();
+    s.clear_current_workstream(a).unwrap();
+
+    let report = s.merge_projects(a, b).unwrap();
+    assert_eq!(report.workstreams, 2, "the report must account for what moved");
+
+    let kept = s.workstream_by_name(a, "contact-form").unwrap().expect("the colliding name folds into one");
+    let scoped = s.board(a, &BoardQuery::board().with_workstream(Some(kept.id))).unwrap();
+    let titles: Vec<&str> = scoped.tasks.iter().map(|t| t.title.as_str()).collect();
+    assert!(titles.contains(&"field validator"), "the merged half's task must keep its workstream: {titles:?}");
+    assert!(titles.contains(&"label rendering"), "the surviving half's task must too: {titles:?}");
+
+    let moved = s.workstream_by_name(a, "seo-redirects").unwrap();
+    assert!(moved.is_some(), "a workstream unique to the merged board must move, not vanish");
+}

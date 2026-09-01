@@ -19,6 +19,7 @@ pub mod task;
 pub mod staleness;
 pub mod store;
 pub mod transfer;
+pub mod workstream;
 
 pub use error::{Error, Result};
 pub use store::{now, Store};

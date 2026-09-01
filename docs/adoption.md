@@ -160,91 +160,72 @@ The honest signals:
 
 ## Installing
 
-The plugin lives at the repo root: `.claude-plugin/plugin.json`, with its configs in
-`plugin/`. Both the hook and the MCP server run the same binary, so it has to exist first:
-
 ```sh
-cargo build --release          # produces target/release/ai-kanban
-claude plugin validate .
+make install
 ```
 
-The plugin lives at `.claude/skills/ai-kanban/`, **inside this repository**. A folder in a
-project's `.claude/skills/` that contains a `.claude-plugin/plugin.json` loads as
-`ai-kanban@skills-dir` (`reference/skills.md:150`), gated by the workspace trust dialog.
+That builds the binary, installs it to `$(PREFIX)/bin`, and **generates** the plugin into
+`$(CLAUDE_DIR)/skills/ai-kanban/` with the binary's absolute path baked in. `CLAUDE_DIR`
+defaults to `~/.claude`; pass `CLAUDE_DIR=~/.claude-private` for a non-default Claude
+configuration directory.
 
-So the only setup for this repo is:
+A directory under `<claude-dir>/skills/` containing a `.claude-plugin/plugin.json` loads as
+a skills-dir plugin (`reference/skills.md:150`). Installed under the user's Claude directory
+it applies to every project with no trust dialog; dropped into a repo's own
+`.claude/skills/`, it applies to that repo and asks once.
 
-```sh
-cargo build --release
-```
+Discovery happens at session start, so it does not appear in `claude plugin list` until the
+next session.
 
-The plugin is discovered at session start, so it does not appear in `claude plugin list`
-until the next session. Turn it off with `claude plugin disable ai-kanban@skills-dir`.
+### Why the config is generated rather than checked in
 
-### Project-local here, personal everywhere else
+**A plugin is installed by being copied, and a copied config cannot know where the binary
+went.** That single fact drove three designs, and the first two were wrong:
 
-Both locations work, and they answer different questions:
+1. **Hard-coded relative path.** Both configs named
+   `${CLAUDE_PLUGIN_ROOT}/../../../target/release/ai-kanban`, which resolves only when the
+   plugin sits inside an ai-kanban checkout. It shipped that way for four days. Nothing
+   caught it, because every path resolves correctly *here* and here is the only place it was
+   ever run.
+2. **A resolver script.** `bin/ai-kanban` searched `$AI_KANBAN_BIN`, a surrounding checkout,
+   `~/.local/bin`, `~/.cargo/bin`, the Homebrew and `/usr/local` directories, then `PATH` —
+   with a guard against re-exec'ing itself. Sixty lines reconstructing at session start what
+   the installer already knew, and a list that silently had to be kept in sync with whatever
+   the README told people to do.
+3. **Generation at install time.** The path is known exactly once — when someone installs —
+   so that is where it gets written down.
 
-| Location | Applies to | Trust dialog |
-|---|---|---|
-| `~/.claude/skills/ai-kanban/` | every project | no |
-| `<repo>/.claude/skills/ai-kanban/` | that repo | yes, once |
+The third removes the search, the script, and the `AI_KANBAN_BIN` escape hatch that existed
+only to patch the search. It also moves the failure: `make install` runs the binary before
+writing any config, so a broken install fails **loudly, at install time, in front of the
+person doing it**, instead of silently at session start.
 
-This repository uses the project-local one, because the plugin is part of the thing being
-developed and should travel with it in version control. That is a dogfooding choice, not a
-constraint.
+The trade is real and worth stating: a baked absolute path breaks if the binary is moved
+afterwards. The fix is to re-run `make install`. That is better than a search silently
+picking a different binary than the one intended — which is the failure mode the checkout
+ordering in the old resolver existed to prevent, and which `make install-dev` now handles
+explicitly instead.
 
-It **was** a constraint, and the note is worth keeping because the reasoning is easy to
-re-derive wrongly. Before the resolver (task #1), both configs named
-`${CLAUDE_PLUGIN_ROOT}/../../../target/release/ai-kanban`, so the plugin directory had to
-sit inside the checkout for the binary to be reachable at all. A global install would have
-meant symlinking the whole repository into `~/.claude/skills` — a 757MB `target/`, 208
-vendored reference files and `.git`, in a directory scanned at session start — and
-symlinking it *inside* the repo would be a loop. The resolver removed that constraint
-entirely; nothing about the layout depends on it any more.
+### What the generated config still has to protect
 
-### How the binary is found
+`hooks.json` guards each command with `[ -x "<bin>" ] && … || true`. **A hook that complains
+on every session start is a hook the user removes**, taking the bundled MCP server with it —
+so if the binary is later moved, the hooks go quiet rather than erroring.
 
-`bin/ai-kanban` in the plugin is a resolver: it searches for the real binary and `exec`s it
-with the arguments untouched. Both `hooks.json` and `mcp.json` invoke it, since
-`${CLAUDE_PLUGIN_ROOT}` is set for both.
+`mcp.json` deliberately does **not** guard, and the asymmetry is the point: an MCP server
+that dies in silence is a board that is mysteriously absent, which is harder to diagnose
+than a startup error.
 
-It searches, in order: `$AI_KANBAN_BIN`; `target/release` then `target/debug` relative to a
-surrounding checkout; `~/.local/bin`; `~/.cargo/bin`; the Homebrew and `/usr/local` bin
-directories; and finally `PATH`.
+### Testing it
 
-Those directories are named explicitly rather than left to `PATH` because **a hook is not a
-login shell** — the host may invoke it with a minimal environment containing none of the
-user's directories. Anything the README tells someone to install into therefore has to be on
-this list, or the plugin works when they type the command themselves and silently does
-nothing in a session. That failure is close to undiagnosable from the outside, so
-`tests/plugin_install.rs` asserts the documented location resolves with `PATH` stripped to
-`/usr/bin:/bin`.
+Note #15's rule survives the redesign, because the reason for it does: *any test of the
+plugin's own configuration must exercise an installed copy, never the working tree.* A test
+that runs the plugin in place asserts the one configuration that was never in doubt.
 
-Two of those orderings are deliberate. **The checkout comes before `PATH`** so that
-developing ai-kanban tests the build you just made rather than a global install silently
-shadowing it. **`PATH` comes last and is skipped if it resolves back into the plugin's own
-`bin/`**, because a plugin directory on `PATH` would otherwise make the script re-exec
-itself forever.
-
-This replaced a hard-coded `${CLAUDE_PLUGIN_ROOT}/../../../target/release/ai-kanban`, which
-only resolved when the plugin sat inside a checkout — so a copied plugin, which is how
-plugins are normally installed, pointed at nothing. The cheaper fix of naming a bare
-`ai-kanban` on `PATH` was tried before and reverted: `cargo install` puts it in
-`~/.cargo/bin`, which is not on `PATH` on every machine (it is not on this one; rust here is
-from Homebrew). Searching several locations is what makes both setups work at once.
-
-When nothing is found, `hook` exits 0 in silence — a hook that complains on every session
-start is a hook the user removes, taking the bundled MCP server with it. Every other
-subcommand explains what to install, because an MCP server that dies without a reason is a
-board that is mysteriously absent.
-
-> **Windows is not supported, by decision.** The resolver is a `#!/bin/sh` script, so the
-> hooks and the MCP server need a POSIX shell. A `bin/ai-kanban.cmd` shim with the same
-> search order would fix it, and it is deliberately not being written: there is no Windows
-> machine here, so it would ship untested, and untested platform code is a support burden
-> that reads as a promise. The binary itself builds and runs on Windows — it is the plugin
-> entry point that does not.
+`tests/plugin_install.rs` renders the templates into a temporary directory with `make
+plugin`, then asserts the output names an absolute path, mentions neither
+`CLAUDE_PLUGIN_ROOT` nor a `..` hop, runs from `/`, and goes silent when the binary is
+removed.
 
 ## `instructions` — the channel that needs no hook
 

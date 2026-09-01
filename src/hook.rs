@@ -57,6 +57,9 @@ diff; why it changed is not.
 with the files it concerns. That is knowledge that would otherwise die with this session.
   - About to debug something that feels familiar? Check recall first -- you may have \
 already solved it here or on another project.
+  - Told what you are working on (\"we're doing the contact form now\")? Pass it to board \
+as `workstream`. The board narrows to that work and tasks you file join it, so the next \
+session starts on the right slice instead of the whole project.
 
 These are ai-kanban's MCP tools; your tool list shows them under a longer namespaced name.";
 
@@ -129,7 +132,17 @@ pub fn context_for(store: &Store, start: &std::path::Path) -> Option<String> {
     // see the tools exist without being told.
     let project = store.find_project(start).ok()??;
 
-    let snap = store.board(project.id, &BoardQuery::board()).ok()?;
+    // Honour the board's current workstream. This is the reason the workstream is sticky
+    // state rather than an argument: THIS call takes no arguments and never can. It is the
+    // cold-start view -- the board an agent reads before the first prompt -- so a scope the
+    // caller has to pass would leave exactly the view that motivated the feature unscoped.
+    //
+    // `unwrap_or(None)` rather than `?`: a store this binary has not migrated yet has no
+    // workstream tables, and that must degrade to an unscoped board rather than to no board
+    // at all. Hook code never fails loudly.
+    let workstream = store.current_workstream(project.id).unwrap_or(None);
+    let q = BoardQuery::board().with_workstream(workstream.map(|w| w.id));
+    let snap = store.board(project.id, &q).ok()?;
     let board = render::board(&snap);
 
     let mut out = String::with_capacity(board.len() + GUIDANCE.len() + 2);

@@ -58,9 +58,28 @@ pub struct ProjectExport {
     /// dropped them would quietly re-introduce that split.
     #[serde(default)]
     pub paths: Vec<String>,
+    /// Exported in full rather than inferred from the tasks that reference them: a
+    /// workstream with no open work still carries its name and the fact that it was
+    /// closed, and an export that reconstructed the list from task rows would silently
+    /// drop every empty one.
+    ///
+    /// `serde(default)` because exports written before migration 005 have no such field,
+    /// and an importer that rejected them would turn a new column into a broken restore.
+    #[serde(default)]
+    pub workstreams: Vec<WorkstreamExport>,
     pub tasks: Vec<TaskExport>,
     pub notes: Vec<NoteExport>,
     pub events: Vec<EventExport>,
+}
+
+/// Carried by **name**, not id. Ids are row numbers in one particular store; the name is
+/// what identifies a workstream inside its board, and it is already normalized and unique
+/// there -- so it survives a round trip into a store that numbers its rows differently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkstreamExport {
+    pub name: String,
+    pub created_at: i64,
+    pub closed_at: Option<i64>,
 }
 
 /// Rows carry their **source** id, and only so that references inside the same export can
@@ -76,6 +95,11 @@ pub struct TaskExport {
     pub origin: Origin,
     pub priority: Priority,
     pub blocked_by: Option<i64>,
+    /// The workstream's **name**, for the same reason `key` is used for a project: an id
+    /// means nothing outside the store that allocated it. `serde(default)` keeps pre-005
+    /// exports importable.
+    #[serde(default)]
+    pub workstream: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -196,11 +220,22 @@ impl Store {
         let paths: Vec<String> =
             st.query_map([p.id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
 
+        let mut st = self.conn.prepare(
+            "SELECT name, created_at, closed_at FROM workstreams WHERE project_id = ?1 ORDER BY id",
+        )?;
+        let workstreams: Vec<WorkstreamExport> = st
+            .query_map([p.id], |r| {
+                Ok(WorkstreamExport { name: r.get(0)?, created_at: r.get(1)?, closed_at: r.get(2)? })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
         // Ordered by id everywhere below: an export that reorders between two runs is one
         // nobody can diff, which is half the reason the JSON format exists at all.
         let mut st = self.conn.prepare(
-            "SELECT id, title, body, status, type, origin, priority, blocked_by, created_at, updated_at
-               FROM tasks WHERE project_id = ?1 ORDER BY id",
+            "SELECT t.id, t.title, t.body, t.status, t.type, t.origin, t.priority, t.blocked_by,
+                    t.created_at, t.updated_at, w.name
+               FROM tasks t LEFT JOIN workstreams w ON w.id = t.workstream_id
+              WHERE t.project_id = ?1 ORDER BY t.id",
         )?;
         let tasks: Vec<TaskExport> = st
             .query_map([p.id], |r| {
@@ -215,6 +250,7 @@ impl Store {
                     blocked_by: r.get(7)?,
                     created_at: r.get(8)?,
                     updated_at: r.get(9)?,
+                    workstream: r.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -266,6 +302,7 @@ impl Store {
             name: p.name.clone(),
             created_at: p.created_at,
             paths,
+            workstreams,
             tasks,
             notes,
             events,
@@ -330,14 +367,37 @@ impl Store {
             }
         }
 
+        // Workstreams before tasks: a task carries its workstream by name, so the row it
+        // points at has to exist before the task is inserted. Inserted directly rather than
+        // through `ensure_workstream` because that writes a `workstream_created` event, and
+        // a restore must not manufacture history that did not happen -- the export's own
+        // events are replayed further down.
+        let mut workstream_ids = std::collections::HashMap::new();
+        for w in &pe.workstreams {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO workstreams (project_id, name, created_at, closed_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![pid, w.name, w.created_at, w.closed_at],
+            )?;
+            let id: i64 = self.conn.query_row(
+                "SELECT id FROM workstreams WHERE project_id = ?1 AND name = ?2",
+                params![pid, w.name], |r| r.get(0),
+            )?;
+            workstream_ids.insert(w.name.clone(), id);
+        }
+
         // Tasks in two passes. `blocked_by` points at another task in the same export, so
         // it cannot be written until every id in the project has been allocated.
         let mut task_ids = std::collections::HashMap::new();
         for t in &pe.tasks {
+            // A name with no workstream row is dropped rather than invented, matching how
+            // a dangling `blocked_by` is handled: losing the grouping degrades the board,
+            // while inventing a workstream would put the task in one that never existed.
+            let ws = t.workstream.as_ref().and_then(|n| workstream_ids.get(n));
             self.conn.execute(
-                "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![pid, t.title, t.body, t.status, t.r#type, t.origin, t.priority, t.created_at, t.updated_at],
+                "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, workstream_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![pid, t.title, t.body, t.status, t.r#type, t.origin, t.priority, ws, t.created_at, t.updated_at],
             )?;
             task_ids.insert(t.id, self.conn.last_insert_rowid());
         }

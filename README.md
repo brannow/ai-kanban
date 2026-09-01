@@ -8,50 +8,47 @@ without being asked.
 
 ## Install
 
-Two pieces: a binary, and a plugin that points Claude Code at it.
-
 ```sh
 git clone <this repo> && cd ai-kanban
-cargo build --release
-install -m 755 target/release/ai-kanban ~/.local/bin/    # no sudo, already on most PATHs
-cp -R .claude/skills/ai-kanban ~/.claude/skills/
+make install
 ```
 
 Restart Claude Code. That is the whole setup.
 
-### Putting the binary somewhere else
+`make install` builds the binary, puts it in `~/.local/bin`, and generates the Claude Code
+plugin with that path baked in. It checks the binary runs before writing anything, so a
+broken install fails here rather than silently at session start.
 
-Any directory works — the plugin searches `~/.local/bin`, `~/.cargo/bin`,
-`/opt/homebrew/bin`, `/usr/local/bin` and then your `PATH`. Pick one **your shell already
-knows about**, so you can run `ai-kanban backup` yourself:
-
-```sh
-echo $PATH | tr ':' '\n'                                  # what yours actually is
-```
+### Choosing where things go
 
 ```sh
-install -m 755 target/release/ai-kanban ~/.local/bin/     # no sudo
-sudo install -m 755 target/release/ai-kanban /usr/local/bin/   # traditional, needs sudo
-cargo install --path .                                    # -> ~/.cargo/bin
+make where                                  # every path it would touch
+make install PREFIX=/usr/local              # binary -> /usr/local/bin (may need sudo)
+make install CLAUDE_DIR=~/.claude-private   # plugin -> a different Claude config directory
 ```
 
-`cargo install` is the odd one out: the plugin finds it there, but `~/.cargo/bin` is often
-**not** on `PATH` (it isn't by default on macOS with Homebrew Rust), so the commands below
-won't work in your terminal. Use it only if that directory is already on yours.
+`CLAUDE_DIR` is for anyone who keeps Claude Code's configuration somewhere other than
+`~/.claude`. It must match the `CLAUDE_CONFIG_DIR` your Claude Code actually uses, or the
+plugin lands where nothing looks for it.
+
+Pick a `PREFIX` **your shell already knows about**, so you can also run `ai-kanban backup`
+yourself — `make install` warns if the one you chose is not on your `PATH`. The plugin works
+either way, because it uses the absolute path rather than searching.
+
+```sh
+echo $PATH | tr ':' '\n'     # what yours actually is
+```
 
 `/usr/bin` is not an option on macOS — it is protected and unwritable.
 
-### Per-project instead of everywhere
-
-Drop the plugin in one repo rather than all of them:
+### Working on ai-kanban itself
 
 ```sh
-mkdir -p /path/to/repo/.claude/skills
-cp -R .claude/skills/ai-kanban /path/to/repo/.claude/skills/
+make install-dev     # plugin only, pointed at ./target/release
 ```
 
-Claude Code asks you to trust the workspace the first time. The personal install above does
-not ask.
+Then `cargo build --release` and reload, with no reinstall step. Without this a global
+install would silently shadow the build you are testing.
 
 ### Check it worked
 
@@ -59,9 +56,14 @@ not ask.
 ai-kanban where     # prints the path to your store
 ```
 
-The plugin is discovered at session start, so `claude plugin list` shows
-`ai-kanban@skills-dir` from the next session on. Turn it off with
-`claude plugin disable ai-kanban@skills-dir`.
+The plugin is discovered at session start, so `claude plugin list` shows it from the next
+session on.
+
+### Removing it
+
+```sh
+make uninstall      # plugin and binary; your board is untouched
+```
 
 ## Using it
 
@@ -69,11 +71,30 @@ Mostly you don't. The agent calls it — `board` at session start, `task_add` wh
 something, `note_add` when it works something out, `recall` before debugging something
 familiar.
 
+### Workstreams, when one project has several things going on
+
+A long-lived project accumulates work from several directions at once — a feature, an
+upgrade, a migration. Left flat, the board fills with tasks from all of them and an agent
+starting cold gets told, in detail, about work that is not the work it is doing.
+
+A **workstream** is a named slice of one board. Tell the agent what you are working on and
+it narrows:
+
+> we're doing the contact form now
+
+From then on the board shows that slice, other workstreams appear as a one-line summary, and
+tasks the agent files join the workstream automatically. It is not a second board: tasks
+still block each other across workstreams, nothing has to be merged when one finishes, and
+work with no workstream stays visible from everywhere.
+
 For yourself, there is a web UI:
 
 ```sh
 ai-kanban serve                 # http://127.0.0.1:7373
 ```
+
+It shows which workstream the board is in, lets you switch it, and states which one a new
+task will join — so nothing lands somewhere you could not see.
 
 ## Commands
 
@@ -125,10 +146,11 @@ The first board survives and the second is folded into it.
 | | |
 |---|---|
 | `AI_KANBAN_DB` | Use a different store. **Set this for any experiment** — otherwise you are writing to your real memory. |
-| `AI_KANBAN_BIN` | Point the plugin at a specific binary. Searched before everything else. |
+| `CLAUDE_CONFIG_DIR` | Claude Code's own setting. If you use it, pass the same path as `CLAUDE_DIR` to `make install`. |
 
-**macOS and Linux.** Windows is a stated non-goal, not a gap — the plugin's entry point is a
-`#!/bin/sh` script. The `ai-kanban` binary itself builds and runs there; the plugin does not.
+**macOS and Linux.** Windows is a stated non-goal, not a gap — installation is a Makefile and
+the generated hooks are `/bin/sh` one-liners. The `ai-kanban` binary itself builds and runs
+there; the install path does not.
 
 ## Docs
 
@@ -146,6 +168,6 @@ Contributing: read [`CLAUDE.md`](CLAUDE.md) first.
 ## Building from source
 
 ```sh
-cargo build --release
-cargo test
+make build      # cargo build --release
+make test       # cargo test
 ```
