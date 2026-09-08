@@ -14,11 +14,28 @@ PREFIX     ?= $(HOME)/.local
 BINDIR     ?= $(PREFIX)/bin
 
 # Which Claude configuration directory to install the plugin into. Override for a private
-# or per-project setup:  make install CLAUDE_DIR=~/.claude-private
+# or per-project setup:  make install CLAUDE_DIR=$HOME/.claude-private
 # If you keep Claude Code's config somewhere non-default you already set CLAUDE_CONFIG_DIR
 # to the same path -- these must agree, or the plugin lands where nothing looks for it.
 CLAUDE_DIR ?= $(HOME)/.claude
 PLUGIN_DIR  = $(CLAUDE_DIR)/skills/ai-kanban
+
+# A leading `~` in an overridden path is a trap, and this file used to document it as the
+# way to override CLAUDE_DIR. Make does not expand `~`, and the recipes quote these paths
+# because they can contain spaces -- so `mkdir -p '~/.claude-private/...'` creates a
+# directory literally named `~` in the CURRENT directory. The install then reports success
+# and lands where nothing looks for it, which is the exact failure the comment above about
+# CLAUDE_CONFIG_DIR warns about, arrived at by a different route.
+#
+# Worse than a wrong install: cleaning up the debris invites `rm -rf ~`, which is one
+# tab-completion away from deleting the home directory. Refused here rather than left to
+# be discovered.
+ifeq ($(patsubst ~%,~,$(CLAUDE_DIR)),~)
+$(error CLAUDE_DIR starts with '~', which make does not expand -- it would create a directory named '~' here. Use $$HOME: make install CLAUDE_DIR=$$HOME/.claude-private)
+endif
+ifeq ($(patsubst ~%,~,$(PREFIX)),~)
+$(error PREFIX starts with '~', which make does not expand -- it would create a directory named '~' here. Use $$HOME: make install PREFIX=$$HOME/.local)
+endif
 
 BIN         = $(BINDIR)/ai-kanban
 BUILT       = target/release/ai-kanban
