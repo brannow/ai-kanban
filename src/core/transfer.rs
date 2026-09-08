@@ -100,6 +100,11 @@ pub struct TaskExport {
     /// exports importable.
     #[serde(default)]
     pub workstream: Option<String>,
+    /// `serde(default)` for the same reason as `workstream`: without it a pre-006 export
+    /// stops importing, and the format is meant to be readable by a binary older than the
+    /// one that wrote it.
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -248,7 +253,7 @@ impl Store {
         // nobody can diff, which is half the reason the JSON format exists at all.
         let mut st = self.conn.prepare(
             "SELECT t.id, t.title, t.body, t.status, t.type, t.origin, t.priority, t.blocked_by,
-                    t.created_at, t.updated_at, w.name
+                    t.created_at, t.updated_at, w.name, t.tags
                FROM tasks t LEFT JOIN workstreams w ON w.id = t.workstream_id
               WHERE t.project_id = ?1 ORDER BY t.id",
         )?;
@@ -266,6 +271,7 @@ impl Store {
                     created_at: r.get(8)?,
                     updated_at: r.get(9)?,
                     workstream: r.get(10)?,
+                    tags: crate::core::note::split_tags(&r.get::<_, String>(11)?),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -410,9 +416,10 @@ impl Store {
             // while inventing a workstream would put the task in one that never existed.
             let ws = t.workstream.as_ref().and_then(|n| workstream_ids.get(n));
             self.conn.execute(
-                "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, workstream_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![pid, t.title, t.body, t.status, t.r#type, t.origin, t.priority, ws, t.created_at, t.updated_at],
+                "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, workstream_id, tags, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?11, ?9, ?10)",
+                params![pid, t.title, t.body, t.status, t.r#type, t.origin, t.priority, ws, t.created_at, t.updated_at,
+                        crate::core::note::join_tags(&t.tags)],
             )?;
             task_ids.insert(t.id, self.conn.last_insert_rowid());
         }

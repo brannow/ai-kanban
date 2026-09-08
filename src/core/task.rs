@@ -21,6 +21,9 @@ pub struct TaskDraft {
     pub priority: Priority,
     pub status: Status,
     pub blocked_by: Option<i64>,
+    /// Freeform labels. No semantics an agent must honour -- that is what makes them safe
+    /// to add without touching the fixed statuses. Stored comma-joined.
+    pub tags: Vec<String>,
 }
 
 impl TaskDraft {
@@ -28,6 +31,7 @@ impl TaskDraft {
         Self {
             title: title.into(),
             body: String::new(),
+            tags: vec![],
             task_type: TaskType::default(),
             origin: Origin::default(),
             priority: Priority::default(),
@@ -54,6 +58,9 @@ pub struct TaskPatch {
     /// mis-filing the EXPECTED error rather than an edge case -- and without this it was
     /// the only field on a task that could never be corrected afterwards.
     pub workstream: Option<Option<i64>>,
+    /// Replaces the whole set, like `NotePatch::tags`. Not add/remove: two verbs on one
+    /// field is a surface an agent has to learn, and the set is short enough to resend.
+    pub tags: Option<Vec<String>>,
     /// The *why*. Recorded as the event body -- this is the field that makes the history
     /// worth reading six months later.
     pub log: Option<String>,
@@ -85,6 +92,7 @@ impl TaskPatch {
         self.title.is_none() && self.body.is_none() && self.status.is_none()
             && self.priority.is_none() && self.task_type.is_none() && self.blocked_by.is_none()
             && self.workstream.is_none()
+            && self.tags.is_none()
             && self.log.is_none()
     }
 }
@@ -129,17 +137,53 @@ impl Store {
     pub fn create_task_in(&self, project_id: i64, draft: TaskDraft, workstream: Option<i64>) -> Result<Task> {
         let ts = now();
         self.conn.execute(
-            "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, blocked_by, workstream_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+            "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, blocked_by, workstream_id, tags, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?11, ?10, ?10)",
             params![
                 project_id, draft.title, draft.body, draft.status, draft.task_type,
-                draft.origin, draft.priority, draft.blocked_by, workstream, ts
+                draft.origin, draft.priority, draft.blocked_by, workstream, ts,
+                crate::core::note::join_tags(&draft.tags)
             ],
         )?;
         let id = self.conn.last_insert_rowid();
         let actor = match draft.origin { Origin::User => Actor::User, Origin::Agent => Actor::Agent };
         self.write_event(project_id, Some(id), actor, "created", &draft.title)?;
         self.task(project_id, id)
+    }
+
+    /// A task's tags.
+    ///
+    /// A separate lookup because `tags` is deliberately not in `TASK_COLS` -- see migration
+    /// 006. Only the paths that actually display tags pay for it, and the read-only
+    /// SessionStart hook never names the column, which is what keeps MIN_READABLE_VERSION
+    /// where it is.
+    pub fn task_tags(&self, project_id: i64, id: i64) -> Result<Vec<String>> {
+        let raw: Option<String> = self.conn.query_row(
+            "SELECT tags FROM tasks WHERE id = ?1 AND project_id = ?2",
+            params![id, project_id],
+            |r| r.get(0),
+        ).optional()?;
+        Ok(crate::core::note::split_tags(&raw.unwrap_or_default()))
+    }
+
+    /// Tags for a set of tasks, in one query.
+    ///
+    /// The batch form exists because the web board shows tags on every card while `tags` is
+    /// out of `TASK_COLS`, so the rows it lists do not carry them. One lookup for the page
+    /// beats one per card, and it stays one as the page size grows.
+    pub fn tags_for(&self, project_id: i64, tasks: &[Task]) -> Result<Vec<(i64, Vec<String>)>> {
+        if tasks.is_empty() {
+            return Ok(vec![]);
+        }
+        let holes = tasks.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let mut st = self.conn.prepare(&format!(
+            "SELECT id, tags FROM tasks WHERE project_id = ? AND id IN ({holes}) AND tags != ''"
+        ))?;
+        let ids = std::iter::once(project_id).chain(tasks.iter().map(|t| t.id)).collect::<Vec<_>>();
+        let rows = st.query_map(rusqlite::params_from_iter(ids), |r| {
+            Ok((r.get::<_, i64>(0)?, crate::core::note::split_tags(&r.get::<_, String>(1)?)))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Fetches a task, **scoped to a project**.
@@ -212,6 +256,12 @@ impl Store {
         // `before` does not carry it. See migration 005 on why that column stays out.
         let before_ws = self.task_workstream(project_id, id)?;
         let workstream = match patch.workstream { Some(v) => v, None => before_ws };
+        // Read separately for the same reason as the workstream: `tags` is deliberately
+        // out of `TASK_COLS`, so `before` does not carry it either.
+        let tags = match &patch.tags {
+            Some(t) => crate::core::note::join_tags(t),
+            None => crate::core::note::join_tags(&self.task_tags(project_id, id)?),
+        };
         if let Some(w) = workstream {
             // Same-board check, for the same reason `blocked_by` has one: the store is
             // global, and a workstream id from another board would file this task into a
@@ -224,9 +274,9 @@ impl Store {
         // gets the plain update. Two statements would be two chances to fix a bug once.
         let changed = self.conn.execute(
             "UPDATE tasks SET title=?2, body=?3, status=?4, type=?5, priority=?6, blocked_by=?7, updated_at=?8,
-                    workstream_id=?10, version = version + 1
+                    workstream_id=?10, tags=?11, version = version + 1
               WHERE id=?1 AND (?9 IS NULL OR version = ?9)",
-            params![id, title, body, status, task_type, priority, blocked_by, ts, patch.expected_version, workstream],
+            params![id, title, body, status, task_type, priority, blocked_by, ts, patch.expected_version, workstream, tags],
         )?;
         if changed == 0 {
             // The row exists -- `self.task()` above proved it is here and on this board --
@@ -286,6 +336,7 @@ impl Store {
         let project = self.project(task.project_id)?;
         let blocker = match task.blocked_by { Some(b) => self.task_opt(project_id, b)?, None => None };
         Ok(TaskDetail {
+            tags: self.task_tags(project_id, id)?,
             blocking: self.tasks_blocked_by(project_id, id)?,
             events: self.task_events(id)?,
             notes: self.notes_for_task(project_id, id)?,

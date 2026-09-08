@@ -193,6 +193,32 @@ carry the same column for the same reason.
 Passing it is **optional**, and the two consumers differ: the HTTP API always sends it, the
 MCP agent never does. The reasoning is in `docs/http-api.md` and on `TaskPatch::expected_version`.
 
+**`tags` — the escape valve that keeps the five statuses fixed.**
+
+People ask for custom board columns. They cannot have them, and the reason is not
+conservatism: every status carries BEHAVIOUR, not just a label. `is_open()` decides what
+"8 open" means on the board an agent reads cold, `board_rank` decides ordering, `blocked` is
+tied to `blocked_by`, `archived` is terminal. A user-defined status has no answer to "is this
+open, should I pick work from it" except in the user's head — which inverts the design law:
+the agent would need knowledge of the USER'S configuration, worse than needing ours. And
+since the store is global and recall crosses projects, one board's "in review" against
+another's "reviewing" quietly makes cross-project search meaningless.
+
+Tags carry no semantics an agent must honour, which is exactly what makes them safe. A person
+gets "in review", "waiting-on-vendor", "frontend" without inventing workflow states.
+
+Consequences worth knowing:
+
+- **Not in `TASK_COLS`**, following `workstream_id` — that is what keeps
+  `MIN_READABLE_VERSION` where it is. `task_tags` and `tags_for` read it separately, and both
+  are on paths that have already migrated.
+- **Shown in `task_show` and the web UI, never on the board line.** The board listing is the
+  most expensive space in the product and is paid for on every `task_add`; tags buy an agent
+  nothing there. The asymmetry is deliberate: an agent can set a tag it will not see on the
+  board, which is correct, because tags are for the person's filtering.
+- **Not the storage for workstreams.** A workstream must be ENUMERABLE (the directory needs
+  name + count) and single-valued per task. A comma-joined column serves neither.
+
 ### `events`
 
 Append-only. A NULL `task_id` means project-level history — a decision, a session summary —
@@ -242,6 +268,17 @@ Three things learned building `recall`, each of which was silently wrong first:
 - **`created` and `note_added` events are excluded from search.** Their bodies are copies of
   the task or note title, so including them makes every entity match twice — once as
   itself, once as an event repeating its own name.
+
+**Adding a column to an external-content FTS table means dropping and rebuilding it.** The
+column list is fixed at creation, so migration 006 (`tasks.tags`) had to drop the table and
+all three sync triggers, recreate both, and `INSERT INTO tasks_fts(tasks_fts) VALUES('rebuild')`.
+Forgetting the rebuild does not error — it leaves an empty index, which is indistinguishable
+from "nothing matched". `tests/migrate.rs::adoption_leaves_the_search_index_intact` is the
+test that catches it; the rest of the suite stays green either way.
+
+Tags are **indexed, not filterable**. `recall`'s contract is "plain words — no search syntax
+needed", so a `tag:frontend` operator would be a second query language beside FTS5's and
+exactly the internal knowledge the design law forbids. Indexed, a tag is found by typing it.
 
 Agent input is never passed to `MATCH` raw. FTS5's syntax is a query language: `auth-loop`
 is a NOT expression and a stray quote is a syntax error. Every token is quoted and ANDed,

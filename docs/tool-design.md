@@ -343,3 +343,19 @@ added later inherits it without anyone remembering this section exists. `tests/m
 asserts it over the real registered tools, and also asserts that the generator still produces
 unions — a guard that outlives the thing it guards is worse than none, because it passes
 forever while checking nothing.
+
+## Tags
+
+`task_add` and `task_update` take `tags` as a comma-separated string; `task_update` treats
+`""` as "clear them" and an omitted field as "leave them alone", the same three-way reading
+`workstream` uses.
+
+They appear in `task_show` and in the web UI, and **not on the board line**. That asymmetry
+is the design: the board listing is paid for on every `task_add`, and tags carry no semantics
+an agent must act on — which is the whole reason they are safe to offer at all. An agent can
+therefore set a tag it will not see on the board. That is correct. Tags exist so a person can
+say "in review" or "waiting-on-vendor" without inventing workflow states the agent would then
+have to interpret, which is what keeps the five statuses fixed.
+
+They are indexed by `recall`, so typing a tag finds the tasks carrying it. There is no filter
+syntax, deliberately — see `docs/data-model.md`.

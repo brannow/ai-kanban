@@ -211,6 +211,14 @@ pub fn task_detail(d: &TaskDetail) -> String {
     meta.push(format!("filed {}", since(d.now, t.created_at)));
     out.push_str(&format!("  {}\n", meta.join(", ")));
 
+    if !d.tags.is_empty() {
+        // Shown here and nowhere on the board. The board listing is the most expensive
+        // space in the product and is paid for on every task_add; tags buy an agent
+        // nothing there, since carrying no semantics it must honour is exactly what makes
+        // them safe to have. task_show is the response that is allowed to cost more,
+        // because the agent has already committed to this one task.
+        out.push_str(&format!("\ntags: {}\n", d.tags.join(", ")));
+    }
     if !t.body.is_empty() {
         out.push_str(&format!("\n{}\n", t.body));
     }

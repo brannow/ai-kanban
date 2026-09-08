@@ -227,6 +227,7 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
     // #16" forever -- including after #16 is done. Same defect as the agent board had, and
     // fixing one and not the other is how the two views start disagreeing.
     let blockers = store.blocker_status(project.id, &listed)?;
+    let tags = store.tags_for(project.id, &listed)?;
     let cursor = store.change_cursor()?;
     tx.commit()?;
 
@@ -239,6 +240,11 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
         "blocker_status": blockers.iter()
             .map(|(id, s)| json!({ "id": id, "status": s.as_str() }))
             .collect::<Vec<_>>(),
+        // Keyed by task id rather than inlined on the row: `tags` is out of `TASK_COLS`
+        // (migration 006), so the listed `Task` values do not carry it. Only tasks that
+        // actually have tags appear here.
+        "task_tags": tags.iter().map(|(id, t)| (id.to_string(), json!(t)))
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
         // Both halves are needed by the UI: `workstream` is what the board is scoped to and
         // what a new task will join, `workstreams` is everything selectable. Sent even when
         // nothing is scoped, so the control can offer the list without a second request.
@@ -343,9 +349,14 @@ pub async fn tasks(
         q.limit.unwrap_or(PAGE).min(200),
         ws,
     )?;
+    // Appended pages need their tags too, or an expanded column shows labels on the first
+    // 50 cards and none after -- which reads as "those tasks have no tags".
+    let tags = store.tags_for(project.id, &page.items)?;
     Ok(Json(json!({
         "now": crate::core::now(),
         "tasks": page.items,
+        "task_tags": tags.iter().map(|(id, t)| (id.to_string(), json!(t)))
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
         "next": page.next.map(encode_cursor),
     })))
 }
@@ -360,6 +371,8 @@ pub async fn task(
     Ok((etag(version), Json(json!({
         "now": detail.now,
         "task": detail.task,
+        // Same reason as `workstream` below: out of `TASK_COLS`, so no `Task` carries it.
+        "tags": detail.tags,
         "blocker": detail.blocker,
         "blocking": detail.blocking,
         "notes": detail.notes,
@@ -385,6 +398,8 @@ pub struct TaskBody {
     pub task_type: Option<String>,
     /// `Some(None)` clears the blocker; omitted leaves it alone.
     pub blocked_by: Option<Option<i64>>,
+    /// Freeform labels. Replaces the whole set on update; omitted leaves it alone.
+    pub tags: Option<Vec<String>>,
     /// The *why*. Recorded as the event body -- the field that makes history worth reading.
     pub log: Option<String>,
     /// Which **existing** workstream this task joins, by name. Omitted means "inherit the
@@ -419,6 +434,7 @@ pub async fn create_task(
         // Hardcoded. See the module header.
         origin: Origin::User,
         blocked_by: b.blocked_by.flatten(),
+        tags: b.tags.clone().unwrap_or_default(),
     };
     let task = match b.workstream.as_ref().map(|w| w.trim()) {
         // Absent: inherit whatever the board is scoped to, exactly as `task_add` does.
@@ -458,6 +474,7 @@ pub async fn update_task(
         task_type: enum_field("type", &b.task_type, TaskType::parse)?,
         blocked_by: b.blocked_by,
         workstream,
+        tags: b.tags.clone(),
         log: b.log.clone(),
         actor: Actor::User,
         expected_version: Some(expected),

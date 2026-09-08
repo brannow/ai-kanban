@@ -60,7 +60,7 @@ pub(crate) fn split_tags(s: &str) -> Vec<String> {
     s.split(',').map(str::trim).filter(|t| !t.is_empty()).map(String::from).collect()
 }
 
-fn join_tags(tags: &[String]) -> String {
+pub(crate) fn join_tags(tags: &[String]) -> String {
     tags.iter().map(|t| t.trim()).filter(|t| !t.is_empty()).collect::<Vec<_>>().join(",")
 }
 

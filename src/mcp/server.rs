@@ -165,6 +165,10 @@ pub struct TaskAddParams {
     pub origin: Option<String>,
     /// Task id this one is waiting on.
     pub blocked_by: Option<i64>,
+    /// Freeform labels, comma separated -- "in review", "waiting-on-vendor", "frontend".
+    /// For the person's filtering: they carry no meaning you have to act on, and they are
+    /// not shown on the board.
+    pub tags: Option<String>,
     pub project: Option<String>,
 }
 
@@ -187,6 +191,8 @@ pub struct TaskUpdateParams {
     pub body: Option<String>,
     /// Task id this one is waiting on. Pass 0 to clear it.
     pub blocked_by: Option<i64>,
+    /// Replaces the labels, comma separated. Pass "" to clear them.
+    pub tags: Option<String>,
     /// Why this changed. This is the part worth reading in six months -- record the
     /// reasoning, not the fact that something moved.
     pub log: Option<String>,
@@ -345,6 +351,7 @@ impl AiKanban {
             priority: parse_enum("priority", &p.priority, Priority::parse)?.unwrap_or_default(),
             status: parse_enum("status", &p.status, Status::parse)?.unwrap_or_default(),
             blocked_by: p.blocked_by.filter(|b| *b > 0),
+            tags: csv(&p.tags).unwrap_or_default(),
         };
         let task = store.create_task(resolved.project.id, draft).map_err(fail)?;
         let snap = store.board_after_mutation(resolved.project.id, task.id).map_err(fail)?;
@@ -376,6 +383,9 @@ impl AiKanban {
                     store.ensure_workstream(resolved.project.id, name).map_err(fail)?.id,
                 )),
             },
+            // Absent leaves them alone; "" clears them. Same three-way reading as
+            // `workstream` above, so one shape means one thing across the whole tool.
+            tags: p.tags.as_deref().map(|t| csv(&Some(t.to_string())).unwrap_or_default()),
             log: p.log.clone(),
             // Unguarded, deliberately -- see `TaskPatch::expected_version`.
             expected_version: None,

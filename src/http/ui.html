@@ -63,6 +63,7 @@
   .pri-urgent { color: var(--urgent); font-weight: 600; }
   .pri-high { color: var(--high); }
   .badge-user { color: var(--user); }
+  .tag { color: var(--dim); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; }
   .empty { padding: 10px; color: var(--dim2); font-size: 11px; }
   .more { display: block; width: calc(100% - 16px); margin: 0 8px 8px; color: var(--dim); font-size: 11px; }
   /* The header count is where the truncation becomes visible, so it is also where you act
@@ -221,6 +222,10 @@ async function loadBoard() {
   if (!PROJECT) return;
   const { body } = await api(`/api/projects/${PROJECT}/board`);
   BOARD = body;
+  // Reset, not merged: a board reload is the authoritative set for what it lists, and
+  // keeping stale entries would show a tag on a task it was removed from.
+  TAGS = {};
+  mergeTags(body.task_tags);
   SKEW = Math.floor(Date.now() / 1000) - body.now;
   CURSOR = body.cursor;
   await restoreExpanded();
@@ -244,6 +249,7 @@ async function restoreExpanded() {
         + `?status=${encodeURIComponent(col.status)}&limit=${Math.min(want, 200)}`);
       col.tasks = body.tasks;
       col.next = body.next;
+      mergeTags(body.task_tags);
     } catch (e) {
       // A column that fails to re-expand is not worth losing the rest of the board over --
       // it simply comes back one page deep, which is the old behaviour.
@@ -279,6 +285,13 @@ function renderWorkstream() {
 // A card holds only its blocker's id, so it cannot tell whether that blocker is still
 // blocking. Without this a finished blocker keeps the card reading "do not pick this up",
 // and every blocker is eventually finished -- so the board gets less true over time.
+// Tags come alongside the rows, not on them: `tags` is out of TASK_COLS server-side, so a
+// listed task does not carry it. Merged rather than replaced, because a paged-in column
+// brings the tags for its own rows only.
+let TAGS = {};
+function mergeTags(map) { Object.assign(TAGS, map || {}); }
+function tagsOf(id) { return TAGS[String(id)] || []; }
+
 function blockerDone(id) {
   const row = (BOARD.blocker_status || []).find(b => b.id === id);
   return row && (row.status === 'done' || row.status === 'archived');
@@ -296,6 +309,7 @@ function render() {
           ${t.priority !== 'normal' ? `<span class="pri-${esc(t.priority)}">${esc(t.priority)}</span>` : ''}
           ${t.origin === 'user' ? '<span class="badge-user">user</span>' : ''}
           ${t.blocked_by ? `<span>blocked by #${t.blocked_by}${blockerDone(t.blocked_by) ? ' (done)' : ''}</span>` : ''}
+          ${tagsOf(t.id).map(g => `<span class="tag">${esc(g)}</span>`).join('')}
           <span class="dim2" title="updated ${when(t.updated_at)}&#10;created ${when(t.created_at)}">upd ${ago(t.updated_at)}</span>
         </span>
       </div>`).join('');
@@ -343,6 +357,7 @@ async function loadMore(status) {
       + `?status=${encodeURIComponent(status)}&cursor=${encodeURIComponent(col.next)}`);
     col.tasks = col.tasks.concat(body.tasks);
     col.next = body.next;
+    mergeTags(body.task_tags);
     EXPANDED[status] = col.tasks.length;
     render();
   } catch (e) { fail(e.message); }
@@ -398,6 +413,11 @@ async function openTask(id) {
         <input id="log" class="grow" placeholder="why (recorded in history)">
         <button id="save" class="primary">save</button>
       </div>
+      <div class="row" style="margin-top:7px">
+        <!-- Freeform on purpose: tags exist so the five statuses can stay fixed, and a
+             picker would quietly turn them back into a controlled vocabulary. -->
+        <input id="tags" class="grow" placeholder="tags, comma separated (in review, waiting-on-vendor)">
+      </div>
     </section>
 
     ${t.body ? `<section><h3>detail</h3><pre class="body">${esc(t.body)}</pre></section>` : ''}
@@ -440,6 +460,7 @@ async function openTask(id) {
   // panel touched.
   $('#ws').innerHTML = workstreamOptions('no workstream',
     body.workstream ? body.workstream.name : '');
+  $('#tags').value = (body.tags || []).join(', ');
   $('#panel').hidden = false;
   $('#close').onclick = () => { $('#panel').hidden = true; OPEN_TASK = null; };
   $('#save').onclick = () => saveTask(id);
@@ -461,6 +482,9 @@ async function saveTask(id) {
         // Always sent: the control shows the task's current workstream, so leaving it
         // alone and moving it are both explicit rather than one being an omission.
         workstream: $('#ws').value,
+        // Always sent, like `workstream`: the field shows the current set, so clearing it
+        // and leaving it alone are both explicit rather than one being an omission.
+        tags: $('#tags').value.split(',').map(t => t.trim()).filter(Boolean),
         log: $('#log').value || null,
       }),
     });

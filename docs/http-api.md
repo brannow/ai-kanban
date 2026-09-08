@@ -123,7 +123,12 @@ tell that client whether what it is showing has gone stale.
   // Status of every task a listed card is blocked by. A card carries only the blocker's
   // id, so without this the board reads "blocked by #16" for as long as the row exists --
   // including long after #16 was finished.
-  "blocker_status": [ { "id": 16, "status": "done" } ]
+  "blocker_status": [ { "id": 16, "status": "done" } ],
+  // Tags for the listed tasks, keyed by id, and only for tasks that have any. Sent
+  // alongside the rows rather than on them because `tags` is out of TASK_COLS, so a listed
+  // task does not carry it. `/tasks` returns the same field for the rows in its page --
+  // without that, an expanded column would show tags on the first 50 cards and none after.
+  "task_tags": { "68": ["frontend", "in review"] }
 }
 ```
 

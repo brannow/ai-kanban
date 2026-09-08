@@ -308,6 +308,10 @@ pub struct ProjectSummary {
 pub struct TaskDetail {
     pub project: Project,
     pub task: Task,
+    /// Carried here rather than on `Task` because `tags` is out of `TASK_COLS` -- see
+    /// migration 006. task_show is the response allowed to cost more, so it is where the
+    /// labels belong; the board line deliberately does not show them.
+    pub tags: Vec<String>,
     pub blocker: Option<Task>,
     pub blocking: Vec<Task>,
     pub events: Vec<Event>,
