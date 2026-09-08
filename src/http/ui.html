@@ -150,6 +150,10 @@
 <script>
 const $ = s => document.querySelector(s);
 let META = null, PROJECT = null, CURSOR = 0, BOARD = null, SKEW = 0, OPEN_TASK = null;
+// Status -> how many rows the person has expanded that column to. A live tick refetches the
+// board, which comes back one page deep, so without this every event silently collapses a
+// column the reader had opened. Cleared whenever the board being looked at changes.
+let EXPANDED = {};
 // Board name -> id. Recall hits name their project; every other call needs the id.
 const PROJECTS = new Map();
 
@@ -219,7 +223,33 @@ async function loadBoard() {
   BOARD = body;
   SKEW = Math.floor(Date.now() / 1000) - body.now;
   CURSOR = body.cursor;
+  await restoreExpanded();
   render();
+}
+
+// Re-opens the columns the reader had expanded, in ONE request each rather than by replaying
+// the pages they clicked through. A cursor walk would cost a round trip per page on every
+// event; asking for the rows directly costs one per expanded column and needs no bookkeeping
+// beyond a row count.
+//
+// The server caps `limit` at 200, so a column expanded past that comes back at 200 and the
+// button reappears for the rest. That is a worse outcome than remembering exactly, and a much
+// better one than silently dropping back to 50.
+async function restoreExpanded() {
+  for (const col of BOARD.columns) {
+    const want = EXPANDED[col.status];
+    if (!want || want <= col.tasks.length) continue;
+    try {
+      const { body } = await api(`/api/projects/${PROJECT}/tasks`
+        + `?status=${encodeURIComponent(col.status)}&limit=${Math.min(want, 200)}`);
+      col.tasks = body.tasks;
+      col.next = body.next;
+    } catch (e) {
+      // A column that fails to re-expand is not worth losing the rest of the board over --
+      // it simply comes back one page deep, which is the old behaviour.
+      fail(e.message);
+    }
+  }
 }
 
 // Options for a workstream picker. The empty value means two different things depending on
@@ -313,6 +343,7 @@ async function loadMore(status) {
       + `?status=${encodeURIComponent(status)}&cursor=${encodeURIComponent(col.next)}`);
     col.tasks = col.tasks.concat(body.tasks);
     col.next = body.next;
+    EXPANDED[status] = col.tasks.length;
     render();
   } catch (e) { fail(e.message); }
 }
@@ -331,6 +362,9 @@ async function setWorkstream(name) {
       body: JSON.stringify({ name: name || null }),
     });
     $('#panel').hidden = true;
+    // A different slice of the board is a different set of columns; carrying the expansion
+    // over would re-open something the reader never expanded here.
+    EXPANDED = {};
     await loadBoard();
   } catch (e) { fail(e.message); }
 }
@@ -601,6 +635,7 @@ function connect() {
       PROJECT = Number(sel.value);
       history.replaceState(null, '', `?project=${PROJECT}`);
       $('#panel').hidden = true;
+      EXPANDED = {};
       es.close();
       await loadBoard();
       es = connect();
