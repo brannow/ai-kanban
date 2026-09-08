@@ -77,6 +77,29 @@ pub fn board(snap: &BoardSnapshot) -> String {
         out.push_str(&format!("\n  ...{more}\n"));
     }
 
+    // Said only when the cap is actually hiding work AND there is nothing to group by.
+    //
+    // Those two conditions together are the whole design of this line. `omitted` non-empty
+    // means the board is showing a slice; no workstreams means there is no way for it to be
+    // the RIGHT slice, because selection then falls back to recency. That is the failure
+    // measured in note #16: a cold agent told in detail about work that is not its own.
+    //
+    // It goes quiet the moment a workstream exists, which is what keeps it from becoming
+    // the repeated boilerplate that gets a plugin uninstalled and that a model learns to
+    // skip. Suppressed on an after-write snapshot as well (`highlight`): that response is a
+    // confirmation that filing landed, and filing has to stay cheap.
+    if !snap.omitted.is_empty()
+        && snap.workstream.is_none()
+        && snap.other_workstreams.is_empty()
+        && snap.highlight.is_none()
+    {
+        out.push_str(
+            "\n  Nothing here is grouped, so this is the most recently touched work rather \
+             than the work in hand. When the user says what they are working on, pass it to \
+             board as `workstream` -- the board narrows to it and new tasks join it.\n",
+        );
+    }
+
     if !snap.recent.is_empty() {
         out.push_str("\nrecent\n");
         for e in &snap.recent {

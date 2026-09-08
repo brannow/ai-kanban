@@ -373,3 +373,51 @@ fn the_board_says_whether_a_blocker_is_still_blocking() {
     assert!(text.contains(&format!("blocked by #{} (done)", blocker.id)),
         "a finished blocker has to say so, or the task reads as dead: {text}");
 }
+
+#[test]
+fn an_ungrouped_board_that_is_hiding_work_says_how_to_narrow_it() {
+    // Two conditions, and the pairing is the design. `omitted` non-empty means the board is
+    // showing a slice; no workstreams means it cannot be the RIGHT slice, because selection
+    // then falls back to recency -- the failure note #16 measured, where a cold agent is
+    // told in detail about work that is not its own.
+    //
+    // The line has to go quiet as soon as either condition lifts. A nudge that fires on
+    // every call is what gets a plugin uninstalled and what a model learns to skip, so the
+    // silence cases below matter more than the firing one.
+    let (s, pid) = fixture();
+    for i in 0..(BoardQuery::BOARD_LIMIT + 5) {
+        s.create_task(pid, TaskDraft::new(format!("task {i}"))).unwrap();
+    }
+
+    let snap = s.board(pid, &BoardQuery::board()).unwrap();
+    assert!(!snap.omitted.is_empty(), "fixture must actually trip the cap");
+    let text = ai_kanban::render::board(&snap);
+    assert!(text.contains("pass it to board as `workstream`"), "{text}");
+
+    // Silent after a write. That response confirms the task landed, and filing has to stay
+    // cheap -- a nudge on every task_add is the boilerplate this is trying not to become.
+    let t = s.create_task(pid, TaskDraft::new("one more")).unwrap();
+    let after = ai_kanban::render::board(&s.board_after_mutation(pid, t.id).unwrap());
+    assert!(!after.contains("`workstream`"), "not on a write confirmation: {after}");
+
+    // An EMPTY workstream does not count, and that is deliberate rather than an oversight:
+    // `workstream_summaries` requires open tasks, and a workstream holding none is not
+    // grouping anything. The board is still a recency-ordered slice, so the advice stands.
+    let w = s.ensure_workstream(pid, "contact-form").unwrap();
+    let empty = ai_kanban::render::board(&s.board(pid, &BoardQuery::board()).unwrap());
+    assert!(empty.contains("pass it to board as `workstream`"),
+        "an empty workstream groups nothing, so this is not yet done: {empty}");
+
+    // Silent once work actually sits in one, whether or not the board is scoped to it.
+    s.set_current_workstream(pid, w.id).unwrap();
+    s.create_task(pid, TaskDraft::new("field validator")).unwrap();
+    s.clear_current_workstream(pid).unwrap();
+    let unscoped = ai_kanban::render::board(&s.board(pid, &BoardQuery::board()).unwrap());
+    assert!(!unscoped.contains("pass it to board as `workstream`"),
+        "a workstream holds work, so the advice is already taken: {unscoped}");
+
+    let scoped = ai_kanban::render::board(
+        &s.board(pid, &BoardQuery::board().with_workstream(Some(w.id))).unwrap());
+    assert!(!scoped.contains("pass it to board as `workstream`"),
+        "never nag a board that is already narrowed: {scoped}");
+}
