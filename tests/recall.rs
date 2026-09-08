@@ -206,3 +206,34 @@ fn notes_outrank_events_regardless_of_raw_fts_score() {
     let r = s.recall(&q("cache", Some(pid))).unwrap();
     assert_eq!(r.hits[0].kind, HitKind::Note, "a durable claim answers 'what do we know' better than one log line");
 }
+
+#[test]
+fn a_capped_result_says_how_many_matches_it_left_out() {
+    // Recall is capped like everything else, and a capped list that looks complete sends the
+    // reader away believing the store holds nothing more. `core/board.rs` already sets the
+    // rule -- report what the cap excluded rather than dropping it silently.
+    //
+    // The number has to be COUNTED, and this fixture is built to prove it. Fifteen matching
+    // notes means `recall_notes` returns exactly its own `limit` of 10 and the merged list
+    // is truncated from 10 to 10 -- so inferring the omission from what came back gives 0,
+    // confidently and wrongly. The cap is applied twice; only a real count sees past it.
+    let s = Store::open_in_memory().unwrap();
+    let pid = project(&s, "omitted");
+    let total = DEFAULT_LIMIT + 5;
+    for i in 0..total {
+        s.create_note(pid, NoteDraft {
+            body: "the auth middleware rewrites Location headers".into(),
+            ..NoteDraft::new(format!("middleware note {i}"))
+        }, Actor::Agent).unwrap();
+    }
+
+    let r = s.recall(&q("middleware", Some(pid))).unwrap();
+    assert_eq!(r.hits.len(), DEFAULT_LIMIT, "the cap still applies");
+    assert_eq!(r.omitted, total - DEFAULT_LIMIT, "counted, not inferred from the truncated list");
+
+    // And a result that fits reports nothing left out, or the notice cries wolf on every
+    // search and stops being read.
+    let r = s.recall(&RecallQuery { text: "middleware", project_id: Some(pid), limit: 200 }).unwrap();
+    assert_eq!(r.hits.len(), total);
+    assert_eq!(r.omitted, 0);
+}

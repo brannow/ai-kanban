@@ -31,7 +31,7 @@ fn a_filed_task_joins_the_current_workstream_without_being_told() {
     let w = s.ensure_workstream(pid, "contact-form").unwrap();
     s.set_current_workstream(pid, w.id).unwrap();
 
-    let t = s.create_task(pid, TaskDraft::new("validator rejects empty labels")).unwrap();
+    s.create_task(pid, TaskDraft::new("validator rejects empty labels")).unwrap();
 
     let scoped = s.board(pid, &BoardQuery::board().with_workstream(Some(w.id))).unwrap();
     assert_eq!(titles(&scoped), vec!["validator rejects empty labels"]);

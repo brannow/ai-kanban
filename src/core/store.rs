@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 /// Owns the connection and the schema. One global DB; projects are rows, not files.
 pub struct Store {
     pub conn: Connection,
+    /// Set only by `open_existing`. The checkpoint in `Drop` cannot run on a read-only
+    /// connection, and attempting it there looked like it did something while it could not.
+    read_only: bool,
 }
 
 impl Store {
@@ -52,7 +55,7 @@ impl Store {
         // Creates the schema on a new store and upgrades an old one. This is the only place
         // that happens -- see `migrate.rs` for why the read-only path must not.
         migrate::run(&conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn, read_only: false })
     }
 }
 
@@ -73,11 +76,16 @@ impl Store {
 /// #14, where exactly that happened on the real store).
 ///
 /// Failure is ignored on purpose. Every caller of this is a process already on its way
-/// out, a busy checkpoint means another session will do the same job shortly, and on the
-/// read-only connection the session-start hook uses it cannot run at all -- none of which
+/// out, and a busy checkpoint means another session will do the same job shortly -- neither
 /// is worth a message in a destructor.
+///
+/// The read-only connection skips it rather than attempting and swallowing the failure. A
+/// call that cannot possibly work reads, to anyone maintaining this, as one that does.
 impl Drop for Store {
     fn drop(&mut self) {
+        if self.read_only {
+            return;
+        }
         self.checkpoint();
     }
 }
@@ -124,6 +132,6 @@ impl Store {
         if !migrate::is_readable(&conn)? {
             return Ok(None);
         }
-        Ok(Some(Self { conn }))
+        Ok(Some(Self { conn, read_only: true }))
     }
 }

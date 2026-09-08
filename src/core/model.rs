@@ -354,6 +354,11 @@ pub struct RecallResult {
     /// Populated so an empty result can orient rather than just report nothing: per the
     /// design law, "no hits" should say what *is* in the store and suggest widening.
     pub available: StoreOverview,
+    /// How many matches the cap left out. Recall is capped like everything else here, and
+    /// `core/board.rs` sets the rule that a cap reports what it excluded rather than
+    /// dropping it silently -- a result that looks complete and is not sends the reader
+    /// away believing the store holds nothing more.
+    pub omitted: usize,
     pub now: i64,
 }
 

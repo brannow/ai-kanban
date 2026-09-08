@@ -65,6 +65,11 @@
   .badge-user { color: var(--user); }
   .empty { padding: 10px; color: var(--dim2); font-size: 11px; }
   .more { display: block; width: calc(100% - 16px); margin: 0 8px 8px; color: var(--dim); font-size: 11px; }
+  /* The header count is where the truncation becomes visible, so it is also where you act
+     on it -- the bottom button is 50 cards away from the notice that sends you looking for
+     it. Styled as the header text it replaces rather than as a button parked in a header. */
+  .count-more { background: none; border: 0; padding: 0; color: inherit; font: inherit; letter-spacing: inherit; }
+  .count-more:hover { color: var(--accent); text-decoration: underline; }
 
   #panel {
     position: fixed; top: 0; right: 0; bottom: 0; width: min(620px, 100%);
@@ -263,11 +268,17 @@ function render() {
     // "50 / 75", not "50 of 75": the header is uppercased and letter-spaced, which turns a
     // word into something that reads as a code rather than a sentence. A slash survives it.
     const shown = col.tasks.length < col.total ? `${col.tasks.length} / ${col.total}` : `${col.total}`;
+    const rest = col.total - col.tasks.length;
+    // Two ways to the same action: the header, where you notice rows are missing, and the
+    // foot of the column, where you arrive after scrolling the ones that are there.
+    const count = col.next
+      ? `<button class="count-more" data-more="${esc(col.status)}" title="load the remaining ${rest}">${shown}</button>`
+      : `<span>${shown}</span>`;
     const more = col.next
-      ? `<button class="more" data-status="${esc(col.status)}">load ${col.total - col.tasks.length} more</button>`
+      ? `<button class="more" data-more="${esc(col.status)}">load ${rest} more</button>`
       : '';
     return `<div class="col ${esc(col.status)}">
-      <h2><span>${esc(col.status)}</span><span>${shown}</span></h2>
+      <h2><span>${esc(col.status)}</span>${count}</h2>
       <div class="cards">${cards || '<div class="empty">nothing here</div>'}</div>
       ${more}
     </div>`;
@@ -275,8 +286,8 @@ function render() {
 
   document.querySelectorAll('.card').forEach(c =>
     c.onclick = () => openTask(Number(c.dataset.id)));
-  document.querySelectorAll('.more').forEach(b =>
-    b.onclick = () => loadMore(b.dataset.status));
+  document.querySelectorAll('[data-more]').forEach(b =>
+    b.onclick = () => loadMore(b.dataset.more));
 }
 
 // Appends the next page into the column already on screen. The server scopes `/tasks` to the

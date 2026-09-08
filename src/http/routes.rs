@@ -598,6 +598,7 @@ pub async fn recall(
         "now": crate::core::now(),
         "scope": result.scope,
         "hits": result.hits,
+        "omitted": result.omitted,
         "available": result.available,
     })))
 }

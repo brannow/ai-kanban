@@ -71,8 +71,12 @@ impl Store {
         let available = self.overview(q.project_id)?;
 
         let Some(match_expr) = fts_query(q.text) else {
-            return Ok(RecallResult { query: q.text.into(), hits: vec![], scope, available, now: now() });
+            return Ok(RecallResult {
+                query: q.text.into(), hits: vec![], scope, available, omitted: 0, now: now(),
+            });
         };
+
+        let total = self.match_total(&match_expr, q.project_id)?;
 
         let mut hits = Vec::new();
         hits.extend(self.recall_notes(&match_expr, q.project_id, q.limit)?);
@@ -96,7 +100,33 @@ impl Store {
             .then(b.ts.cmp(&a.ts)));
         hits.truncate(q.limit);
 
-        Ok(RecallResult { query: q.text.into(), hits, scope, available, now: now() })
+        let omitted = total.saturating_sub(hits.len());
+        Ok(RecallResult { query: q.text.into(), hits, scope, available, omitted, now: now() })
+    }
+
+    /// Total rows matching, so a truncated result can say what it left out.
+    ///
+    /// Counted, not inferred from what came back. The cap is applied TWICE -- each of the
+    /// three searches takes `limit` rows before the merged list is truncated to `limit`
+    /// again -- so the number of hits in hand is a lower bound on the matches and nothing
+    /// more. Publishing a lower bound as though it were the count produces a number that
+    /// gets believed and is wrong whenever it matters.
+    ///
+    /// The event filters are repeated here rather than shared, and they must stay in step
+    /// with `recall_events`: counting rows that search would never return would report
+    /// omissions that do not exist, which is a worse failure than saying nothing.
+    fn match_total(&self, m: &str, project: Option<i64>) -> Result<usize> {
+        let housekeeping = crate::core::event::housekeeping_filter().replace("kind", "e.kind");
+        let n: i64 = self.conn.query_row(&format!(
+            "SELECT (SELECT count(*) FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid
+                      WHERE notes_fts MATCH ?1 AND (?2 IS NULL OR n.project_id = ?2))
+                  + (SELECT count(*) FROM tasks_fts JOIN tasks t ON t.id = tasks_fts.rowid
+                      WHERE tasks_fts MATCH ?1 AND (?2 IS NULL OR t.project_id = ?2))
+                  + (SELECT count(*) FROM events_fts JOIN events e ON e.id = events_fts.rowid
+                      WHERE events_fts MATCH ?1 AND (?2 IS NULL OR e.project_id = ?2)
+                        AND e.kind NOT IN ('created', 'note_added') AND {housekeeping})"
+        ), params![m, project], |r| r.get(0))?;
+        Ok(n.max(0) as usize)
     }
 
     fn recall_notes(&self, m: &str, project: Option<i64>, limit: usize) -> Result<Vec<RecallHit>> {

@@ -247,6 +247,13 @@ pub fn recall(r: &RecallResult, cross_project: bool, missing: &MissingSubjects) 
         }
     }
 
+    // What the cap left out, phrased as a next step rather than a statistic. A capped list
+    // that looks complete sends the reader away believing the store holds nothing more --
+    // the same failure the board's `omitted` count exists to prevent.
+    if r.omitted > 0 {
+        out.push_str(&format!("\n{} more match{} not shown. Narrow the query, or pass a higher limit.\n",
+            r.omitted, if r.omitted == 1 { "" } else { "es" }));
+    }
     if !cross_project {
         out.push_str("\nSearched this project only. Pass project: \"all\" to search every board.\n");
     }
