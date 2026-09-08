@@ -247,7 +247,9 @@ pub struct LogParams {
 // Tools
 // ---------------------------------------------------------------------------
 
-#[tool_router]
+// `vis = "pub"` so the tool list -- and therefore every generated schema -- is reachable
+// from an integration test. See `tests/mcp_schema.rs`.
+#[tool_router(vis = "pub")]
 impl AiKanban {
     /// Show the board: what is in flight, what is blocked and why, and what happened
     /// recently. Call this when starting work on a project to find out where things stand.
@@ -491,6 +493,33 @@ impl AiKanban {
 /// thing in fewer words rather than describing the API.
 #[tool_handler]
 impl ServerHandler for AiKanban {
+    /// Defined here purely to run every tool schema through `schema::split_type_unions` on
+    /// the way out. `#[tool_handler]` generates `list_tools` only when the impl does not
+    /// already have one, so writing it here replaces that generated body and leaves
+    /// `call_tool` alone. The rest of this mirrors what the macro would have produced.
+    ///
+    /// Rewriting here rather than at the type level keeps the parameter structs honest: an
+    /// `Option<String>` stays an `Option<String>`, and the shape other clients need is a
+    /// serialisation concern handled at the boundary where it belongs.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
+        let supports_cache_hints = context.protocol_version().is_some_and(|version| {
+            version >= rmcp::model::ProtocolVersion::V_2026_07_28
+        });
+        let tools = crate::mcp::schema::portable_tools(Self::tool_router().list_all());
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
+        })
+    }
+
     fn get_info(&self) -> ServerInfo {
         // Both ServerInfo and Implementation are #[non_exhaustive], so they are built
         // through their constructors and then adjusted.

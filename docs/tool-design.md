@@ -321,3 +321,25 @@ status rather than a delete, and a note edit writes the previous value into the 
 
 The write tools are **not** idempotent, and saying so matters: calling `task_add` twice
 creates two tasks. A client that assumed otherwise and retried would silently duplicate work.
+
+## Schema portability
+
+Every tool schema is rewritten on the way out of `list_tools`: `"type": ["string", "null"]`
+becomes `{"anyOf": [{"type": "string"}, {"type": "null"}]}` (`src/mcp/schema.rs`).
+
+Both forms are legal JSON Schema and mean the same thing. The array form is what `schemars`
+emits for every `Option<T>`, and it is the one a number of MCP clients mishandle — they
+either refuse the tool or drop the constraint. The failure mode is what makes this worth
+code rather than a note: nothing errors. The board is simply missing in that client, and the
+agent working there has no memory, with no signal to anyone about why.
+
+Rewriting at the boundary rather than at the type level is deliberate. `Option<String>` is
+the honest Rust type for an optional argument, and eight parameter structs should not be
+contorted to suit other people's parsers. Which shape goes over the wire is a serialisation
+concern, and it is handled where serialisation happens.
+
+The rewrite walks the whole schema tree rather than a list of known fields, so a parameter
+added later inherits it without anyone remembering this section exists. `tests/mcp_schema.rs`
+asserts it over the real registered tools, and also asserts that the generator still produces
+unions — a guard that outlives the thing it guards is worse than none, because it passes
+forever while checking nothing.
