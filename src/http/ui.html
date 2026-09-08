@@ -64,6 +64,7 @@
   .pri-high { color: var(--high); }
   .badge-user { color: var(--user); }
   .empty { padding: 10px; color: var(--dim2); font-size: 11px; }
+  .more { display: block; width: calc(100% - 16px); margin: 0 8px 8px; color: var(--dim); font-size: 11px; }
 
   #panel {
     position: fixed; top: 0; right: 0; bottom: 0; width: min(620px, 100%);
@@ -90,6 +91,8 @@
   .note .paths { font-size: 11px; color: var(--dim2); margin-top: 5px; word-break: break-all; }
   .hit { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 9px; margin-bottom: 7px; }
   .hit mark { background: transparent; color: var(--accent); font-weight: 600; }
+  .hit.open { cursor: pointer; }
+  .hit.open:hover { border-color: var(--accent); }
   #err {
     position: fixed; bottom: 14px; left: 14px; z-index: 40; max-width: 520px;
     background: var(--panel); border: 1px solid var(--bug); color: var(--bug);
@@ -142,6 +145,8 @@
 <script>
 const $ = s => document.querySelector(s);
 let META = null, PROJECT = null, CURSOR = 0, BOARD = null, SKEW = 0, OPEN_TASK = null;
+// Board name -> id. Recall hits name their project; every other call needs the id.
+const PROJECTS = new Map();
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -251,14 +256,46 @@ function render() {
           <span class="dim2" title="updated ${when(t.updated_at)}&#10;created ${when(t.created_at)}">upd ${ago(t.updated_at)}</span>
         </span>
       </div>`).join('');
+    // A column lists at most one page while its header counts every task in that status,
+    // so a truncated column has to SAY it is truncated. An unqualified "75" above 50 cards
+    // is how a task becomes invisible with nothing on screen looking wrong -- you cannot
+    // scroll to it, and browser find cannot see it, because it was never in the document.
+    // "50 / 75", not "50 of 75": the header is uppercased and letter-spaced, which turns a
+    // word into something that reads as a code rather than a sentence. A slash survives it.
+    const shown = col.tasks.length < col.total ? `${col.tasks.length} / ${col.total}` : `${col.total}`;
+    const more = col.next
+      ? `<button class="more" data-status="${esc(col.status)}">load ${col.total - col.tasks.length} more</button>`
+      : '';
     return `<div class="col ${esc(col.status)}">
-      <h2><span>${esc(col.status)}</span><span>${col.total}</span></h2>
+      <h2><span>${esc(col.status)}</span><span>${shown}</span></h2>
       <div class="cards">${cards || '<div class="empty">nothing here</div>'}</div>
+      ${more}
     </div>`;
   }).join('');
 
   document.querySelectorAll('.card').forEach(c =>
     c.onclick = () => openTask(Number(c.dataset.id)));
+  document.querySelectorAll('.more').forEach(b =>
+    b.onclick = () => loadMore(b.dataset.status));
+}
+
+// Appends the next page into the column already on screen. The server scopes `/tasks` to the
+// same current workstream the board is scoped to, so page two cannot pull in rows the header
+// did not count.
+//
+// A live-stream tick calls loadBoard and collapses the column back to one page. That is
+// deliberate: keeping it expanded means replaying N pages on every event, and the state to
+// get that wrong costs more than re-clicking a button.
+async function loadMore(status) {
+  const col = BOARD && BOARD.columns.find(c => c.status === status);
+  if (!col || !col.next) return;
+  try {
+    const { body } = await api(`/api/projects/${PROJECT}/tasks`
+      + `?status=${encodeURIComponent(status)}&cursor=${encodeURIComponent(col.next)}`);
+    col.tasks = col.tasks.concat(body.tasks);
+    col.next = body.next;
+    render();
+  } catch (e) { fail(e.message); }
 }
 
 // ---- workstream ------------------------------------------------------------
@@ -410,8 +447,8 @@ async function runSearch(q) {
         <h2>recall: ${esc(q)}</h2><button id="close">close</button>
       </div>
       <div class="dim2" style="font-size:11px">${esc(body.scope)} · ${body.hits.length} hits${body.omitted ? ` (+${body.omitted} more)` : ''}</div>
-      <section>${body.hits.map(h => `
-        <div class="hit">
+      <section>${body.hits.map((h, i) => `
+        <div class="hit${h.task_id ? ' open' : ''}" ${h.task_id ? `data-hit="${i}"` : ''}>
           <div class="dim2" style="font-size:11px">
             ${esc(h.kind)} · ${esc(h.project)} ${h.task_id ? `· #${h.task_id}` : ''} · ${ago(h.ts)}
           </div>
@@ -421,6 +458,40 @@ async function runSearch(q) {
       </section>`;
     $('#panel').hidden = false;
     $('#close').onclick = () => { $('#panel').hidden = true; };
+    // Only hits that point at a task are clickable. Note hits and title-only event hits have
+    // no task_id, and a result that looks openable and does nothing is worse than a plain one.
+    $('#panel').querySelectorAll('.hit.open').forEach(el =>
+      el.onclick = () => openHit(body.hits[Number(el.dataset.hit)]));
+  } catch (e) { fail(e.message); }
+}
+
+// Follows a hit to its task. Recall searches EVERY board, so a hit can belong to a project
+// that is not the one on screen, and it carries a project *name* rather than an id -- hence
+// the lookup built at boot.
+//
+// The board switch goes through the picker's own onchange rather than being repeated here:
+// that handler is what closes the current event stream and opens a new one. Switching
+// inline would leave the old EventSource attached to the previous board.
+async function openHit(h) {
+  try {
+    const here = BOARD && BOARD.project && BOARD.project.name;
+    if (h.project !== here) {
+      const id = PROJECTS.get(h.project);
+      if (!id) { fail(`board "${h.project}" is not in the picker`); return; }
+      const sel = $('#project');
+      sel.value = String(id);
+      // A <select> silently keeps its old value when assigned one no option carries, and
+      // onchange would then read the wrong board -- or `Number("")` = 0, fetching
+      // /api/projects/0. Cannot happen today (the map and the options are filled from one
+      // response and neither is refreshed), which is exactly why it would go unnoticed the
+      // day one of them starts refreshing without the other.
+      if (sel.value !== String(id)) { fail(`board "${h.project}" is no longer listed`); return; }
+      await sel.onchange();
+    }
+    // openTask is otherwise only reached from a card that provably exists. From a search
+    // result the task may have been forgotten since it was indexed, so a 404 is reachable
+    // and would otherwise surface as nothing at all.
+    await openTask(h.task_id);
   } catch (e) { fail(e.message); }
 }
 
@@ -500,6 +571,7 @@ function connect() {
     const sel = $('#project');
     sel.innerHTML = body.projects.map(p =>
       `<option value="${p.project.id}">${esc(p.project.name)} (${p.open} open)</option>`).join('');
+    body.projects.forEach(p => PROJECTS.set(p.project.name, p.project.id));
 
     const wanted = new URLSearchParams(location.search).get('project');
     if (wanted && body.projects.some(p => String(p.project.id) === wanted)) sel.value = wanted;

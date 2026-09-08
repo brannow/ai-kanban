@@ -312,16 +312,25 @@ pub struct PageParams {
     pub limit: Option<usize>,
 }
 
+/// Scoped to the project's current workstream, like `board` is.
+///
+/// This is the endpoint a board column pages against, so an unscoped page two would put more
+/// cards in a column than its own header claims -- `counts` comes from `status_counts_in`,
+/// which is already workstream-scoped. The scope is read here rather than accepted as a
+/// query parameter on purpose: it can change between the board load and the "load more"
+/// click, and a client replaying a stale name would silently mix two slices of the board.
 pub async fn tasks(
     State(api): State<Api>, Path(p): Path<String>, Query(q): Query<PageParams>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let store = api.store();
     let project = resolve(&store, &p)?;
-    let page = store.tasks_page(
+    let ws = store.current_workstream(project.id)?.map(|w| w.id);
+    let page = store.tasks_page_in(
         project.id,
         &parse_status_list(&q.status)?,
         decode_cursor(&q.cursor)?,
         q.limit.unwrap_or(PAGE).min(200),
+        ws,
     )?;
     Ok(Json(json!({
         "now": crate::core::now(),

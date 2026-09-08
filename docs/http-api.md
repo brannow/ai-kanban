@@ -111,12 +111,15 @@ tell that client whether what it is showing has gone stale.
   "project": { ... },
   "now": 1756400000,
   "cursor": 412,                 // the events.id this read was taken at
-  "counts":  { "backlog": 12, "doing": 2, "blocked": 1, "done": 40, "archived": 3 },
-  "columns": {
-    "doing":   { "tasks": [ ... ], "next_cursor": null },
-    "blocked": { "tasks": [ ... ], "next_cursor": null },
-    "backlog": { "tasks": [ ... ], "next_cursor": "1756399000:31" }
-  }
+  "counts":  [ { "status": "backlog", "count": 12 }, { "status": "doing", "count": 2 } ],
+  // An ARRAY, already in column order -- the client renders left to right without knowing
+  // the ordering rule. `total` is every task in that status; `tasks` is the first page.
+  "columns": [
+    { "status": "doing",   "total": 2,  "tasks": [ ... ], "next": null },
+    { "status": "backlog", "total": 75, "tasks": [ ... ], "next": "1756399000:31" }
+  ],
+  "workstream":  { ... },        // what the board is scoped to, or null
+  "workstreams": [ ... ]         // everything selectable
 }
 ```
 
@@ -125,9 +128,24 @@ is the right shape for something that must fit in a token budget and the wrong s
 board with columns you scroll. One request paints the whole board; each column then pages
 independently against `/tasks?status=`.
 
+**`total` and `tasks.length` differ, and the client must show that they differ.** A column
+that lists 50 of 75 under a header reading `75` is a task that cannot be reached: not by
+scrolling, and not by browser find, because it was never in the document. Whatever replaces
+the agent snapshot's `omitted` count here has to be visible in the same way -- dropping the
+count did not remove the cap, it only removed the evidence of it. This was a real bug: the
+paging half of this design was specified here and never built client-side, so the cap stayed
+silent for as long as the UI existed.
+
 **The whole read runs in one transaction** (`BEGIN DEFERRED`). `counts` and the per-column
 pages are separate queries, and an agent writing between them would render `backlog (12)`
 above thirteen cards. A read transaction costs nothing here and removes the class entirely.
+
+**`/tasks` is scoped to the project's current workstream, exactly as `board` is.** It is the
+endpoint a column pages against, and `counts` comes from `status_counts_in`, which is already
+scoped -- so an unscoped page two would put more cards in a column than its own header
+counted. The scope is read server-side rather than passed as a query parameter: it can change
+between the board load and the "load more" click, and a client replaying a name it captured
+earlier would silently splice two slices of the board together.
 
 ### Writes
 

@@ -384,3 +384,41 @@ async fn an_unknown_workstream_is_refused_with_the_ones_that_exist() {
     assert_eq!(board["workstreams"].as_array().unwrap().len(), 2,
         "and must not have created a third");
 }
+
+#[tokio::test]
+async fn paging_a_column_stays_inside_the_workstream_the_board_is_scoped_to() {
+    // `/tasks` is what a board column pages against, and the column header comes from
+    // `status_counts_in`, which is workstream-scoped. An unscoped page two would therefore
+    // put more cards in a column than its own header counted -- and would show the person
+    // work from a slice of the board they had deliberately narrowed away from.
+    let (api, pid) = api();
+    {
+        let s = api.store.lock().unwrap();
+        let w = s.ensure_workstream(pid, "contact-form").unwrap();
+        s.set_current_workstream(pid, w.id).unwrap();
+        for i in 0..6 {
+            s.create_task(pid, TaskDraft::new(format!("scoped {i}"))).unwrap();
+        }
+        s.clear_current_workstream(pid).unwrap();
+        let o = s.ensure_workstream(pid, "seo-redirects").unwrap();
+        s.set_current_workstream(pid, o.id).unwrap();
+        s.create_task(pid, TaskDraft::new("elsewhere")).unwrap();
+        s.clear_current_workstream(pid).unwrap();
+        let w = s.ensure_workstream(pid, "contact-form").unwrap();
+        s.set_current_workstream(pid, w.id).unwrap();
+    }
+
+    // Deliberately paged small, so the row from the other workstream would have room to
+    // appear if the endpoint were not scoped.
+    let (_, first, _) = call(&api, get(&format!("/api/projects/{pid}/tasks?limit=4"))).await;
+    let cursor = first["next"].as_str().expect("more pages").to_string();
+    let (status, second, _) =
+        call(&api, get(&format!("/api/projects/{pid}/tasks?limit=4&cursor={cursor}"))).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+
+    let titles: Vec<&str> = [&first, &second].iter()
+        .flat_map(|b| b["tasks"].as_array().unwrap())
+        .map(|t| t["title"].as_str().unwrap()).collect();
+    assert_eq!(titles.len(), 6, "every scoped task, across both pages: {titles:?}");
+    assert!(!titles.contains(&"elsewhere"), "another workstream leaked into a page: {titles:?}");
+}
