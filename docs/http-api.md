@@ -147,6 +147,33 @@ counted. The scope is read server-side rather than passed as a query parameter: 
 between the board load and the "load more" click, and a client replaying a name it captured
 earlier would silently splice two slices of the board together.
 
+### `/api/recall`
+
+```jsonc
+{
+  "now": 1756400000,
+  "scope": "all projects",       // or the project name, when `project=` was given
+  "hits": [ { "kind": "task", "id": 68, "task_id": 68, "project": "sbb", "title": "...",
+              "snippet": "... >>news<< ...", "ts": 1756399000, "score": -1.8,
+              "status": "backlog" } ],
+  "omitted": 35,                 // matches the cap left out
+  "available": { "notes": 67, "tasks": 196, "events": 508, "projects": 5 }
+}
+```
+
+**`omitted` is counted, not derived from `hits.length`.** The cap is applied twice — each of
+the three searches (notes, tasks, events) takes `limit` rows, and the merged list is then
+truncated to `limit` again — so the number of hits returned is a lower bound on the matches
+and nothing more. A search returning 20 of 55 matches would otherwise report 0 omitted, which
+is the failure this field exists to prevent: a capped result that looks complete sends the
+reader away believing the store holds nothing else.
+
+`hits[].id` is the id of the matched thing in its own id space; `task_id` is the task to
+follow, and is null for a note or for an event with no task. A client making hits clickable
+must key on `task_id`, not `id`. `project` is a display NAME — `{p}` in every other route
+takes an id or a key, so following a hit to another board needs a name-to-id lookup from
+`/api/projects`.
+
 ### Writes
 
 Everything a human sends is `origin: "user"` and `actor: "user"`, **hardcoded in the adapter

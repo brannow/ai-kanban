@@ -237,3 +237,29 @@ fn a_capped_result_says_how_many_matches_it_left_out() {
     assert_eq!(r.hits.len(), total);
     assert_eq!(r.omitted, 0);
 }
+
+#[test]
+fn the_omitted_count_ignores_exactly_what_the_search_ignores() {
+    // Recall counts matches to report what its cap left out, and searches them to return
+    // them. Those are two queries over the same tables, so their filters have to agree: a
+    // count that includes rows the search can never return claims omissions that do not
+    // exist, and the reader goes looking for hits that were never withheld.
+    //
+    // The rows this guards are the ones recall drops on purpose. Creating a task writes a
+    // `created` event whose body is the task's own title, and creating a note writes
+    // `note_added` the same way -- so a query matching the title matches the entity AND its
+    // echo. Everything here fits well inside the limit, so the only way `omitted` comes out
+    // non-zero is if the count is looking at rows the search is not.
+    let s = Store::open_in_memory().unwrap();
+    let pid = project(&s, "parity");
+    s.create_task(pid, TaskDraft::new("nginx redirect loop")).unwrap();
+    s.create_note(pid, NoteDraft {
+        body: "the proxy drops the trailing slash".into(),
+        ..NoteDraft::new("nginx redirect notes")
+    }, Actor::Agent).unwrap();
+
+    let r = s.recall(&RecallQuery { text: "nginx", project_id: Some(pid), limit: 200 }).unwrap();
+    assert_eq!(r.hits.len(), 2, "the task and the note themselves: {:?}",
+        r.hits.iter().map(|h| (h.kind, h.title.as_str())).collect::<Vec<_>>());
+    assert_eq!(r.omitted, 0, "nothing was withheld, so nothing may be claimed withheld");
+}

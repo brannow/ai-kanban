@@ -41,6 +41,21 @@ fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
 /// whereas switching which slice you are looking at is navigation, not news.
 pub(crate) const HOUSEKEEPING_KINDS: &[&str] = &["path_learned", "workstream_entered"];
 
+/// Events whose body is a copy of the title of the thing they happened to. Recall excludes
+/// them, or every task and note matches twice: once as itself, once as an event repeating
+/// its own name.
+///
+/// Shared rather than written out at each use for the same reason as the list above: recall
+/// both SEARCHES events and COUNTS them to report what its cap left out, and a filter that
+/// drifted between those two would count rows the search can never return -- reporting
+/// omissions that do not exist.
+pub(crate) const DUPLICATE_TITLE_KINDS: &[&str] = &["created", "note_added"];
+
+pub(crate) fn duplicate_title_filter() -> String {
+    let list = DUPLICATE_TITLE_KINDS.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(", ");
+    format!("kind NOT IN ({list})")
+}
+
 /// Built from the list above rather than written out, so the two cannot drift. The values
 /// are compile-time constants, never caller input, so inlining them is safe.
 pub(crate) fn housekeeping_filter() -> String {

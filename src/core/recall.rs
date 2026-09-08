@@ -112,11 +112,12 @@ impl Store {
     /// more. Publishing a lower bound as though it were the count produces a number that
     /// gets believed and is wrong whenever it matters.
     ///
-    /// The event filters are repeated here rather than shared, and they must stay in step
-    /// with `recall_events`: counting rows that search would never return would report
-    /// omissions that do not exist, which is a worse failure than saying nothing.
+    /// The event filters are BUILT from the same constants `recall_events` builds them from,
+    /// never written out again here. Counting rows the search can never return would report
+    /// omissions that do not exist, and a duplicated literal is how the two drift apart.
     fn match_total(&self, m: &str, project: Option<i64>) -> Result<usize> {
         let housekeeping = crate::core::event::housekeeping_filter().replace("kind", "e.kind");
+        let duplicates = crate::core::event::duplicate_title_filter().replace("kind", "e.kind");
         let n: i64 = self.conn.query_row(&format!(
             "SELECT (SELECT count(*) FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid
                       WHERE notes_fts MATCH ?1 AND (?2 IS NULL OR n.project_id = ?2))
@@ -124,7 +125,7 @@ impl Store {
                       WHERE tasks_fts MATCH ?1 AND (?2 IS NULL OR t.project_id = ?2))
                   + (SELECT count(*) FROM events_fts JOIN events e ON e.id = events_fts.rowid
                       WHERE events_fts MATCH ?1 AND (?2 IS NULL OR e.project_id = ?2)
-                        AND e.kind NOT IN ('created', 'note_added') AND {housekeeping})"
+                        AND {duplicates} AND {housekeeping})"
         ), params![m, project], |r| r.get(0))?;
         Ok(n.max(0) as usize)
     }
@@ -184,6 +185,7 @@ impl Store {
     /// status transitions, logs, and the previous value of an edited note.
     fn recall_events(&self, m: &str, project: Option<i64>, limit: usize) -> Result<Vec<RecallHit>> {
         let housekeeping = crate::core::event::housekeeping_filter().replace("kind", "e.kind");
+        let duplicates = crate::core::event::duplicate_title_filter().replace("kind", "e.kind");
         let mut st = self.conn.prepare(&format!(
             "SELECT e.id, p.name, COALESCE(t.title, ''),
                     snippet(events_fts, 0, '>>', '<<', '...', 20),
@@ -193,7 +195,7 @@ impl Store {
                JOIN projects p ON p.id = e.project_id
                LEFT JOIN tasks t ON t.id = e.task_id
               WHERE events_fts MATCH ?1 AND (?2 IS NULL OR e.project_id = ?2)
-                AND e.kind NOT IN ('created', 'note_added') AND {housekeeping}
+                AND {duplicates} AND {housekeeping}
               ORDER BY events_fts.rank, e.id DESC LIMIT ?3"
         ))?;
         let rows = st.query_map(params![m, project, limit as i64], |r| {
