@@ -343,3 +343,33 @@ fn a_note_or_log_cannot_attach_to_another_projects_task() {
     assert!(s.create_note(a, NoteDraft { task_id: Some(foreign.id), ..NoteDraft::new("note") }, Actor::Agent).is_err());
     assert!(s.log_on(a, Some(foreign.id), Actor::Agent, "log line").is_err());
 }
+
+#[test]
+fn the_board_says_whether_a_blocker_is_still_blocking() {
+    // A task row carries only its blocker's ID, so a board that prints the id alone says
+    // "blocked by #7" for as long as the row exists -- including long after #7 was finished.
+    // It reads as "do not pick this up", it is the cold-start view saying it, and the reader
+    // it misleads is the one least able to check. Every blocker eventually gets finished,
+    // so this gets worse with time rather than better.
+    let (s, pid) = fixture();
+    let blocker = s.create_task(pid, TaskDraft::new("ship the migration")).unwrap();
+    s.create_task(pid, TaskDraft {
+        blocked_by: Some(blocker.id),
+        ..TaskDraft::new("backfill the old rows")
+    }).unwrap();
+
+    let b = s.board(pid, &BoardQuery::board()).unwrap();
+    assert_eq!(b.blocker_status, vec![(blocker.id, Status::Backlog)]);
+    let text = ai_kanban::render::board(&b);
+    assert!(text.contains(&format!("blocked by #{}", blocker.id)), "{text}");
+    assert!(!text.contains("(done)"), "nothing is finished yet: {text}");
+
+    s.update_task(pid, blocker.id,
+        TaskPatch { status: Some(Status::Done), ..Default::default() }).unwrap();
+
+    let b = s.board(pid, &BoardQuery::board()).unwrap();
+    assert_eq!(b.blocker_status, vec![(blocker.id, Status::Done)]);
+    let text = ai_kanban::render::board(&b);
+    assert!(text.contains(&format!("blocked by #{} (done)", blocker.id)),
+        "a finished blocker has to say so, or the task reads as dead: {text}");
+}

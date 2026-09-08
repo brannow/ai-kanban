@@ -65,7 +65,7 @@ pub fn board(snap: &BoardSnapshot) -> String {
             out.push_str(&format!("\n{}\n", t.status));
             current = Some(t.status);
         }
-        out.push_str(&task_line(t, snap.highlight == Some(t.id)));
+        out.push_str(&task_line(t, snap.highlight == Some(t.id), &snap.blocker_status));
     }
 
     // What the cap left out. Stated, never silently dropped -- a board that hides work is
@@ -128,12 +128,22 @@ fn header(snap: &BoardSnapshot) -> String {
 /// One task, one line. The trailing parenthetical carries only what is *not* obvious from
 /// the columns -- origin is always shown because it is the instrumentation for whether the
 /// agent files work unprompted, and that question needs to stay visible.
-fn task_line(t: &Task, highlighted: bool) -> String {
+fn task_line(t: &Task, highlighted: bool, blockers: &[(i64, Status)]) -> String {
     let mark = if highlighted { "*" } else { " " };
     let mut meta = vec![t.origin.to_string()];
     if t.task_type != TaskType::Task { meta.insert(0, t.task_type.to_string()); }
     if t.priority != Priority::Normal { meta.push(t.priority.to_string()); }
-    if let Some(b) = t.blocked_by { meta.push(format!("blocked by #{b}")); }
+    if let Some(b) = t.blocked_by {
+        // The blocker's status, not just its id. A finished blocker is no longer a reason
+        // to skip the task, and the id alone cannot say so -- which left tasks reading as
+        // blocked forever. Stated rather than dropped: "was blocked, now clear" explains
+        // why the task is sitting in backlog instead of in flight, which a bare line does
+        // not. An unknown status (another board's id, or a forgotten task) prints as before.
+        meta.push(match blockers.iter().find(|(id, _)| *id == b) {
+            Some((_, s)) if !s.is_open() => format!("blocked by #{b} ({s})"),
+            _ => format!("blocked by #{b}"),
+        });
+    }
     format!("{mark} #{:<4} {:<40} ({})\n", t.id, truncate(&t.title, 40), meta.join(", "))
 }
 

@@ -246,6 +246,14 @@ function renderWorkstream() {
   $('#workstream').innerHTML = workstreamOptions('all work', current);
 }
 
+// A card holds only its blocker's id, so it cannot tell whether that blocker is still
+// blocking. Without this a finished blocker keeps the card reading "do not pick this up",
+// and every blocker is eventually finished -- so the board gets less true over time.
+function blockerDone(id) {
+  const row = (BOARD.blocker_status || []).find(b => b.id === id);
+  return row && (row.status === 'done' || row.status === 'archived');
+}
+
 function render() {
   const b = BOARD;
   renderWorkstream();
@@ -257,7 +265,7 @@ function render() {
           <span>${esc(t.task_type)}</span>
           ${t.priority !== 'normal' ? `<span class="pri-${esc(t.priority)}">${esc(t.priority)}</span>` : ''}
           ${t.origin === 'user' ? '<span class="badge-user">user</span>' : ''}
-          ${t.blocked_by ? `<span>blocked by #${t.blocked_by}</span>` : ''}
+          ${t.blocked_by ? `<span>blocked by #${t.blocked_by}${blockerDone(t.blocked_by) ? ' (done)' : ''}</span>` : ''}
           <span class="dim2" title="updated ${when(t.updated_at)}&#10;created ${when(t.created_at)}">upd ${ago(t.updated_at)}</span>
         </span>
       </div>`).join('');

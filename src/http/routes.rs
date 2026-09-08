@@ -210,8 +210,12 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
     statuses.sort_by_key(|s| s.board_rank());
 
     let mut columns = Vec::new();
+    // Kept alongside the JSON so the blocker lookup below is one query for the whole board
+    // rather than one per column.
+    let mut listed: Vec<Task> = Vec::new();
     for s in statuses {
         let page = store.tasks_page_in(project.id, &[s], None, PAGE, ws)?;
+        listed.extend(page.items.iter().cloned());
         columns.push(json!({
             "status": s.as_str(),
             "total": counts.iter().find(|(k, _)| *k == s).map(|(_, n)| *n).unwrap_or(0),
@@ -219,6 +223,10 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
             "next": page.next.map(encode_cursor),
         }));
     }
+    // A card carries only its blocker's id, so without this the web board says "blocked by
+    // #16" forever -- including after #16 is done. Same defect as the agent board had, and
+    // fixing one and not the other is how the two views start disagreeing.
+    let blockers = store.blocker_status(project.id, &listed)?;
     let cursor = store.change_cursor()?;
     tx.commit()?;
 
@@ -228,6 +236,9 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
         "project": project,
         "counts": counts.iter().map(|(s, n)| json!({ "status": s.as_str(), "count": n })).collect::<Vec<_>>(),
         "columns": columns,
+        "blocker_status": blockers.iter()
+            .map(|(id, s)| json!({ "id": id, "status": s.as_str() }))
+            .collect::<Vec<_>>(),
         // Both halves are needed by the UI: `workstream` is what the board is scoped to and
         // what a new task will join, `workstreams` is everything selectable. Sent even when
         // nothing is scoped, so the control can offer the list without a second request.

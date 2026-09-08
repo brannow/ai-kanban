@@ -275,6 +275,13 @@ pub struct BoardSnapshot {
     /// The other open workstreams on this board, with their open counts. What the scope
     /// excluded, stated rather than hidden -- the same rule `omitted` follows for statuses.
     pub other_workstreams: Vec<WorkstreamSummary>,
+    /// The status of every task named by a `blocked_by` on a listed task.
+    ///
+    /// Carried because a row holds only the blocker's id, so without this the board can
+    /// print "blocked by #16" and nothing more -- including long after #16 was finished.
+    /// The annotation then reads as "do not pick this up" forever, and it is the cold-start
+    /// view that says it, which is the reader least able to check.
+    pub blocker_status: Vec<(i64, Status)>,
     pub now: i64,
 }
 

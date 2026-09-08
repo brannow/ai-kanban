@@ -119,7 +119,11 @@ tell that client whether what it is showing has gone stale.
     { "status": "backlog", "total": 75, "tasks": [ ... ], "next": "1756399000:31" }
   ],
   "workstream":  { ... },        // what the board is scoped to, or null
-  "workstreams": [ ... ]         // everything selectable
+  "workstreams": [ ... ],        // everything selectable
+  // Status of every task a listed card is blocked by. A card carries only the blocker's
+  // id, so without this the board reads "blocked by #16" for as long as the row exists --
+  // including long after #16 was finished.
+  "blocker_status": [ { "id": 16, "status": "done" } ]
 }
 ```
 

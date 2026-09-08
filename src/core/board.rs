@@ -46,6 +46,8 @@ impl Store {
             Some(id) => Some(self.workstream(project_id, id)?),
             None => None,
         };
+        // Before `tasks` is moved into the snapshot.
+        let blocker_status = self.blocker_status(project_id, &tasks)?;
 
         Ok(BoardSnapshot {
             project,
@@ -58,9 +60,37 @@ impl Store {
             // follows for statuses. Computed even when unscoped, so a board with several
             // workstreams and no active one still tells the agent they exist.
             other_workstreams: self.workstream_summaries(project_id, q.workstream)?,
+            blocker_status,
             workstream,
             now: now(),
         })
+    }
+
+    /// The status of each distinct task the listed tasks are blocked by.
+    ///
+    /// One query for the whole board rather than one per task: a board is capped at a few
+    /// dozen rows, but a per-row lookup is the kind of thing that stops being free the
+    /// moment someone raises the cap.
+    ///
+    /// Scoped by `project_id` like every other task lookup here. The store is global, so a
+    /// bare id can name another board's row -- and a blocker id copied across boards would
+    /// report a status belonging to work the reader cannot see.
+    pub fn blocker_status(&self, project_id: i64, tasks: &[Task]) -> Result<Vec<(i64, Status)>> {
+        let mut ids: Vec<i64> = tasks.iter().filter_map(|t| t.blocked_by).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let holes = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let mut st = self.conn.prepare(&format!(
+            "SELECT id, status FROM tasks WHERE project_id = ? AND id IN ({holes})"
+        ))?;
+        let params = std::iter::once(project_id).chain(ids.into_iter()).collect::<Vec<_>>();
+        let rows = st.query_map(rusqlite::params_from_iter(params), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Status>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// The response after a write. Same shape, tighter caps, and the changed task marked.
