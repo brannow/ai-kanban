@@ -169,6 +169,7 @@ The first board survives and the second is folded into it.
 | | |
 |---|---|
 | `AI_KANBAN_DB` | Use a different store. **Set this for any experiment** — otherwise you are writing to your real memory. |
+| `AI_KANBAN_PLANIO_URL` | Your Planio, e.g. `https://frs.plan.io`. Set it where you run `ai-kanban serve` and the web UI links every Planio number to its issue. |
 | `CLAUDE_CONFIG_DIR` | Claude Code's own setting. If you use it, pass the same path as `CLAUDE_DIR` to `make install`. |
 
 **macOS and Linux.** Windows is a stated non-goal, not a gap — installation is a Makefile and

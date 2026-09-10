@@ -105,6 +105,30 @@ fn every_mutation_moves_the_change_cursor() {
 }
 
 #[test]
+fn a_save_that_changes_nothing_writes_nothing() {
+    // The web form sends every field on every save. Recording those as edits filled the
+    // history with "no change" lines and bumped the version under anyone else's open form.
+    let s = Store::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let pid = s.resolve_project(dir.path()).unwrap().project.id;
+    let t = s.create_task(pid, TaskDraft::new("a task")).unwrap();
+    let before = cursor(&s);
+
+    let same = s.update_task(pid, t.id, TaskPatch {
+        title: Some("a task".into()), status: Some(t.status), priority: Some(t.priority),
+        tags: Some(vec![]), repos: Some(vec![]), planio: Some(None), workstream: Some(None),
+        expected_version: Some(t.version),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(cursor(&s), before, "an unchanged save must not reach the history");
+    assert_eq!(same.version, t.version);
+
+    // A reason on its own is a comment, and that is history.
+    s.update_task(pid, t.id, TaskPatch { log: Some("checked, still valid".into()), ..Default::default() }).unwrap();
+    assert!(cursor(&s) > before);
+}
+
+#[test]
 fn a_path_is_only_recorded_the_first_time_it_is_seen() {
     // This runs on every resolve. If it wrote an event each time rather than only when the
     // path is genuinely new, a single project would accumulate one event per session per

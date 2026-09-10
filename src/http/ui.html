@@ -34,6 +34,8 @@
   button:hover { border-color: var(--accent); }
   button.primary { background: var(--accent); color: #07101f; border-color: var(--accent); font-weight: 600; }
   button.danger:hover { border-color: var(--bug); color: var(--bug); }
+  button:disabled { opacity: .45; cursor: default; }
+  button:disabled:hover { border-color: var(--line); }
   .grow { flex: 1; }
   .dim { color: var(--dim); }
   .dim2 { color: var(--dim2); }
@@ -181,6 +183,9 @@ function isAll() { return PROJECT === ALL; }
 let BOARDS = [];
 // The live stream. Replaced whenever the view changes, since it is filtered by board.
 let ES = null;
+// The board the repos menu is showing, and its rows. Its own state rather than BOARD's: in
+// All Projects there is no one board on screen, so the menu picks one.
+let REPO_BOARD = null, REPO_LIST = [];
 function tasksUrl() { return isAll() ? '/api/all/tasks' : `/api/projects/${PROJECT}/tasks`; }
 
 // ---- helpers ---------------------------------------------------------------
@@ -349,8 +354,16 @@ function repoChips(t) {
   if (!l.repos.length && tracksRepos(t) && META.open_statuses.includes(t.status)) {
     out += '<span class="norepo">no repo set</span>';
   }
-  if (l.planio) out += `<span class="planio">planio ${l.planio}</span>`;
+  if (l.planio) out += `<span class="planio">planio ${l.planio}${planioLink(l.planio)}</span>`;
   return out;
+}
+
+// A ↗ to the issue in Planio, when the server knows whose Planio it is. stopPropagation:
+// it sits on a card, and a click on the card opens the ticket.
+function planioUrl(n) { return META.planio_url && n ? `${META.planio_url}/issues/${n}` : null; }
+function planioLink(n) {
+  const url = planioUrl(n);
+  return url ? ` <a class="planio" href="${esc(url)}" target="_blank" rel="noopener" title="open #${n} in Planio" onclick="event.stopPropagation()">↗</a>` : '';
 }
 
 // Accepts what a person pastes: 48213, #48213, or an issue URL ending in the number.
@@ -381,9 +394,8 @@ function blockerDone(id) {
 function render() {
   const b = BOARD;
   renderWorkstream();
-  // Both belong to ONE board: the repos menu manages a board's repos, and a workstream is a
-  // slice of a board. All Projects has neither to offer.
-  $('#repobtn').hidden = isAll();
+  // A workstream is a slice of ONE board, so All Projects has none to offer. The repos menu
+  // stays: there it asks which board.
   $('#workstream').closest('label').hidden = isAll();
   $('#columns').innerHTML = b.columns.map(col => {
     const cards = col.tasks.map(t => `
@@ -424,7 +436,7 @@ function render() {
   }).join('');
 
   document.querySelectorAll('.card').forEach(c =>
-    c.onclick = () => openTask(Number(c.dataset.id), Number(c.dataset.pid)));
+    c.onclick = () => confirmLeave() && openTask(Number(c.dataset.id), Number(c.dataset.pid)));
   document.querySelectorAll('[data-more]').forEach(b =>
     b.onclick = () => loadMore(b.dataset.more));
 }
@@ -458,6 +470,7 @@ async function loadMore(status) {
 // skipped -- but a person clicking a control is already stating intent, and making the
 // change implicit would move where their work is filed without them knowing.
 async function setWorkstream(name) {
+  if (!confirmLeave()) { renderWorkstream(); return; }
   try {
     await api(`/api/projects/${PROJECT}/workstream`, {
       method: 'PUT',
@@ -476,6 +489,45 @@ async function setWorkstream(name) {
 $('#workstream').onchange = e => setWorkstream(e.target.value);
 
 // ---- task detail -----------------------------------------------------------
+
+// ---- the side panel: unsaved edits ------------------------------------------
+
+// Everything the task form can send, as one comparable value. Taken when the panel opens,
+// compared on every input: equal means there is nothing to save and nothing to lose.
+function taskFormState() {
+  return JSON.stringify([$('#st').value, $('#pr').value, $('#ws').value, $('#tags').value.trim(),
+    $('#planio').value.trim(), pickedRepos($('#repopick')), $('#log').value.trim()]);
+}
+
+function panelDirty() {
+  if ($('#panel').hidden) return false;
+  if (OPEN_TASK && OPEN_TASK.clean !== undefined && $('#st')) return taskFormState() !== OPEN_TASK.clean;
+  if (REPOS_OPEN) return !!(($('#rpath') && $('#rpath').value.trim()) || ($('#rname') && $('#rname').value.trim()));
+  return false;
+}
+
+// True when it is fine to leave the panel -- nothing typed, or the person said to drop it.
+function confirmLeave() {
+  return !panelDirty() || confirm('You have unsaved changes in the open panel. Discard them?');
+}
+
+function closePanel() {
+  if (!confirmLeave()) return;
+  $('#panel').hidden = true;
+  OPEN_TASK = null;
+  REPOS_OPEN = false;
+}
+
+// Esc closes the panel -- but not while the new-task dialog is up, which handles Esc itself.
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape' || $('#panel').hidden || $('#newdlg').open) return;
+  e.preventDefault();
+  closePanel();
+});
+
+window.addEventListener('beforeunload', e => {
+  if (panelDirty()) { e.preventDefault(); e.returnValue = ''; }
+});
 
 // `pid` is the task's board. In one board's view that is the board on screen; in All Projects
 // every card carries its own, and cards inside the panel (blocker, blocking) share the open
@@ -519,11 +571,17 @@ async function openTask(id, pid) {
       </div>
       <div class="row" style="margin-top:7px">
         <input id="planio" size="16" placeholder="planio ticket #">
+        <a id="planiolink" class="planio" target="_blank" rel="noopener" title="open in Planio" hidden>↗</a>
         <span id="repopick" class="row"></span>
       </div>
       <div class="row" style="margin-top:7px">
         <select id="moveto"></select>
         <button id="move">move to board</button>
+      </div>
+      <div class="row" style="margin-top:7px">
+        <button data-start="claude" title="a new Ghostty window running claude in this ticket's repo, primed with the ticket">open in claude</button>
+        <button data-start="claude-work" title="the same, with your claude-work setup (~/.claude-work)">open in claude-work</button>
+        <span id="startnote" class="dim2" style="font-size:11px"></span>
       </div>
     </section>
 
@@ -580,12 +638,36 @@ async function openTask(id, pid) {
     + others.map(b => `<option value="${b.id}">${esc(b.name)}</option>`).join('');
   $('#move').hidden = $('#moveto').hidden = !others.length;
   $('#panel').hidden = false;
-  $('#close').onclick = () => { $('#panel').hidden = true; OPEN_TASK = null; };
+  $('#close').onclick = closePanel;
   $('#save').onclick = () => saveTask(id);
   $('#move').onclick = () => moveTask(id);
+  // Only backlog work can be started -- the server refuses the rest too. Judged on the saved
+  // status, not the select: an unsaved change has not moved the ticket anywhere yet.
+  const startable = t.status === 'backlog';
+  $('#panel').querySelectorAll('[data-start]').forEach(b => {
+    b.disabled = !startable;
+    b.onclick = () => startTask(id, b.dataset.start);
+  });
+  $('#startnote').textContent = !startable ? 'only backlog tickets can be started'
+    : !(body.repos || []).length ? 'needs a repo first' : '';
+  // The link follows the field as it is typed, so it always opens the number shown.
+  const syncPlanioLink = () => {
+    const url = planioUrl(parsePlanio($('#planio').value));
+    $('#planiolink').hidden = !url;
+    if (url) $('#planiolink').href = url;
+  };
+  $('#planio').addEventListener('input', syncPlanioLink);
+  syncPlanioLink();
   $('#forget').onclick = () => forgetTask(id, t.title);
   $('#panel').querySelectorAll('.card').forEach(c =>
-    c.onclick = () => openTask(Number(c.dataset.id)));
+    c.onclick = () => confirmLeave() && openTask(Number(c.dataset.id)));
+  // What "unsaved" is measured against, and what keeps save from being pressed with nothing
+  // to save -- the server refuses to record that too, but a button that does nothing is noise.
+  OPEN_TASK.clean = taskFormState();
+  const sync = () => { if ($('#st')) $('#save').disabled = taskFormState() === OPEN_TASK.clean; };
+  $('#panel').oninput = sync;
+  $('#panel').onchange = sync;
+  sync();
 }
 
 async function saveTask(id) {
@@ -645,6 +727,17 @@ async function moveTask(id) {
   }
 }
 
+async function startTask(id, profile) {
+  try {
+    const { body } = await api(`/api/projects/${OPEN_TASK.pid}/tasks/${id}/start`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ profile }),
+    });
+    $('#startnote').textContent = `${body.profile} opened in ${body.started_in}`;
+  } catch (e) { fail(e.message); }
+}
+
 async function forgetTask(id, title) {
   if (!confirm(`Permanently forget #${id} "${title}" and its history?\n\nThis cannot be undone.`)) return;
   try {
@@ -666,9 +759,13 @@ $('#search').oninput = e => {
 };
 
 async function runSearch(q) {
+  // Results replace the panel, so they wait rather than wipe an edit in progress. A
+  // confirm() here would fire on every keystroke of the search.
+  if (panelDirty()) { fail('Save or close the open panel before searching.'); return; }
   try {
     const { body } = await api(`/api/recall?q=${encodeURIComponent(q)}`);
     REPOS_OPEN = false;
+    OPEN_TASK = null;
     $('#panel').innerHTML = `
       <div class="row" style="justify-content:space-between">
         <h2>recall: ${esc(q)}</h2><button id="close">close</button>
@@ -728,10 +825,14 @@ async function openHit(h) {
 
 // The only place repos are registered. The agent names repos on tickets but never adds one:
 // registering changes which board a directory resolves to, which is a person's decision.
-async function openRepos() {
+async function openRepos(pid) {
   REPOS_OPEN = true;
   OPEN_TASK = null;
-  const list = BOARD.repos || [];
+  REPO_BOARD = pid;
+  let list = [];
+  try { list = (await api(`/api/projects/${pid}/repos`)).body.repos; } catch (e) { fail(e.message); }
+  REPO_LIST = list;
+  const title = (BOARDS.find(b => b.id === pid) || {}).name || `board ${pid}`;
   // Repos on other boards, which this one can share. Asked for each time the menu opens:
   // another board may have added one since.
   let shareable = [];
@@ -740,10 +841,10 @@ async function openRepos() {
     const here = new Set(list.map(r => r.repo.id));
     shareable = body.repos.filter(x => !here.has(x.repo.id));
   } catch (e) { fail(e.message); }
-  const me = BOARD.project.id;
+  const me = pid;
   $('#panel').innerHTML = `
     <div class="row" style="justify-content:space-between">
-      <h2>repos · ${esc(BOARD.project.name)}</h2>
+      <h2>repos · ${isAll() ? `<select id="rboard">${boardOptions(pid)}</select>` : esc(title)}</h2>
       <button id="close">close</button>
     </div>
     <div class="dim2" style="font-size:11px">
@@ -780,7 +881,9 @@ async function openRepos() {
       </div>
     </section>`;
   $('#panel').hidden = false;
-  $('#close').onclick = () => { $('#panel').hidden = true; REPOS_OPEN = false; };
+  $('#close').onclick = closePanel;
+  $('#panel').oninput = $('#panel').onchange = null;
+  if ($('#rboard')) $('#rboard').onchange = e => openRepos(Number(e.target.value));
   $('#radd').onclick = addRepo;
   $('#rpath').onkeydown = e => { if (e.key === 'Enter') addRepo(); };
   if ($('#rshareadd')) $('#rshareadd').onclick = () => postRepo($('#rshare').value, null);
@@ -796,14 +899,14 @@ async function repoWrite(path, opts) {
   try {
     await api(path, opts);
     await loadBoard();
-    await openRepos();
+    await openRepos(REPO_BOARD);
   } catch (e) { fail(e.message); }
 }
 
 // A path that is already a repo somewhere is shared rather than refused: it joins this
 // board, and its folder keeps opening where it did.
 function postRepo(path, name) {
-  return repoWrite(`/api/projects/${PROJECT}/repos`, {
+  return repoWrite(`/api/projects/${REPO_BOARD}/repos`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ path, name }),
@@ -817,18 +920,18 @@ function addRepo() {
 }
 
 function makeHome(id) {
-  const r = BOARD.repos.find(x => x.repo.id === id);
+  const r = REPO_LIST.find(x => x.repo.id === id);
   if (!confirm(`Open "${r ? r.repo.name : id}" on this board from now on?\n\n`
     + `An agent opening that folder will land here instead of on ${r ? r.home_board : 'its current board'}. `
     + `History already written stays where it is.`)) return;
-  return repoWrite(`/api/projects/${PROJECT}/repos/${id}/home`, { method: 'PUT' });
+  return repoWrite(`/api/projects/${REPO_BOARD}/repos/${id}/home`, { method: 'PUT' });
 }
 
 function renameRepo(id) {
-  const r = BOARD.repos.find(x => x.repo.id === id);
+  const r = REPO_LIST.find(x => x.repo.id === id);
   const name = prompt('New name', r ? r.repo.name : '');
   if (!name || !name.trim()) return;
-  return repoWrite(`/api/projects/${PROJECT}/repos/${id}`, {
+  return repoWrite(`/api/projects/${REPO_BOARD}/repos/${id}`, {
     method: 'PATCH',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ name }),
@@ -836,9 +939,9 @@ function renameRepo(id) {
 }
 
 function removeRepo(id) {
-  const r = BOARD.repos.find(x => x.repo.id === id);
+  const r = REPO_LIST.find(x => x.repo.id === id);
   const n = r ? r.total : 0;
-  const home = r && r.repo.home_project_id === BOARD.project.id;
+  const home = r && r.repo.home_project_id === REPO_BOARD;
   // Says what happens to the folder, because that is the surprising half: it never ends up
   // opening on a new empty board.
   const folder = !home ? `Its folder keeps opening on ${r ? r.home_board : 'its home'}.`
@@ -846,10 +949,15 @@ function removeRepo(id) {
     : 'The folder keeps resolving to this board.';
   if (!confirm(`Remove repo "${r ? r.repo.name : id}" from this board?\n\n`
     + `It comes off ${n} ticket${n === 1 ? '' : 's'} here. ${folder}`)) return;
-  return repoWrite(`/api/projects/${PROJECT}/repos/${id}`, { method: 'DELETE' });
+  return repoWrite(`/api/projects/${REPO_BOARD}/repos/${id}`, { method: 'DELETE' });
 }
 
-$('#repobtn').onclick = () => { if (BOARD && !isAll()) openRepos(); };
+// In All Projects the menu opens on the board it showed last, else the most recently active.
+$('#repobtn').onclick = () => {
+  if (!BOARD || !BOARDS.length) return;
+  const pid = isAll() ? (BOARDS.some(b => b.id === REPO_BOARD) ? REPO_BOARD : BOARDS[0].id) : PROJECT;
+  openRepos(pid);
+};
 
 // ---- new task --------------------------------------------------------------
 
@@ -954,9 +1062,11 @@ function connect() {
       // The picker's "(N open)" counts move with every change, on any board.
       try { await refreshProjects(); } catch { /* the board itself still refreshes */ }
       await loadBoard();
-      if (OPEN_TASK) { try { await openTask(OPEN_TASK.id, OPEN_TASK.pid); } catch { /* it may be gone */ } }
+      // Never redraw over an edit in progress: the refresh would silently throw it away.
+      if (panelDirty()) { /* keep what is being typed */ }
+      else if (OPEN_TASK) { try { await openTask(OPEN_TASK.id, OPEN_TASK.pid); } catch { /* it may be gone */ } }
       // Counts in the menu change whenever an agent links a ticket, so it redraws too.
-      else if (REPOS_OPEN) openRepos();
+      else if (REPOS_OPEN) openRepos(REPO_BOARD);
     }
     mark(true, 'live');
   };
@@ -983,6 +1093,7 @@ async function refreshProjects(select) {
 
 async function onProjectChange() {
   const sel = $('#project');
+  if (!confirmLeave()) { sel.value = String(PROJECT); return; }
   PROJECT = sel.value === ALL ? ALL : Number(sel.value);
   history.replaceState(null, '', `?project=${PROJECT}`);
   $('#panel').hidden = true;

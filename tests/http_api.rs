@@ -530,3 +530,45 @@ async fn boards_are_created_tickets_move_and_all_projects_shows_every_board() {
     let (_, repos, _) = call(&api, get("/api/repos")).await;
     assert_eq!(repos["repos"][0]["home_board"], "BMUKN");
 }
+
+fn start_req(path: &str, origin: Option<&str>) -> Request<Body> {
+    let mut b = Request::builder().method("POST").uri(path)
+        .header("content-type", "application/json").header("host", "127.0.0.1:7373");
+    if let Some(o) = origin {
+        b = b.header("origin", o);
+    }
+    b.body(Body::from("{}")).unwrap()
+}
+
+#[tokio::test]
+async fn starting_a_session_is_refused_from_other_sites_and_without_a_repo() {
+    // Only the refusals are exercised: the success path opens a real terminal window. They
+    // are the half that matters -- an unauthenticated local endpoint that launches programs
+    // must not be reachable from whatever page the browser has open.
+    let (api, pid) = api();
+    let tid = api.store().create_task(pid, TaskDraft::new("Rework header slider")).unwrap().id;
+    let path = format!("/api/projects/{pid}/tasks/{tid}/start");
+
+    let (status, body, _) = call(&api, start_req(&path, Some("https://evil.example"))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body, _) = call(&api, start_req(&path, Some("http://127.0.0.1:7373"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a ticket with no repo has nowhere to start: {body}");
+    assert_eq!(body["error"]["field"], "repos");
+
+    // Only backlog work: a second session on a ticket in doing is two agents on one ticket.
+    api.store().update_task(pid, tid, ai_kanban::core::task::TaskPatch {
+        status: Some(Status::Doing), ..Default::default()
+    }).unwrap();
+    let (status, body, _) = call(&api, start_req(&path, Some("http://127.0.0.1:7373"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["field"], "status");
+
+    // Only the two known setups; anything else names them rather than guessing.
+    let req = Request::builder().method("POST").uri(&path)
+        .header("content-type", "application/json").header("host", "127.0.0.1:7373")
+        .body(Body::from(r#"{"profile":"claude-bmu"}"#)).unwrap();
+    let (status, body, _) = call(&api, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["field"], "profile");
+}

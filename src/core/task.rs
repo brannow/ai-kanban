@@ -276,9 +276,10 @@ impl Store {
         let workstream = match patch.workstream { Some(v) => v, None => before_ws };
         // Read separately for the same reason as the workstream: `tags` is deliberately
         // out of `TASK_COLS`, so `before` does not carry it either.
+        let before_tags = crate::core::note::join_tags(&self.task_tags(project_id, id)?);
         let tags = match &patch.tags {
             Some(t) => crate::core::note::join_tags(t),
-            None => crate::core::note::join_tags(&self.task_tags(project_id, id)?),
+            None => before_tags.clone(),
         };
         if let Some(w) = workstream {
             // Same-board check, for the same reason `blocked_by` has one: the store is
@@ -295,6 +296,28 @@ impl Store {
         let planio = match patch.planio { Some(v) => v, None => before_planio };
         check_planio(planio)?;
         let before_repos: Vec<i64> = self.task_repos(project_id, id)?.into_iter().map(|r| r.id).collect();
+
+        // A patch that changes nothing writes nothing -- no version bump, no "no change" line
+        // in the history. The web form sends every field on every save, so without this each
+        // idle click became an event. A `log` alone is still written: a reason with no edit
+        // is a comment, and comments are history.
+        let repos_same = match &patch.repos {
+            None => true,
+            Some(ids) => {
+                let (mut a, mut b) = (ids.clone(), before_repos.clone());
+                a.sort_unstable();
+                a.dedup();
+                b.sort_unstable();
+                a == b
+            }
+        };
+        let unchanged = title == before.title && body == before.body && status == before.status
+            && priority == before.priority && task_type == before.task_type
+            && blocked_by == before.blocked_by && workstream == before_ws && tags == before_tags
+            && planio == before_planio && repos_same;
+        if unchanged && patch.log.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            return Ok(before);
+        }
 
         // `?9 IS NULL OR version = ?9` keeps the guarded and unguarded writes on one
         // statement: a caller that read a version gets a compare-and-swap, one that did not

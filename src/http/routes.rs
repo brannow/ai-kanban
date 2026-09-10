@@ -146,6 +146,12 @@ pub async fn meta(State(api): State<Api>) -> ApiResult<Json<serde_json::Value>> 
         "priorities": priorities.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
         "types": TaskType::ALL.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
         "actors": Actor::ALL.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+        // Where a Planio number links to, e.g. https://frs.plan.io. A setting rather than a
+        // constant: the tool knows Planio numbers, not whose Planio they are. Unset, the UI
+        // shows the number without a link.
+        "planio_url": std::env::var("AI_KANBAN_PLANIO_URL").ok()
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty()),
     })))
 }
 
@@ -557,6 +563,71 @@ pub async fn move_task(
     let task = store.move_task(project.id, t, target.id, Actor::User, b.log.as_deref(), Some(expected))?;
     let version = task.version;
     Ok((etag(version), Json(json!({ "task": task, "project": target }))))
+}
+
+/// Starts work on a ticket: a new Ghostty window running Claude Code in the ticket's first
+/// repo, with the others added, primed with the ticket (`render::start_prompt`).
+///
+/// A ticket with no repo is refused -- the session has to start in a checkout, and guessing
+/// one would start it in the wrong place. The launch is recorded on the ticket, which is also
+/// what lets a live page see it happened.
+pub async fn start_task(
+    State(api): State<Api>, Path((p, t)): Path<(String, i64)>, headers: HeaderMap,
+    Json(b): Json<StartBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    same_origin(&headers)?;
+    let profile = super::launch::Profile::parse(b.profile.as_deref())?;
+    let store = api.store();
+    let project = resolve(&store, &p)?;
+    let detail = store.task_detail(project.id, t)?;
+    // Only work nobody has started. A ticket in doing already has a session on it, and one
+    // in blocked, done or archived is not ready to be picked up -- a second window on either
+    // is two agents on one ticket, or work on something finished.
+    if detail.task.status != Status::Backlog {
+        return Err(ApiError(Error::InvalidValue {
+            field: "status",
+            value: detail.task.status.to_string(),
+            valid: "backlog -- only a ticket nobody has started can be started".into(),
+        }));
+    }
+    let Some((first, rest)) = detail.repos.split_first() else {
+        return Err(ApiError(Error::InvalidValue {
+            field: "repos",
+            value: String::new(),
+            valid: "at least one repo on the ticket -- the session has to start in a checkout".into(),
+        }));
+    };
+    let add: Vec<String> = rest.iter().map(|r| r.path.clone()).collect();
+    super::launch::open_claude(profile, &first.path, &add, &crate::render::start_prompt(&detail))?;
+    store.log_on(project.id, Some(t), Actor::User,
+        &format!("started a {} session in {}", profile.label(), first.name))?;
+    Ok(Json(json!({ "started_in": first.path, "profile": profile.label() })))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct StartBody {
+    /// `claude` (the default) or `claude-work` -- see `launch::Profile`.
+    pub profile: Option<String>,
+}
+
+/// The start endpoint launches a program, so unlike every other route it must not be callable
+/// by whatever page the browser has open. A cross-site POST carries that site's `Origin`; a
+/// DNS-rebinding page carries a `Host` that is not loopback. The JSON body the route requires
+/// also forces a CORS preflight on any cross-origin request, which this server never answers.
+/// A request with no `Origin` is a local program, which could run `claude` itself anyway.
+fn same_origin(headers: &HeaderMap) -> Result<(), ApiError> {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let name = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    let loopback = name == "127.0.0.1" || name == "localhost";
+    let origin_ok = match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        None => true,
+        Some(o) => o == format!("http://{host}"),
+    };
+    if loopback && origin_ok {
+        Ok(())
+    } else {
+        Err(ApiError(Error::Forbidden("sessions can only be started from the board page itself".into())))
+    }
 }
 
 /// Permanent. See `src/core/forget.rs` -- this is the only surface it is reachable from, and

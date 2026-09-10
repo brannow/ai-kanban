@@ -492,6 +492,29 @@ slice of one board. `GET /api/all/tasks` pages its columns. This is the person's
 agent's cross-board view stays `board(project: "all")`, a per-board summary, because for a
 reader paying per token every open task across every project is a pile, not a board.
 
+## Starting work from the board
+
+`POST /projects/{p}/tasks/{t}/start` (body `{"profile": "claude" | "claude-work"}`, default
+`claude`) opens a new Ghostty window running Claude Code in the ticket's first repo. The
+`claude-work` profile is the same binary with `CLAUDE_CONFIG_DIR=~/.claude-work`, set through
+`/usr/bin/env` because a launched window runs no shell and so never sees shell aliases. It
+starts with its other repos passed as `--add-dir`, and the ticket as
+the first prompt (`render::start_prompt`). The prompt names the board, because the first
+repo's home can be a different board. Only a **backlog** ticket can be started — one in doing
+already has a session, and one blocked or finished is not ready — and a ticket with no repo is
+a `400` too: the session has to start in a checkout.
+
+`/api/meta` carries `planio_url` from `AI_KANBAN_PLANIO_URL` (e.g. `https://frs.plan.io`), and
+the UI links each Planio number to `<planio_url>/issues/<n>`. A setting rather than a constant:
+the tool knows Planio numbers, not whose Planio they are. Unset, numbers show without a link. The launch is logged on the ticket.
+
+It is the one route that starts a process, so it is the one route locked to the board page:
+`Host` must be loopback and `Origin`, when sent, must be this server — a cross-site `POST` or a
+DNS-rebinding page gets a `403`. The required JSON body also forces a CORS preflight that this
+server never answers. Nothing goes through a shell: the prompt is one argv entry, so no text in
+a ticket can become a command. This is a convenience for the person at the board; nothing in
+the agent path depends on it, which keeps `serve` on the right side of the no-daemon line.
+
 ## Explicitly not in v1
 
 - **Drag-to-reorder.** There is no `position` column and there should not be one.

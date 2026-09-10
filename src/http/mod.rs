@@ -12,6 +12,7 @@
 //! * **Writes carry a version.** A browser form sits open for minutes while an agent works
 //!   the same board; that is the lost update the guard exists for.
 
+pub mod launch;
 pub mod routes;
 pub mod stream;
 
@@ -57,6 +58,7 @@ pub fn router(api: Api) -> Router {
         .route("/api/projects/{p}/repos/{r}", patch(routes::update_repo).delete(routes::delete_repo))
         .route("/api/projects/{p}/repos/{r}/home", put(routes::repo_home))
         .route("/api/projects/{p}/tasks/{t}/move", post(routes::move_task))
+        .route("/api/projects/{p}/tasks/{t}/start", post(routes::start_task))
         .route("/api/projects/{p}/tasks", get(routes::tasks).post(routes::create_task))
         .route("/api/projects/{p}/tasks/{t}", get(routes::task))
         .route("/api/projects/{p}/tasks/{t}", patch(routes::update_task))
@@ -132,6 +134,7 @@ impl IntoResponse for ApiError {
                 "claimed",
                 serde_json::json!({ "board": board, "key": key }),
             ),
+            Error::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden", serde_json::json!({})),
             Error::AmbiguousProject { candidates, .. } => (
                 StatusCode::CONFLICT,
                 "ambiguous",
