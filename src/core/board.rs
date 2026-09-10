@@ -48,6 +48,7 @@ impl Store {
         };
         // Before `tasks` is moved into the snapshot.
         let blocker_status = self.blocker_status(project_id, &tasks)?;
+        let links = self.links_for(project_id, &tasks)?;
 
         Ok(BoardSnapshot {
             project,
@@ -61,6 +62,8 @@ impl Store {
             // workstreams and no active one still tells the agent they exist.
             other_workstreams: self.workstream_summaries(project_id, q.workstream)?,
             blocker_status,
+            links,
+            repo_count: self.repo_count(project_id)?,
             workstream,
             now: now(),
         })
@@ -137,6 +140,11 @@ impl Store {
                 }
                 snap.tasks.push(t);
                 sort_board(&mut snap.tasks);
+                // Both describe the listed rows, and the listed rows just changed. Left as
+                // computed, the task this response exists to confirm would be the one row
+                // missing its repos, its Planio ref and its blocker's status.
+                snap.links = self.links_for(project_id, &snap.tasks)?;
+                snap.blocker_status = self.blocker_status(project_id, &snap.tasks)?;
                 // The swap changed what is shown, so the "and N more" figures have to be
                 // recomputed or they would describe the pre-swap list.
                 let mut wanted = q.status.clone();

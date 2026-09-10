@@ -32,6 +32,7 @@ pub struct MergeReport {
     pub events: usize,
     pub paths: usize,
     pub workstreams: usize,
+    pub repos: usize,
 }
 
 impl Store {
@@ -59,6 +60,7 @@ impl Store {
         let notes = counted("notes")?;
         let events = counted("events")?;
         let paths = counted("project_paths")?;
+        let repos = counted("repos")?;
 
         // Order is load-bearing. Every child table cascades on DELETE of a project, and
         // `tasks.blocked_by` is ON DELETE SET NULL -- so deleting the source first would
@@ -103,6 +105,18 @@ impl Store {
             params![into, from],
         )?;
 
+        // Repos move before the source is deleted, for the reason workstreams do: the project
+        // cascade would take them, and `task_repos` with them, so every ticket from the merged
+        // board would silently lose its repos. A path is unique store-wide, so two repos are
+        // never the same checkout -- only a NAME can collide, and the incoming one is suffixed
+        // with its id rather than folded in, because the same name is not the same repo.
+        tx.execute(
+            "UPDATE repos SET name = name || '-' || id
+              WHERE project_id = ?2 AND name IN (SELECT name FROM repos WHERE project_id = ?1)",
+            params![into, from],
+        )?;
+        tx.execute("UPDATE repos SET project_id = ?1 WHERE project_id = ?2", params![into, from])?;
+
         // Reparenting fires the FTS `_au` triggers, which re-index title and body with
         // unchanged rowids. Wasted work, not wrong work -- and cheaper than teaching the
         // triggers about a column they do not index.
@@ -131,13 +145,13 @@ impl Store {
             "project_merged",
             &format!(
                 "Merged board \"{}\" ({}) into this one: {tasks} tasks, {notes} notes, \
-                 {events} events, {paths} paths, {workstreams} workstreams. That board no \
-                 longer exists.",
+                 {events} events, {paths} paths, {workstreams} workstreams, {repos} repos. \
+                 That board no longer exists.",
                 source.name, source.key
             ),
         )?;
 
-        Ok(MergeReport { into: target, merged: source, tasks, notes, events, paths, workstreams })
+        Ok(MergeReport { into: target, merged: source, tasks, notes, events, paths, workstreams, repos })
     }
 
     /// `merge_projects` with the survivor chosen: the older board wins.

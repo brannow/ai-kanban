@@ -50,6 +50,8 @@ pub fn router(api: Api) -> Router {
         .route("/api/projects/{p}", get(routes::project))
         .route("/api/projects/{p}/board", get(routes::board))
         .route("/api/projects/{p}/workstream", put(routes::set_workstream))
+        .route("/api/projects/{p}/repos", get(routes::repos).post(routes::create_repo))
+        .route("/api/projects/{p}/repos/{r}", patch(routes::update_repo).delete(routes::delete_repo))
         .route("/api/projects/{p}/tasks", get(routes::tasks).post(routes::create_task))
         .route("/api/projects/{p}/tasks/{t}", get(routes::task))
         .route("/api/projects/{p}/tasks/{t}", patch(routes::update_task))
@@ -117,6 +119,13 @@ impl IntoResponse for ApiError {
                 StatusCode::NOT_FOUND,
                 "not_found",
                 serde_json::json!({ "existing": existing }),
+            ),
+            // 409 with the owner named, so the UI can say which board holds the directory
+            // rather than just refusing.
+            Error::PathClaimed { board, key, .. } => (
+                StatusCode::CONFLICT,
+                "claimed",
+                serde_json::json!({ "board": board, "key": key }),
             ),
             Error::AmbiguousProject { candidates, .. } => (
                 StatusCode::CONFLICT,

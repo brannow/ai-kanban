@@ -24,6 +24,11 @@ pub struct TaskDraft {
     /// Freeform labels. No semantics an agent must honour -- that is what makes them safe
     /// to add without touching the fixed statuses. Stored comma-joined.
     pub tags: Vec<String>,
+    /// Repo ids on this board. Adapters resolve names to ids with `resolve_repos`; core
+    /// checks each belongs to the board, so a raw id from elsewhere cannot slip through.
+    pub repos: Vec<i64>,
+    /// The Planio ticket this task tracks.
+    pub planio: Option<i64>,
 }
 
 impl TaskDraft {
@@ -32,6 +37,8 @@ impl TaskDraft {
             title: title.into(),
             body: String::new(),
             tags: vec![],
+            repos: vec![],
+            planio: None,
             task_type: TaskType::default(),
             origin: Origin::default(),
             priority: Priority::default(),
@@ -61,6 +68,10 @@ pub struct TaskPatch {
     /// Replaces the whole set, like `NotePatch::tags`. Not add/remove: two verbs on one
     /// field is a surface an agent has to learn, and the set is short enough to resend.
     pub tags: Option<Vec<String>>,
+    /// Replaces the whole set of repo ids, like `tags`. `Some(vec![])` clears them.
+    pub repos: Option<Vec<i64>>,
+    /// Nested like `blocked_by`: `Some(None)` clears the Planio ref.
+    pub planio: Option<Option<i64>>,
     /// The *why*. Recorded as the event body -- this is the field that makes the history
     /// worth reading six months later.
     pub log: Option<String>,
@@ -93,6 +104,8 @@ impl TaskPatch {
             && self.priority.is_none() && self.task_type.is_none() && self.blocked_by.is_none()
             && self.workstream.is_none()
             && self.tags.is_none()
+            && self.repos.is_none()
+            && self.planio.is_none()
             && self.log.is_none()
     }
 }
@@ -135,17 +148,22 @@ impl Store {
     /// the call it is most likely to skip is a cost the design will not pay; a person
     /// filling in a form can see the field and choose, including choosing "none".
     pub fn create_task_in(&self, project_id: i64, draft: TaskDraft, workstream: Option<i64>) -> Result<Task> {
+        self.check_repos(project_id, &draft.repos)?;
+        check_planio(draft.planio)?;
         let ts = now();
         self.conn.execute(
-            "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, blocked_by, workstream_id, tags, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?11, ?10, ?10)",
+            "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, blocked_by, workstream_id, tags, planio, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?11, ?12, ?10, ?10)",
             params![
                 project_id, draft.title, draft.body, draft.status, draft.task_type,
                 draft.origin, draft.priority, draft.blocked_by, workstream, ts,
-                crate::core::note::join_tags(&draft.tags)
+                crate::core::note::join_tags(&draft.tags), draft.planio
             ],
         )?;
         let id = self.conn.last_insert_rowid();
+        if !draft.repos.is_empty() {
+            self.set_task_repos(id, &draft.repos)?;
+        }
         let actor = match draft.origin { Origin::User => Actor::User, Origin::Agent => Actor::Agent };
         self.write_event(project_id, Some(id), actor, "created", &draft.title)?;
         self.task(project_id, id)
@@ -268,21 +286,33 @@ impl Store {
             // group that does not exist on the board showing it.
             self.workstream(project_id, w)?;
         }
+        if let Some(ids) = &patch.repos {
+            self.check_repos(project_id, ids)?;
+        }
+        // Read separately for the same reason as tags: `planio` and the repo links are out of
+        // `TASK_COLS` (migration 007), so `before` carries neither.
+        let before_planio = self.task_planio(project_id, id)?;
+        let planio = match patch.planio { Some(v) => v, None => before_planio };
+        check_planio(planio)?;
+        let before_repos: Vec<i64> = self.task_repos(project_id, id)?.into_iter().map(|r| r.id).collect();
 
         // `?9 IS NULL OR version = ?9` keeps the guarded and unguarded writes on one
         // statement: a caller that read a version gets a compare-and-swap, one that did not
         // gets the plain update. Two statements would be two chances to fix a bug once.
         let changed = self.conn.execute(
             "UPDATE tasks SET title=?2, body=?3, status=?4, type=?5, priority=?6, blocked_by=?7, updated_at=?8,
-                    workstream_id=?10, tags=?11, version = version + 1
+                    workstream_id=?10, tags=?11, planio=?12, version = version + 1
               WHERE id=?1 AND (?9 IS NULL OR version = ?9)",
-            params![id, title, body, status, task_type, priority, blocked_by, ts, patch.expected_version, workstream, tags],
+            params![id, title, body, status, task_type, priority, blocked_by, ts, patch.expected_version, workstream, tags, planio],
         )?;
         if changed == 0 {
             // The row exists -- `self.task()` above proved it is here and on this board --
             // so the only way to match nothing is the version guard.
             let actual = self.task(project_id, id)?.version;
             return Err(Error::Conflict { id, expected: patch.expected_version.unwrap_or(0), actual });
+        }
+        if let Some(ids) = &patch.repos {
+            self.set_task_repos(id, ids)?;
         }
 
         // One event per call, not one per field. Per-field events would bury the reason in
@@ -298,16 +328,32 @@ impl Store {
         // Resolved to a NAME here rather than in `describe_change`, which has no store to
         // look one up with. An id in the history would be unreadable six months later,
         // which is the one thing this line exists to avoid.
-        let moved = if workstream != before_ws {
-            Some(match workstream {
+        let mut lead = Vec::new();
+        if workstream != before_ws {
+            lead.push(match workstream {
                 Some(w) => format!("moved to workstream \"{}\"", self.workstream(project_id, w)?.name),
                 None => "moved out of its workstream".to_string(),
-            })
-        } else {
-            None
-        };
+            });
+        }
+        if let Some(ids) = &patch.repos {
+            let (mut after, mut was) = (ids.clone(), before_repos);
+            after.sort_unstable();
+            after.dedup();
+            was.sort_unstable();
+            if after != was {
+                // Names, for the reason the workstream line above uses one.
+                let names: Vec<String> = self.task_repos(project_id, id)?.into_iter().map(|r| r.name).collect();
+                lead.push(if names.is_empty() { "repos cleared".to_string() } else { format!("repos: {}", names.join(", ")) });
+            }
+        }
+        if planio != before_planio {
+            lead.push(match planio {
+                Some(n) => format!("planio #{n}"),
+                None => "planio ref cleared".to_string(),
+            });
+        }
         let summary = patch.log.clone()
-            .unwrap_or_else(|| describe_change(&before, &title, &body, status, priority, blocked_by, moved));
+            .unwrap_or_else(|| describe_change(&before, &title, &body, status, priority, blocked_by, lead));
         self.write_event(before.project_id, Some(id), patch.actor, &kind, &summary)?;
 
         self.task(project_id, id)
@@ -337,6 +383,9 @@ impl Store {
         let blocker = match task.blocked_by { Some(b) => self.task_opt(project_id, b)?, None => None };
         Ok(TaskDetail {
             tags: self.task_tags(project_id, id)?,
+            repos: self.task_repos(project_id, id)?,
+            planio: self.task_planio(project_id, id)?,
+            board_has_repos: self.repo_count(project_id)? > 0,
             blocking: self.tasks_blocked_by(project_id, id)?,
             events: self.task_events(id)?,
             notes: self.notes_for_task(project_id, id)?,
@@ -348,17 +397,30 @@ impl Store {
     }
 }
 
+/// A Planio issue number is positive. Checked in core so both adapters refuse the same
+/// values; each maps its own "clear it" spelling to `None` before this sees it.
+fn check_planio(planio: Option<i64>) -> Result<()> {
+    match planio {
+        Some(n) if n <= 0 => Err(Error::InvalidValue {
+            field: "planio",
+            value: n.to_string(),
+            valid: "a Planio issue number, e.g. 48213".into(),
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// Fallback event text when the caller gave no reason. States what changed, so the history
 /// is at least factual -- but it is deliberately duller than a real `log`, because "what"
 /// without "why" is the weaker half.
 fn describe_change(
     before: &Task, title: &str, body: &str, status: Status, priority: Priority,
-    blocked_by: Option<i64>, moved: Option<String>,
+    blocked_by: Option<i64>, lead: Vec<String>,
 ) -> String {
-    let mut parts = Vec::new();
-    // First: a move is the most significant thing that can happen to a task without its
-    // status changing, and it is the change a reader is least able to reconstruct later.
-    if let Some(m) = moved { parts.push(m); }
+    // First: changes resolved to names by the caller -- a workstream move, new repos, a
+    // Planio ref. They are the most significant things that can happen to a task without its
+    // status changing, and the ones a reader is least able to reconstruct later.
+    let mut parts = lead;
     if status != before.status { parts.push(format!("{} -> {}", before.status, status)); }
     if priority != before.priority { parts.push(format!("priority {} -> {}", before.priority, priority)); }
     if blocked_by != before.blocked_by {

@@ -81,6 +81,9 @@ impl Store {
         // `blocked_by` is an annotation, so a dangling reference would render as a blocker
         // that cannot be looked up rather than failing loudly.
         tx.execute("UPDATE tasks SET blocked_by = NULL WHERE blocked_by = ?1", [id])?;
+        // Explicit for the reason stated in the module header. Left behind, a link would keep
+        // counting in the repos menu for a ticket that no longer exists.
+        tx.execute("DELETE FROM task_repos WHERE task_id = ?1", [id])?;
         tx.execute("DELETE FROM tasks WHERE id = ?1 AND project_id = ?2", params![id, project_id])?;
         tx.commit()?;
 

@@ -83,7 +83,7 @@ fn ws_cols(alias: &str) -> String {
 /// which renders exactly the pre-005 board -- rather than to an error that takes the whole
 /// hook output down with it. Matching on the message is crude; it is also the only thing
 /// SQLite gives us that distinguishes a missing table from a real failure.
-fn is_missing_schema(e: &rusqlite::Error) -> bool {
+pub(crate) fn is_missing_schema(e: &rusqlite::Error) -> bool {
     let m = e.to_string();
     m.contains("no such table") || m.contains("no such column")
 }

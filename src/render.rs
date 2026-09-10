@@ -65,7 +65,10 @@ pub fn board(snap: &BoardSnapshot) -> String {
             out.push_str(&format!("\n{}\n", t.status));
             current = Some(t.status);
         }
-        out.push_str(&task_line(t, snap.highlight == Some(t.id), &snap.blocker_status));
+        out.push_str(&task_line(
+            t, snap.highlight == Some(t.id), &snap.blocker_status,
+            snap.links_of(t.id), snap.repo_count > 0,
+        ));
     }
 
     // What the cap left out. Stated, never silently dropped -- a board that hides work is
@@ -151,7 +154,18 @@ fn header(snap: &BoardSnapshot) -> String {
 /// One task, one line. The trailing parenthetical carries only what is *not* obvious from
 /// the columns -- origin is always shown because it is the instrumentation for whether the
 /// agent files work unprompted, and that question needs to stay visible.
-fn task_line(t: &Task, highlighted: bool, blockers: &[(i64, Status)]) -> String {
+///
+/// Repos and the Planio ref follow the parenthetical, and unlike tags they are on the line:
+/// which checkouts a ticket lives in and which ticket it is are what an agent needs to pick
+/// work up at all. Neither costs anything on a board that has none.
+///
+/// `no repo set` appears only when the board tracks repos (`flag_missing`) and only on open
+/// work -- on a board with no repos every task would say it, and a line that always says the
+/// same thing is one a reader learns to skip.
+fn task_line(
+    t: &Task, highlighted: bool, blockers: &[(i64, Status)],
+    links: Option<&TaskLinks>, flag_missing: bool,
+) -> String {
     let mark = if highlighted { "*" } else { " " };
     let mut meta = vec![t.origin.to_string()];
     if t.task_type != TaskType::Task { meta.insert(0, t.task_type.to_string()); }
@@ -167,7 +181,16 @@ fn task_line(t: &Task, highlighted: bool, blockers: &[(i64, Status)]) -> String 
             _ => format!("blocked by #{b}"),
         });
     }
-    format!("{mark} #{:<4} {:<40} ({})\n", t.id, truncate(&t.title, 40), meta.join(", "))
+    let mut tail = String::new();
+    match links.map(|l| l.repos.as_slice()).filter(|r| !r.is_empty()) {
+        Some(repos) => tail.push_str(&format!(" [{}]", repos.join(", "))),
+        None if flag_missing && t.status.is_open() => tail.push_str(" no repo set"),
+        None => {}
+    }
+    if let Some(n) = links.and_then(|l| l.planio) {
+        tail.push_str(&format!(" planio {n}"));
+    }
+    format!("{mark} #{:<4} {:<40} ({}){tail}\n", t.id, truncate(&t.title, 40), meta.join(", "))
 }
 
 /// Events render by *kind*, because a status change and a recorded decision are different
@@ -190,6 +213,11 @@ fn event_line(e: &Event, now: i64) -> String {
             // to it.
             "workstream_created" => format!("started workstream \"{}\"", truncate(&e.body, 50)),
             "workstream_closed"  => format!("closed workstream \"{}\"", truncate(&e.body, 50)),
+            // Same reasoning as the workstream kinds: history worth the line, but the body
+            // alone ("eee-web (/Users/…)") would not say what happened to it.
+            "repo_added"   => format!("added repo {}", truncate(&e.body, 60)),
+            "repo_renamed" => format!("renamed repo {}", truncate(&e.body, 60)),
+            "repo_removed" => format!("removed repo {}", truncate(&e.body, 60)),
             _ => match e.task_id {
                 Some(id) => format!("#{id} {}", truncate(&e.body, 55)),
                 None => truncate(&e.body, 70),
@@ -208,8 +236,22 @@ pub fn task_detail(d: &TaskDetail) -> String {
     let t = &d.task;
     let mut out = format!("Board: {}\n\n#{} {}\n", d.project.name, t.id, t.title);
     let mut meta = vec![t.status.to_string(), t.task_type.to_string(), format!("{} priority", t.priority), t.origin.to_string()];
+    if let Some(n) = d.planio { meta.push(format!("planio #{n}")); }
     meta.push(format!("filed {}", since(d.now, t.created_at)));
     out.push_str(&format!("  {}\n", meta.join(", ")));
+
+    if !d.repos.is_empty() {
+        // With paths: this is the response an agent reads when it commits to the work, and
+        // the path is what tells it where that work is.
+        out.push_str("\nrepos\n");
+        for r in &d.repos {
+            out.push_str(&format!("  {}  {}\n", r.name, r.path));
+        }
+    } else if d.board_has_repos && t.status.is_open() {
+        // The board only flags it; here, at the moment of starting, it says what to do.
+        out.push_str("\nno repo set -- ask the user which repos this touches, then record them \
+                      with task_update `repos`\n");
+    }
 
     if !d.tags.is_empty() {
         // Shown here and nowhere on the board. The board listing is the most expensive
@@ -393,11 +435,10 @@ pub fn merge_report(r: &crate::core::merge::MergeReport) -> String {
     };
     // Mentioned only when there were any. Most merges repair a board that never had a
     // workstream, and a line reading "and 0 workstreams" is noise on the common path.
-    let workstreams = if r.workstreams > 0 {
-        format!(" and {} workstream{}", r.workstreams, plural(r.workstreams))
-    } else {
-        String::new()
-    };
+    let mut extra = Vec::new();
+    if r.workstreams > 0 { extra.push(format!("{} workstream{}", r.workstreams, plural(r.workstreams))); }
+    if r.repos > 0 { extra.push(format!("{} repo{}", r.repos, plural(r.repos))); }
+    let workstreams = if extra.is_empty() { String::new() } else { format!(" and {}", extra.join(" and ")) };
     format!(
         "Merged \"{gone}\" into \"{kept}\".\n\n\
          Moved {} task{}, {} note{}, {} event{} and {} path{}{workstreams}.\n\
@@ -432,6 +473,11 @@ pub fn import_report(r: &crate::core::transfer::ImportReport) -> String {
             // directory keeps landing on the board that already owns it, and only the
             // actual path tells the reader whether that matters.
             out.push_str(&format!("  path already claimed by another board, left alone: {path}\n"));
+        }
+        for path in &p.repos_skipped {
+            // Same rule one level up: a checkout is registered on exactly one board, and its
+            // tickets from this export lose that repo rather than stealing it.
+            out.push_str(&format!("  repo already registered on another board, left alone: {path}\n"));
         }
     }
     for key in &r.skipped_existing {
@@ -478,6 +524,11 @@ pub fn error(e: &crate::core::Error) -> String {
         E::InvalidValue { field, value, valid } => {
             format!("\"{value}\" is not a valid {field}.\n\nValid values: {valid}\n")
         }
+        E::PathClaimed { path, board, key } => format!(
+            "{path} already belongs to board \"{board}\".\n\nA directory resolves to exactly one \
+             board, so it cannot join a second one. If both boards are the same work, merge \
+             them first:\n\n  ai-kanban merge <this board> {key}\n"
+        ),
         E::NoProjectContext => {
             "Could not tell which project this is.\n\nPass project explicitly, or run the server \
              with a working directory inside the project.\n".to_string()

@@ -123,7 +123,7 @@ fn etag(version: i64) -> [(header::HeaderName, String); 1] {
 ///
 /// The design law applied to the second consumer: a page that hardcodes
 /// `["backlog","doing","blocked"]` needs internal knowledge of the schema and drifts silently
-/// the day a status is added. Values arrive in display order (`Status::board_rank`,
+/// the day a status is added. Values arrive in display order (`Status::column_rank`,
 /// `Priority::rank`) so the client renders columns left to right without knowing the rule.
 ///
 /// Carries no cursor on purpose -- this document is cacheable for the life of the process,
@@ -132,7 +132,7 @@ fn etag(version: i64) -> [(header::HeaderName, String); 1] {
 pub async fn meta(State(api): State<Api>) -> ApiResult<Json<serde_json::Value>> {
     let store = api.store();
     let mut statuses: Vec<Status> = Status::ALL.to_vec();
-    statuses.sort_by_key(|s| s.board_rank());
+    statuses.sort_by_key(|s| s.column_rank());
     let mut priorities: Vec<Priority> = Priority::ALL.to_vec();
     priorities.sort_by_key(|p| p.rank());
 
@@ -206,8 +206,9 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
     let ws = current.as_ref().map(|w| w.id);
 
     let counts = store.status_counts_in(project.id, ws)?;
+    // Column order, not the agent's `board_rank` -- see `Status::column_rank`.
     let mut statuses: Vec<Status> = Status::ALL.to_vec();
-    statuses.sort_by_key(|s| s.board_rank());
+    statuses.sort_by_key(|s| s.column_rank());
 
     let mut columns = Vec::new();
     // Kept alongside the JSON so the blocker lookup below is one query for the whole board
@@ -228,6 +229,8 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
     // fixing one and not the other is how the two views start disagreeing.
     let blockers = store.blocker_status(project.id, &listed)?;
     let tags = store.tags_for(project.id, &listed)?;
+    let links = store.links_for(project.id, &listed)?;
+    let repos = store.repo_summaries(project.id)?;
     let cursor = store.change_cursor()?;
     tx.commit()?;
 
@@ -245,6 +248,12 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
         // actually have tags appear here.
         "task_tags": tags.iter().map(|(id, t)| (id.to_string(), json!(t)))
             .collect::<serde_json::Map<String, serde_json::Value>>(),
+        // Same shape and the same reason as `task_tags`: neither the repo links nor `planio`
+        // is in `TASK_COLS` (migration 007).
+        "task_links": links_json(&links),
+        // Every repo on the board, so the cards, the pickers and the repos menu all come
+        // from this one read.
+        "repos": repos,
         // Both halves are needed by the UI: `workstream` is what the board is scoped to and
         // what a new task will join, `workstreams` is everything selectable. Sent even when
         // nothing is scoped, so the control can offer the list without a second request.
@@ -352,11 +361,13 @@ pub async fn tasks(
     // Appended pages need their tags too, or an expanded column shows labels on the first
     // 50 cards and none after -- which reads as "those tasks have no tags".
     let tags = store.tags_for(project.id, &page.items)?;
+    let links = store.links_for(project.id, &page.items)?;
     Ok(Json(json!({
         "now": crate::core::now(),
         "tasks": page.items,
         "task_tags": tags.iter().map(|(id, t)| (id.to_string(), json!(t)))
             .collect::<serde_json::Map<String, serde_json::Value>>(),
+        "task_links": links_json(&links),
         "next": page.next.map(encode_cursor),
     })))
 }
@@ -373,6 +384,8 @@ pub async fn task(
         "task": detail.task,
         // Same reason as `workstream` below: out of `TASK_COLS`, so no `Task` carries it.
         "tags": detail.tags,
+        "repos": detail.repos,
+        "planio": detail.planio,
         "blocker": detail.blocker,
         "blocking": detail.blocking,
         "notes": detail.notes,
@@ -400,6 +413,12 @@ pub struct TaskBody {
     pub blocked_by: Option<Option<i64>>,
     /// Freeform labels. Replaces the whole set on update; omitted leaves it alone.
     pub tags: Option<Vec<String>>,
+    /// Repo ids on this board. Replaces the whole set on update; `[]` clears; omitted leaves
+    /// it alone.
+    pub repos: Option<Vec<i64>>,
+    /// Planio issue number. `0` clears it on update -- the same sentinel the agent uses,
+    /// because a JSON `null` in an optional field reads as "absent" once deserialized.
+    pub planio: Option<i64>,
     /// The *why*. Recorded as the event body -- the field that makes history worth reading.
     pub log: Option<String>,
     /// Which **existing** workstream this task joins, by name. Omitted means "inherit the
@@ -435,6 +454,8 @@ pub async fn create_task(
         origin: Origin::User,
         blocked_by: b.blocked_by.flatten(),
         tags: b.tags.clone().unwrap_or_default(),
+        repos: b.repos.clone().unwrap_or_default(),
+        planio: b.planio.filter(|n| *n != 0),
     };
     let task = match b.workstream.as_ref().map(|w| w.trim()) {
         // Absent: inherit whatever the board is scoped to, exactly as `task_add` does.
@@ -475,6 +496,8 @@ pub async fn update_task(
         blocked_by: b.blocked_by,
         workstream,
         tags: b.tags.clone(),
+        repos: b.repos.clone(),
+        planio: b.planio.map(|n| if n == 0 { None } else { Some(n) }),
         log: b.log.clone(),
         actor: Actor::User,
         expected_version: Some(expected),
@@ -492,6 +515,96 @@ pub async fn forget_task(
     let store = api.store();
     let project = resolve(&store, &p)?;
     store.forget_task(project.id, t)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Task links keyed by task id, like `task_tags`. Only tasks with a repo or a Planio ref appear.
+fn links_json(links: &[TaskLinks]) -> serde_json::Map<String, serde_json::Value> {
+    links.iter()
+        .map(|l| (l.task_id.to_string(), json!({ "repos": l.repos, "planio": l.planio })))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Repos
+//
+// No `If-Match` on these writes, unlike tasks and notes. The guard exists for a form held
+// open while an agent writes the same row -- and no agent writes repos. They are registered,
+// renamed and removed only from here, so there is no second writer to lose an update to.
+// ---------------------------------------------------------------------------
+
+/// The repos menu: every repo on the board, with how many tickets touch it.
+pub async fn repos(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<Json<serde_json::Value>> {
+    let store = api.store();
+    let project = resolve(&store, &p)?;
+    Ok(Json(json!({
+        "now": crate::core::now(),
+        "repos": store.repo_summaries(project.id)?,
+    })))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct RepoBody {
+    /// The local checkout, absolute or starting with `~/`. Required when adding.
+    pub path: Option<String>,
+    /// Defaults to the directory's name when adding.
+    pub name: Option<String>,
+}
+
+/// `~` is expanded here rather than in core: it is how a person types a path into a form, and
+/// anyone calling core from a shell already had it expanded for them.
+fn expand_home(raw: &str) -> std::path::PathBuf {
+    let rest = if raw == "~" { Some("") } else { raw.strip_prefix("~/") };
+    match (rest, dirs::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => raw.into(),
+    }
+}
+
+pub async fn create_repo(
+    State(api): State<Api>, Path(p): Path<String>, Json(b): Json<RepoBody>,
+) -> ApiResult<impl IntoResponse> {
+    let store = api.store();
+    let project = resolve(&store, &p)?;
+    let raw = b.path.as_deref().map(str::trim).unwrap_or_default();
+    if raw.is_empty() {
+        return Err(ApiError(Error::InvalidValue {
+            field: "path",
+            value: String::new(),
+            valid: "the path of a local checkout".into(),
+        }));
+    }
+    let repo = store.add_repo(project.id, &expand_home(raw), b.name.as_deref(), Actor::User)?;
+    Ok((StatusCode::CREATED, Json(json!({ "repo": repo }))))
+}
+
+/// Renames. The path is not editable: a different path is a different checkout, and it may
+/// belong to another board -- so moving a repo is a remove and an add, each of which says
+/// what it did and each of which runs its own checks.
+pub async fn update_repo(
+    State(api): State<Api>, Path((p, r)): Path<(String, i64)>, Json(b): Json<RepoBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let store = api.store();
+    let project = resolve(&store, &p)?;
+    if b.path.is_some() {
+        return Err(ApiError(Error::InvalidValue {
+            field: "path",
+            value: b.path.clone().unwrap_or_default(),
+            valid: "unchanged -- remove this repo and add the new path instead".into(),
+        }));
+    }
+    let repo = store.rename_repo(project.id, r, b.name.as_deref().unwrap_or_default(), Actor::User)?;
+    Ok(Json(json!({ "repo": repo })))
+}
+
+/// Takes the repo off the board and off every ticket naming it. See `Store::remove_repo` for
+/// why the directory keeps resolving to this board afterwards.
+pub async fn delete_repo(
+    State(api): State<Api>, Path((p, r)): Path<(String, i64)>,
+) -> ApiResult<StatusCode> {
+    let store = api.store();
+    let project = resolve(&store, &p)?;
+    store.remove_repo(project.id, r, Actor::User)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

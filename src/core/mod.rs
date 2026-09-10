@@ -15,6 +15,7 @@ pub mod note;
 pub mod page;
 pub mod project;
 pub mod recall;
+pub mod repo;
 pub mod task;
 pub mod staleness;
 pub mod store;

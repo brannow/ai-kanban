@@ -128,6 +128,17 @@ fn csv(s: &Option<String>) -> Option<Vec<String>> {
     s.as_ref().map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
 }
 
+/// Repo names as the agent typed them, resolved to ids on this board. `None` when the field
+/// was absent; `Some(vec![])` for `""`, which clears. An unknown name fails with the names
+/// that exist, rather than filing the task minus the repo the agent meant.
+fn repo_ids(store: &Store, project_id: i64, raw: &Option<String>) -> Result<Option<Vec<i64>>, ErrorData> {
+    match csv(raw) {
+        None => Ok(None),
+        Some(names) if names.is_empty() => Ok(Some(vec![])),
+        Some(names) => store.resolve_repos(project_id, &names).map(Some).map_err(fail),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parameters
 // ---------------------------------------------------------------------------
@@ -169,6 +180,11 @@ pub struct TaskAddParams {
     /// For the person's filtering: they carry no meaning you have to act on, and they are
     /// not shown on the board.
     pub tags: Option<String>,
+    /// Repos this touches, by name as the board lists them, comma separated. On a board that
+    /// tracks repos, a task without any shows "no repo set".
+    pub repos: Option<String>,
+    /// The Planio ticket this tracks, e.g. 48213.
+    pub planio: Option<i64>,
     pub project: Option<String>,
 }
 
@@ -193,6 +209,10 @@ pub struct TaskUpdateParams {
     pub blocked_by: Option<i64>,
     /// Replaces the labels, comma separated. Pass "" to clear them.
     pub tags: Option<String>,
+    /// Replaces the repos this touches, by name, comma separated. Pass "" to clear them.
+    pub repos: Option<String>,
+    /// The Planio ticket this tracks. Pass 0 to clear it.
+    pub planio: Option<i64>,
     /// Why this changed. This is the part worth reading in six months -- record the
     /// reasoning, not the fact that something moved.
     pub log: Option<String>,
@@ -342,6 +362,7 @@ impl AiKanban {
     fn task_add(&self, Parameters(p): Parameters<TaskAddParams>) -> Result<String, ErrorData> {
         let store = self.store();
         let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
+        let repos = repo_ids(&store, resolved.project.id, &p.repos)?.unwrap_or_default();
 
         let draft = TaskDraft {
             title: p.title.clone(),
@@ -352,6 +373,10 @@ impl AiKanban {
             status: parse_enum("status", &p.status, Status::parse)?.unwrap_or_default(),
             blocked_by: p.blocked_by.filter(|b| *b > 0),
             tags: csv(&p.tags).unwrap_or_default(),
+            repos,
+            // 0 means "none" here as it does on task_update; anything else, including a
+            // negative number, goes to core so the error can say what is valid.
+            planio: p.planio.filter(|n| *n != 0),
         };
         let task = store.create_task(resolved.project.id, draft).map_err(fail)?;
         let snap = store.board_after_mutation(resolved.project.id, task.id).map_err(fail)?;
@@ -386,6 +411,10 @@ impl AiKanban {
             // Absent leaves them alone; "" clears them. Same three-way reading as
             // `workstream` above, so one shape means one thing across the whole tool.
             tags: p.tags.as_deref().map(|t| csv(&Some(t.to_string())).unwrap_or_default()),
+            // Same three-way reading again: absent leaves them, "" clears, names replace.
+            repos: repo_ids(&store, resolved.project.id, &p.repos)?,
+            // 0 clears, as it does for `blocked_by`.
+            planio: p.planio.map(|n| if n == 0 { None } else { Some(n) }),
             log: p.log.clone(),
             // Unguarded, deliberately -- see `TaskPatch::expected_version`.
             expected_version: None,

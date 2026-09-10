@@ -96,6 +96,23 @@ ai-kanban serve                 # http://127.0.0.1:7373
 It shows which workstream the board is in, lets you switch it, and states which one a new
 task will join — so nothing lands somewhere you could not see.
 
+### Repos and Planio tickets
+
+When one body of work spans several repositories — `eee-api`, `eee-web`, `eee-infra` — keep
+them on one board. Open the web UI, press **repos**, and add each checkout's path. From then on
+an agent opening any of them lands on that board, and tickets say which repos they touch:
+
+```
+#4    Fix invoice rounding      (user) [eee-api, eee-web] planio 48213
+#9    Contact form spam         (agent) no repo set
+```
+
+A ticket can touch several repos, and a repo carries many tickets. An open ticket naming none
+shows `no repo set` — a flag, not a block — and `task_show` tells the agent to ask you before
+starting. Boards with no repos are unaffected.
+
+`planio` is the Planio ticket a task tracks, and `recall 48213` finds it.
+
 ## Commands
 
 ```sh

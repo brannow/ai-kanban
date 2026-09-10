@@ -79,6 +79,10 @@ POST   /api/projects/{p}/notes                -> 201, Note
 GET    /api/projects/{p}/notes/{n}            ETag
 PATCH  /api/projects/{p}/notes/{n}            If-Match required
 GET    /api/projects/{p}/events               ?cursor= &limit=   the history
+GET    /api/projects/{p}/repos                the repos menu: repos + ticket counts
+POST   /api/projects/{p}/repos                {path, name?} -> 201, Repo
+PATCH  /api/projects/{p}/repos/{r}            {name} -- rename only
+DELETE /api/projects/{p}/repos/{r}            off the board and off its tickets
 GET    /api/recall                            ?q= &project= &limit=
 GET    /api/stream                            SSE, live updates
 ```
@@ -88,7 +92,12 @@ GET    /api/stream                            SSE, live updates
 ### `/api/meta` — so the UI never hardcodes an enum
 
 Returns the statuses, task types, priorities and actors, each with its display order
-(`Status::board_rank`, `Priority::rank`, both of which already exist on the types).
+(`Status::column_rank`, `Priority::rank`).
+
+The web board's columns run backlog, blocked, doing, done, archived — doing in the middle.
+That is `column_rank`, deliberately not the agent's `board_rank`, which lists in-flight work
+first because it decides which rows survive a capped text board. A person sees every column
+at once, so the column order is free to follow how they read the board.
 
 This is the design law applied to consumer #2. A web UI that hardcodes
 `["backlog","doing","blocked"]` needs internal knowledge of the schema, and drifts silently
@@ -115,8 +124,8 @@ tell that client whether what it is showing has gone stale.
   // An ARRAY, already in column order -- the client renders left to right without knowing
   // the ordering rule. `total` is every task in that status; `tasks` is the first page.
   "columns": [
-    { "status": "doing",   "total": 2,  "tasks": [ ... ], "next": null },
-    { "status": "backlog", "total": 75, "tasks": [ ... ], "next": "1756399000:31" }
+    { "status": "backlog", "total": 75, "tasks": [ ... ], "next": "1756399000:31" },
+    { "status": "doing",   "total": 2,  "tasks": [ ... ], "next": null }
   ],
   "workstream":  { ... },        // what the board is scoped to, or null
   "workstreams": [ ... ],        // everything selectable
@@ -431,6 +440,29 @@ that unscoped queries never name the column at all (see `docs/data-model.md`; as
 `TASK_COLS` alone was enough is what shipped a bug). So surfacing it per card needs a separate
 lookup, as `GET /tasks/{t}` already does, rather than a wider column list. Worth doing; not
 worth reopening that decision for.
+
+## Repos
+
+Migration 007 (see `docs/data-model.md`). A board owns the local checkouts its tickets live
+in, and the web UI's **repos** button is the only place they are registered.
+
+- `POST /repos` takes `{"path": "~/work/eee-web", "name": "eee-web"}`. `~/` is expanded here,
+  because that is how a person types a path. The name defaults to the folder's and is
+  normalized. Registering a path twice returns the existing repo. A directory another board
+  already claims — at the path or below it — is a **409 `claimed`** carrying that board's
+  `board` and `key`, because the repair is `ai-kanban merge`.
+- `PATCH /repos/{r}` renames. The path is not editable: a different path is a different
+  checkout, and may belong to another board, so moving one is a remove and an add.
+- `DELETE /repos/{r}` takes it off every ticket. The folder keeps resolving to this board.
+- **No `If-Match` on repo writes.** The guard is for a form held open while an agent writes the
+  same row, and no agent writes repos.
+
+On tasks: `POST`/`PATCH /tasks` take `repos` (ids; `[]` clears) and `planio` (`0` clears — a
+JSON `null` in an optional field deserializes as "absent", so it cannot mean "clear"). `GET
+/tasks/{t}` returns `repos`, with paths, and `planio`. `GET /board` and `GET /tasks` return
+`task_links` keyed by task id like `task_tags` — `{"repos": ["eee-web"], "planio": 48213}` —
+and `/board` also returns `repos`, every repo with `open` and `total` ticket counts, so the
+cards, the pickers and the menu all come from one read.
 
 ## Explicitly not in v1
 

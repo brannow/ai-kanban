@@ -150,6 +150,40 @@ fn a_mutation_response_still_shows_what_is_in_flight() {
 }
 
 #[test]
+fn repos_and_a_planio_ref_on_every_line_stay_affordable() {
+    // The one change to the board LINE since these ceilings were set, and unlike tags it is
+    // rendered there: which checkouts a ticket lives in and which ticket it is are what an
+    // agent needs to pick work up. So it is measured at its worst -- two repos and a ref on
+    // every listed row -- on the same year-old board.
+    let (s, pid) = year_old_project();
+    let root = std::env::temp_dir().join(format!("aik-budget-repos-{}", std::process::id()));
+    let (a, b) = (root.join("api"), root.join("web"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let ra = s.add_repo(pid, &a, Some("eee-api"), Actor::User).unwrap();
+    let rb = s.add_repo(pid, &b, Some("eee-web"), Actor::User).unwrap();
+
+    let open = s.board(pid, &BoardQuery::board().with_limit(usize::MAX)).unwrap().tasks;
+    for (i, t) in open.iter().enumerate() {
+        s.update_task(pid, t.id, TaskPatch {
+            repos: Some(vec![ra.id, rb.id]),
+            planio: Some(Some(48000 + i as i64)),
+            ..Default::default()
+        }).unwrap();
+    }
+
+    let text = render::board(&s.board(pid, &BoardQuery::board()).unwrap());
+    eprintln!("\n=== board() with repos + planio on every line -- ~{} tokens ===\n{}", tokens(&text), text);
+    assert!(text.contains("[eee-api, eee-web] planio"), "the fixture must actually render them");
+    assert!(tokens(&text) < 1100, "board with repos cost {} tokens", tokens(&text));
+
+    let t = s.create_task(pid, TaskDraft { repos: vec![ra.id], ..TaskDraft::new("side quest found in the api") }).unwrap();
+    let text = render::board(&s.board_after_mutation(pid, t.id).unwrap());
+    eprintln!("\n=== task_add with repos -- ~{} tokens ===\n{}", tokens(&text), text);
+    assert!(tokens(&text) < 250, "task_add with repos cost {} tokens", tokens(&text));
+}
+
+#[test]
 fn the_all_boards_view_is_capped_by_board_count() {
     // The one call whose cost scales with something the project does not control: how many
     // repositories the user has touched this year. Uncapped, it grows without bound.

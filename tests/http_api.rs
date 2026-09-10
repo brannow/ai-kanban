@@ -50,16 +50,16 @@ fn json_req(method: &str, path: &str, body: Value, if_match: Option<&str>) -> Re
 
 #[tokio::test]
 async fn the_board_arrives_in_column_order() {
-    // The UI renders columns in the order it receives them. `Status::ALL` is declaration
-    // order (backlog first); `board_rank` is display order. Sending the wrong one puts the
-    // backlog where "doing" belongs.
+    // The UI renders columns in the order it receives them, so the server owns the order:
+    // backlog on the left, doing in the middle. It is `column_rank`, not the agent's
+    // `board_rank` -- sending that one would put "doing" on the far left.
     let (api, pid) = api();
     let (status, body, _) = call(&api, get(&format!("/api/projects/{pid}/board"))).await;
 
     assert_eq!(status, StatusCode::OK);
     let order: Vec<&str> = body["columns"].as_array().unwrap().iter()
         .map(|c| c["status"].as_str().unwrap()).collect();
-    assert_eq!(order, ["doing", "blocked", "backlog", "done", "archived"]);
+    assert_eq!(order, ["backlog", "blocked", "doing", "done", "archived"]);
     assert!(body["cursor"].is_number(), "a board read carries the cursor it was taken at");
     assert!(body["now"].is_number(), "raw timestamps plus now, so the browser can tick ages");
 }
@@ -143,7 +143,7 @@ async fn meta_carries_the_enums_so_the_ui_never_hardcodes_them() {
     assert_eq!(status, StatusCode::OK);
     let statuses: Vec<&str> = body["statuses"].as_array().unwrap()
         .iter().map(|s| s["value"].as_str().unwrap()).collect();
-    assert_eq!(statuses, ["doing", "blocked", "backlog", "done", "archived"], "display order");
+    assert_eq!(statuses, ["backlog", "blocked", "doing", "done", "archived"], "column order");
     assert!(body["schema_version"].as_i64().unwrap() >= 1);
     assert!(body["cursor"].is_null(), "meta is cacheable and must not carry a moving value");
 }
@@ -421,4 +421,64 @@ async fn paging_a_column_stays_inside_the_workstream_the_board_is_scoped_to() {
         .map(|t| t["title"].as_str().unwrap()).collect();
     assert_eq!(titles.len(), 6, "every scoped task, across both pages: {titles:?}");
     assert!(!titles.contains(&"elsewhere"), "another workstream leaked into a page: {titles:?}");
+}
+
+#[tokio::test]
+async fn repos_are_registered_linked_and_cleared_through_the_api() {
+    let (api, pid) = api();
+    let checkout = tempfile::tempdir().unwrap();
+
+    let (status, body, _) = call(&api, json_req(
+        "POST", &format!("/api/projects/{pid}/repos"),
+        serde_json::json!({ "path": checkout.path(), "name": "EEE Web" }), None,
+    )).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["repo"]["name"], "eee-web");
+    let rid = body["repo"]["id"].as_i64().unwrap();
+
+    let (status, body, _) = call(&api, json_req(
+        "POST", &format!("/api/projects/{pid}/tasks"),
+        serde_json::json!({ "title": "invoice rounding", "repos": [rid], "planio": 48213 }), None,
+    )).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let tid = body["task"]["id"].as_i64().unwrap();
+
+    // Links ride beside the rows, like tags; every repo rides along for the pickers and menu.
+    let (_, board, _) = call(&api, get(&format!("/api/projects/{pid}/board"))).await;
+    let links = &board["task_links"][tid.to_string()];
+    assert_eq!(links["repos"], serde_json::json!(["eee-web"]), "{board}");
+    assert_eq!(links["planio"], 48213);
+    assert_eq!(board["repos"][0]["total"], 1);
+
+    // `[]` and `0` clear -- `0` because a JSON null in an optional field reads as "absent".
+    let (_, detail, etag) = call(&api, get(&format!("/api/projects/{pid}/tasks/{tid}"))).await;
+    assert_eq!(detail["repos"][0]["name"], "eee-web");
+    let version = etag.unwrap().trim_matches('"').to_string();
+    let (status, body, _) = call(&api, json_req(
+        "PATCH", &format!("/api/projects/{pid}/tasks/{tid}"),
+        serde_json::json!({ "repos": [], "planio": 0 }), Some(&version),
+    )).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, detail, _) = call(&api, get(&format!("/api/projects/{pid}/tasks/{tid}"))).await;
+    assert_eq!(detail["repos"], serde_json::json!([]));
+    assert!(detail["planio"].is_null());
+
+    // A folder another board already resolves is a 409 naming the owner, so the UI can say
+    // which board holds it and point at `merge`.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let owner = api.store().resolve_project(elsewhere.path()).unwrap().project;
+    let (status, body, _) = call(&api, json_req(
+        "POST", &format!("/api/projects/{pid}/repos"),
+        serde_json::json!({ "path": elsewhere.path() }), None,
+    )).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "claimed");
+    assert_eq!(body["error"]["key"], owner.key);
+
+    let (status, _, _) = call(&api, json_req(
+        "DELETE", &format!("/api/projects/{pid}/repos/{rid}"), serde_json::json!({}), None,
+    )).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, list, _) = call(&api, get(&format!("/api/projects/{pid}/repos"))).await;
+    assert_eq!(list["repos"], serde_json::json!([]));
 }

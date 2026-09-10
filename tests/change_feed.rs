@@ -70,6 +70,23 @@ fn every_mutation_moves_the_change_cursor() {
 
     s.close_workstream(pid, w.id).unwrap();
     moved(&s, "closing a workstream");
+
+    let checkout = dir.path().join("a-checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let r = s.add_repo(pid, &checkout, None, Actor::User).unwrap();
+    moved(&s, "registering a repo");
+
+    s.rename_repo(pid, r.id, "renamed", Actor::User).unwrap();
+    moved(&s, "renaming a repo");
+
+    s.update_task(pid, t.id, TaskPatch { repos: Some(vec![r.id]), ..Default::default() }).unwrap();
+    moved(&s, "linking a task to a repo");
+
+    s.update_task(pid, t.id, TaskPatch { planio: Some(Some(48213)), ..Default::default() }).unwrap();
+    moved(&s, "setting a Planio ref");
+
+    s.remove_repo(pid, r.id, Actor::User).unwrap();
+    moved(&s, "removing a repo");
 }
 
 #[test]

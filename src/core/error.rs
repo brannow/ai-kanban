@@ -28,6 +28,12 @@ pub enum Error {
     #[error("invalid {field}: {value:?}")]
     InvalidValue { field: &'static str, value: String, valid: String },
 
+    /// A directory another board already resolves. One directory maps to exactly one board,
+    /// so it cannot join a second one -- carries the owner so the caller can name it and
+    /// point at `merge`.
+    #[error("{path} already belongs to board {board:?}")]
+    PathClaimed { path: String, board: String, key: String },
+
     #[error("could not determine a project directory")]
     NoProjectContext,
 

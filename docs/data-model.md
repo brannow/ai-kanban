@@ -163,6 +163,53 @@ straight out of a 30-row limit — shipping the original failure with a new colu
 supposed to fix it. The trade, stated because it is real: an unscoped `doing` task now sorts
 below an active-workstream `backlog` one. Displaced work is counted, never dropped.
 
+### `repos` / `task_repos`, and `tasks.planio`
+
+Added in migration 007. A **repo** is a local checkout the board's work happens in. A ticket
+names the repos it touches, and a repo carries many tickets.
+
+**A board owns its repos, rather than every repo being its own board.** A body of work — a
+customer, a product, a Planio project — spans several repositories, and a ticket in it touches
+some of them. With one board per repo, a ticket touching two has to live on one, and an agent
+opening the other never sees it. So registering a repo also registers its root as a
+`project_paths` alias: an agent opening *any* of the board's checkouts lands on the same board.
+`project_paths` already let a board own many directories; `repos` names which of them are
+repositories.
+
+**`repos.path` is unique across the store**, for the reason `project_paths.path` is a primary
+key: one directory resolves to exactly one board. Registering a directory another board already
+claims — at that path *or below it* — is refused with the owner named. Below matters:
+resolution checks the deepest alias first, so another board's `src/` alias would keep
+answering and the registration would silently not take effect. `merge` is the repair when both
+boards are the same work.
+
+**Removing a repo leaves its path alias in place.** Taking it out of the menu says it is no
+longer part of this work, not that its history belongs elsewhere. Dropping the alias would send
+the next session in that folder to a brand-new empty board.
+
+**A ticket with no repo is flagged, not blocked.** `status` is authoritative and carries
+behaviour — the argument under `tags` below. A status forced by a rule is one the agent did not
+set and cannot explain, and `blocked` would stop meaning one thing. The board line says
+`no repo set` instead: only on boards that have repos, and only on open work, because a line
+that always says the same thing is one a reader learns to skip.
+
+**`planio` is an INTEGER, not free text**, so `48213`, `#48213` and a pasted URL cannot coexist
+as three spellings of one ticket. It is indexed in `tasks_fts` so `recall 48213` finds the
+ticket — the FTS table was dropped and rebuilt again, exactly as in 006.
+
+Neither is in `TASK_COLS`, following 005 and 006, so `MIN_READABLE_VERSION` stays at 2. The
+reads that name them (`links_for`, `repo_count`, `task_repos`, `task_planio`) degrade to "no
+repos" on a store the read-only hook finds unmigrated. `tests/repos.rs` drops the tables and
+the column and asserts the board and the hook still render.
+
+Unlike tags, repos and the Planio ref **are on the board line**. Tags carry nothing an agent
+acts on; which checkouts a ticket lives in and which ticket it is are what an agent needs to
+pick the work up at all. Measured at its worst — two repos and a ref on every listed row — in
+`tests/budget.rs`.
+
+**A person registers repos**, in the web UI's repos menu. The agent names repos on tasks and
+never registers one, because registering changes which board a directory resolves to.
+
 ### `tasks`
 
 `status` is one of `backlog | doing | blocked | done | archived`. There is no `next` —

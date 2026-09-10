@@ -300,7 +300,8 @@ One canonical format per domain, and every one of them is valid input somewhere 
 | `backlog\|doing\|blocked\|done\|archived` | Status | `status` |
 | `low\|normal\|high\|urgent` | Priority | `priority` |
 | `"all"` | Every board | `project` |
-| `0` | Clear `blocked_by` | `blocked_by` |
+| `0` | Clear `blocked_by` / `planio` | `blocked_by`, `planio` |
+| `""` | Clear `tags` / `repos` / `workstream` | `tags`, `repos`, `workstream` |
 
 That last one is a compromise worth naming: JSON has no way to say "set this to null" that
 survives an optional field, and inventing a magic string would be worse than a documented
@@ -359,3 +360,27 @@ have to interpret, which is what keeps the five statuses fixed.
 
 They are indexed by `recall`, so typing a tag finds the tasks carrying it. There is no filter
 syntax, deliberately — see `docs/data-model.md`.
+
+## Repos and the Planio ref
+
+`task_add` and `task_update` take `repos` (names as the board lists them, comma separated) and
+`planio` (a ticket number). The same three-way reading as `tags` and `workstream`: omitted
+leaves them alone, `""` clears `repos`, and `0` clears `planio` — the `blocked_by` sentinel,
+for the same reason.
+
+An unknown repo name fails with the names that exist. On a board with none, it says who adds
+them, because the agent cannot: registering a repo changes which board a directory resolves
+to, and that is the person's call, made in the web UI's repos menu. So there is no `repo_add`
+tool — no new tool at all. Repos ride the intents that already exist, as workstreams do.
+
+They **are on the board line**, unlike tags:
+
+```
+  #4    Fix invoice rounding                     (user) [eee-api, eee-web] planio 48213
+  #9    Contact form spam                        (agent) no repo set
+```
+
+`no repo set` is a flag, not a status. On a board that tracks repos, an open ticket naming none
+says so; on a board with no repos it never appears. `task_show` lists each repo with its path —
+the answer to "where is this work" — and on an unset one tells the agent to ask the user and
+record the answer with `task_update`.
