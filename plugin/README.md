@@ -26,3 +26,10 @@ go quiet rather than erroring on every session.
 
 `mcp.json` deliberately does **not** guard: an MCP server that dies silently is a board
 that is mysteriously absent, which is harder to diagnose than a startup error.
+
+## No comments in the templates
+
+JSON has no comments, and the obvious workaround — a `"_comment"` key — is not harmless
+here: Claude Code validates `hooks.json` and prints `unknown key "_comment" ignored` at
+every session start. That is the loud hook this whole file exists to prevent, so the
+explanation lives in this README instead.
