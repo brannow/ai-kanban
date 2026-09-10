@@ -1,12 +1,20 @@
-//! Repos: the local checkouts a board's work happens in, and which tickets touch which.
+//! Repos: the local checkouts boards' work happens in, and which tickets touch which.
 //!
-//! # Why a board owns its repos
+//! # Boards own repos, and a repo can serve several boards
 //!
-//! A body of work -- a customer, a product, a Planio project -- usually spans several
-//! repositories, and a ticket in it touches some of them. If every repo were its own board, a
-//! ticket touching two of them would have to live on one, and an agent opening the other would
-//! never see it. So a board owns repos, and registering one also registers its root as a path
-//! alias: an agent opening any of the board's repos lands on the same board.
+//! A board is a body of work -- a customer, a product, a Planio project -- and it usually
+//! spans several repositories. A repository can serve more than one of them, too: a shared
+//! library, a monorepo two projects deploy from. So repos are global and tied to boards
+//! through `board_repos`, many-to-many, and a ticket can name any repo its board has.
+//!
+//! # Exactly one home
+//!
+//! What cannot be shared is where a folder resolves. An agent opening a directory has to land
+//! on one board, the same one every time, or the folder reads a different memory on different
+//! days -- the split this store exists to prevent. So every repo has a HOME board: the board
+//! its path alias points at. It is always one of the repo's boards. It starts as the board
+//! the repo was first added to, a person can move it, and when the home lets the repo go it
+//! passes to the earliest remaining board rather than leaving the folder pointing nowhere.
 //!
 //! # Why a ticket with no repo is flagged, not blocked
 //!
@@ -29,7 +37,7 @@ use rusqlite::{params, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 
-const REPO_COLS: &str = "id, project_id, name, path, created_at";
+const REPO_COLS: &str = "id, home_project_id, name, path, created_at";
 
 /// `REPO_COLS` with a table alias, derived rather than written out twice -- the `TASK_COLS`
 /// trap in CLAUDE.md, avoided the same way `ws_cols` avoids it.
@@ -38,13 +46,18 @@ fn repo_cols(alias: &str) -> String {
 }
 
 fn row_to_repo(r: &rusqlite::Row<'_>) -> rusqlite::Result<Repo> {
-    Ok(Repo { id: r.get(0)?, project_id: r.get(1)?, name: r.get(2)?, path: r.get(3)?, created_at: r.get(4)? })
+    Ok(Repo { id: r.get(0)?, home_project_id: r.get(1)?, name: r.get(2)?, path: r.get(3)?, created_at: r.get(4)? })
 }
 
+/// "This path, or anything below it", with the path bound as `?1`. `substr` rather than LIKE:
+/// LIKE is case-insensitive for ASCII and treats `_` and `%` in a path as wildcards, so it
+/// would match directories that are not below this one.
+const AT_OR_BELOW: &str = "(path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/')";
+
 /// The read paths below also run from the SessionStart hook, which opens the store read-only
-/// and never migrates it. Against a store older than 007 the tables and `tasks.planio` do not
-/// exist, and that has to read as "this board tracks no repos" -- which renders exactly the
-/// pre-007 board -- rather than as an error that costs the hook its whole output.
+/// and never migrates it. Against a store older than 007 or 008 the tables or columns they
+/// name do not exist, and that has to read as "this board tracks no repos" -- the board as it
+/// rendered before -- rather than as an error that costs the hook its whole output.
 fn tolerant<T: Default>(r: rusqlite::Result<T>) -> Result<T> {
     match r {
         Ok(v) => Ok(v),
@@ -68,28 +81,44 @@ fn check_name(raw: &str) -> Result<String> {
 impl Store {
     /// Every repo on a board, by name.
     pub fn repos(&self, project_id: i64) -> Result<Vec<Repo>> {
+        let sql = format!(
+            "SELECT {} FROM board_repos br JOIN repos r ON r.id = br.repo_id
+              WHERE br.project_id = ?1 ORDER BY r.name, r.id",
+            repo_cols("r"),
+        );
         tolerant((|| {
-            let mut st = self.conn.prepare(&format!(
-                "SELECT {REPO_COLS} FROM repos WHERE project_id = ?1 ORDER BY name, id"
-            ))?;
+            let mut st = self.conn.prepare(&sql)?;
             let rows = st.query_map([project_id], row_to_repo)?.collect::<rusqlite::Result<Vec<_>>>();
+            rows
+        })())
+    }
+
+    /// Every repo in the store, whichever boards it is on -- what a board can attach.
+    pub fn all_repos(&self) -> Result<Vec<Repo>> {
+        tolerant((|| {
+            let mut st = self.conn.prepare(&format!("SELECT {REPO_COLS} FROM repos ORDER BY name, id"))?;
+            let rows = st.query_map([], row_to_repo)?.collect::<rusqlite::Result<Vec<_>>>();
             rows
         })())
     }
 
     pub fn repo_count(&self, project_id: i64) -> Result<usize> {
         tolerant(self.conn.query_row(
-            "SELECT COUNT(*) FROM repos WHERE project_id = ?1",
+            "SELECT COUNT(*) FROM board_repos WHERE project_id = ?1",
             [project_id],
             |r| r.get::<_, i64>(0),
         ).map(|n| n as usize))
     }
 
-    /// Scoped by project like every other lookup: the store is global, so a bare id could name
-    /// a repo another board owns.
+    /// A repo **on this board**. Scoped like every other lookup: the store is global, and a
+    /// bare id would let a ticket name a checkout its board does not have.
     pub fn repo(&self, project_id: i64, id: i64) -> Result<Repo> {
         let found = self.conn.query_row(
-            &format!("SELECT {REPO_COLS} FROM repos WHERE id = ?1 AND project_id = ?2"),
+            &format!(
+                "SELECT {} FROM board_repos br JOIN repos r ON r.id = br.repo_id
+                  WHERE r.id = ?1 AND br.project_id = ?2",
+                repo_cols("r"),
+            ),
             params![id, project_id],
             row_to_repo,
         ).optional()?;
@@ -97,6 +126,14 @@ impl Store {
             Some(r) => Ok(r),
             None => Err(self.unknown_repo(project_id, &format!("#{id}"))?),
         }
+    }
+
+    fn repo_by_path(&self, path: &str) -> Result<Option<Repo>> {
+        Ok(self.conn.query_row(
+            &format!("SELECT {REPO_COLS} FROM repos WHERE path = ?1"),
+            [path],
+            row_to_repo,
+        ).optional()?)
     }
 
     /// The not-found error, carrying the names that do exist so the caller can correct itself.
@@ -107,7 +144,7 @@ impl Store {
             field: "repo",
             value: value.to_string(),
             valid: if names.is_empty() {
-                "none yet -- a person registers this board's repos in the web UI's repos menu \
+                "none yet -- a person adds this board's repos in the web UI's repos menu \
                  (ai-kanban serve)".into()
             } else {
                 names.join(", ")
@@ -115,45 +152,67 @@ impl Store {
         })
     }
 
-    /// The repos menu: every repo with how many tickets touch it.
+    /// A board's repos menu: every repo on it, how many of this board's tickets touch it, and
+    /// where its folder opens.
     ///
-    /// Unlike the agent's workstream directory this lists repos with no tickets too -- a repo
-    /// registered a moment ago has none, and a menu that hid it would be one nobody could
-    /// pick from.
+    /// Repos with no tickets are listed too -- one added a moment ago has none, and a menu that
+    /// hid it would be one nobody could pick from.
     pub fn repo_summaries(&self, project_id: i64) -> Result<Vec<RepoSummary>> {
         let sql = format!(
             "SELECT {}, COUNT(t.id),
-                    COALESCE(SUM(CASE WHEN t.status IN ('backlog','doing','blocked') THEN 1 ELSE 0 END), 0)
-               FROM repos r
+                    COALESCE(SUM(CASE WHEN t.status IN ('backlog','doing','blocked') THEN 1 ELSE 0 END), 0),
+                    home.name
+               FROM board_repos br
+               JOIN repos r ON r.id = br.repo_id
+               JOIN projects home ON home.id = r.home_project_id
                LEFT JOIN task_repos tr ON tr.repo_id = r.id
-               LEFT JOIN tasks t ON t.id = tr.task_id
-              WHERE r.project_id = ?1
+               LEFT JOIN tasks t ON t.id = tr.task_id AND t.project_id = br.project_id
+              WHERE br.project_id = ?1
               GROUP BY r.id
               ORDER BY r.name, r.id",
             repo_cols("r"),
         );
         tolerant((|| {
             let mut st = self.conn.prepare(&sql)?;
-            let rows = st.query_map([project_id], |r| Ok(RepoSummary {
+            let mut rows = st.query_map([project_id], |r| Ok(RepoSummary {
                 repo: row_to_repo(r)?,
                 total: r.get::<_, i64>(5)? as usize,
                 open: r.get::<_, i64>(6)? as usize,
-            }))?.collect::<rusqlite::Result<Vec<_>>>();
-            rows
+                home_board: r.get(7)?,
+                other_boards: vec![],
+            }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+
+            let mut st = self.conn.prepare(
+                "SELECT br.repo_id, p.name FROM board_repos br JOIN projects p ON p.id = br.project_id
+                  WHERE br.project_id != ?1
+                    AND br.repo_id IN (SELECT repo_id FROM board_repos WHERE project_id = ?1)
+                  ORDER BY p.name, p.id",
+            )?;
+            let mut others: HashMap<i64, Vec<String>> = HashMap::new();
+            for row in st.query_map([project_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+                let (repo, board) = row?;
+                others.entry(repo).or_default().push(board);
+            }
+            for s in &mut rows {
+                s.other_boards = others.remove(&s.repo.id).unwrap_or_default();
+            }
+            Ok(rows)
         })())
     }
 
-    /// Registers a local checkout on this board, and claims its directory for the board.
+    /// Puts a local checkout on this board.
     ///
-    /// Registering the same path twice returns the existing repo rather than failing: the
-    /// person asked for a state that already holds.
+    /// A checkout that is **already a repo** -- on another board -- is attached, and its home
+    /// stays where it is: sharing a repo does not change where its folder opens. Moving that
+    /// is `set_repo_home`, a step of its own that says what it did. Adding one this board
+    /// already has returns it unchanged: the person asked for a state that already holds.
     ///
-    /// Refused when **another** board already claims the directory or anything below it.
-    /// `project_paths` maps one directory to exactly one board, and resolution checks the
-    /// deepest alias first -- so a subdirectory the other board learned would keep answering
-    /// for it, and this registration would silently not take effect. Taking the paths over
-    /// instead would move that board's future sessions out from under its history. When both
-    /// are the same work, `merge` is the repair, and the error says so.
+    /// A checkout that is **new** makes this board its home and claims its directory. That is
+    /// refused when another board already claims the directory or anything below it: resolution
+    /// checks the deepest alias first, so that board's subdirectory would keep answering and
+    /// this registration would silently not take effect -- and taking its paths over instead
+    /// would move its future sessions out from under its history. When both are the same work,
+    /// `merge` is the repair, and the error says so.
     pub fn add_repo(&self, project_id: i64, path: &Path, name: Option<&str>, actor: Actor) -> Result<Repo> {
         let bad_path = || Error::InvalidValue {
             field: "path",
@@ -168,26 +227,23 @@ impl Store {
         }
         let path_s = canon.to_string_lossy().into_owned();
 
-        let existing = self.conn.query_row(
-            &format!("SELECT {REPO_COLS} FROM repos WHERE path = ?1"),
-            [&path_s],
-            row_to_repo,
-        ).optional()?;
-        if let Some(r) = existing {
-            if r.project_id == project_id {
+        if let Some(r) = self.repo_by_path(&path_s)? {
+            if self.repo(project_id, r.id).is_ok() {
                 return Ok(r);
             }
-            let other = self.project(r.project_id)?;
-            return Err(Error::PathClaimed { path: path_s, board: other.name, key: other.key });
+            let home = self.project(r.home_project_id)?;
+            let tx = self.conn.unchecked_transaction()?;
+            self.attach_repo(project_id, r.id)?;
+            self.write_event(
+                project_id, None, actor, "repo_added",
+                &format!("{} ({}), which opens on board \"{}\"", r.name, r.path, home.name),
+            )?;
+            tx.commit()?;
+            return Ok(r);
         }
 
-        // `substr` rather than LIKE: LIKE is case-insensitive for ASCII and treats `_` and `%`
-        // in a path as wildcards, so it would match directories that are not below this one.
         let claimed: Option<i64> = self.conn.query_row(
-            "SELECT project_id FROM project_paths
-              WHERE project_id != ?2
-                AND (path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/')
-              LIMIT 1",
+            &format!("SELECT project_id FROM project_paths WHERE project_id != ?2 AND {AT_OR_BELOW} LIMIT 1"),
             params![path_s, project_id],
             |r| r.get(0),
         ).optional()?;
@@ -198,14 +254,15 @@ impl Store {
 
         let fallback = canon.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path_s.clone());
         let name = check_name(name.filter(|n| !n.trim().is_empty()).unwrap_or(&fallback))?;
-        self.ensure_repo_name_free(project_id, &name, None)?;
+        self.ensure_repo_name_free(&name, None)?;
 
         let tx = self.conn.unchecked_transaction()?;
         self.conn.execute(
-            "INSERT INTO repos (project_id, name, path, created_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO repos (home_project_id, name, path, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![project_id, name, path_s, now()],
         )?;
         let id = self.conn.last_insert_rowid();
+        self.attach_repo(project_id, id)?;
         // The half that makes an agent opening this repo land on this board.
         self.add_path_alias(project_id, &canon)?;
         // Not housekeeping: "eee-web joined this board" is history a cold agent can use, and
@@ -215,63 +272,137 @@ impl Store {
         self.repo(project_id, id)
     }
 
+    fn attach_repo(&self, project_id: i64, repo_id: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO board_repos (project_id, repo_id, created_at) VALUES (?1, ?2, ?3)",
+            params![project_id, repo_id, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Makes this board the repo's home: its folder, and every subdirectory the old home had
+    /// learned, resolves here from now on. History already written stays on the board that
+    /// wrote it -- this changes where the NEXT session lands, which is the whole question.
+    pub fn set_repo_home(&self, project_id: i64, repo_id: i64, actor: Actor) -> Result<Repo> {
+        let r = self.repo(project_id, repo_id)?;
+        if r.home_project_id == project_id {
+            return Ok(r);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        self.move_home(&r, project_id, actor)?;
+        tx.commit()?;
+        self.repo(project_id, repo_id)
+    }
+
+    /// The shared half of changing a home: re-point the aliases, and say so on both boards --
+    /// on each, it is the entry explaining why a folder started or stopped opening there.
+    fn move_home(&self, r: &Repo, to: i64, actor: Actor) -> Result<()> {
+        let from = self.project(r.home_project_id)?;
+        let target = self.project(to)?;
+        // Only the old home's aliases move. A subdirectory some third board claimed on its own
+        // (split off with a `.ai-kanban` marker, say) was never this repo's to hand over.
+        self.conn.execute(
+            &format!("UPDATE project_paths SET project_id = ?2 WHERE project_id = ?3 AND {AT_OR_BELOW}"),
+            params![r.path, to, from.id],
+        )?;
+        // And the root itself, in case the old home never held it. `add_path_alias` never takes
+        // a path from another board, so this cannot steal one either.
+        self.add_path_alias(to, Path::new(&r.path))?;
+        self.conn.execute("UPDATE repos SET home_project_id = ?2 WHERE id = ?1", params![r.id, to])?;
+        self.write_event(to, None, actor, "repo_home",
+            &format!("{} now opens on this board, moved from \"{}\"", r.name, from.name))?;
+        self.write_event(from.id, None, actor, "repo_home",
+            &format!("{} now opens on board \"{}\"", r.name, target.name))?;
+        Ok(())
+    }
+
     pub fn rename_repo(&self, project_id: i64, id: i64, name: &str, actor: Actor) -> Result<Repo> {
         let before = self.repo(project_id, id)?;
         let name = check_name(name)?;
         if name == before.name {
             return Ok(before);
         }
-        self.ensure_repo_name_free(project_id, &name, Some(id))?;
-        self.conn.execute(
-            "UPDATE repos SET name = ?3 WHERE id = ?1 AND project_id = ?2",
-            params![id, project_id, name],
-        )?;
+        self.ensure_repo_name_free(&name, Some(id))?;
+        self.conn.execute("UPDATE repos SET name = ?2 WHERE id = ?1", params![id, name])?;
         self.write_event(project_id, None, actor, "repo_renamed", &format!("{} -> {name}", before.name))?;
         self.repo(project_id, id)
     }
 
-    /// Takes a repo off the board and off every ticket that named it. Returns how many
-    /// tickets lost it, which the event records.
+    /// Takes a repo off **this board** and off this board's tickets. Returns how many tickets
+    /// lost it. Other boards keep it, and keep their tickets' links.
     ///
-    /// The directory's path alias is **left in place**. Removing a repo from the menu says it
-    /// is no longer part of this work; it does not say its history belongs somewhere else.
-    /// Dropping the alias would silently change which board that directory resolves to next
-    /// session -- to a brand-new empty one -- which is the split this store is built to
-    /// prevent.
+    /// When this board is the home and others remain, the home passes to the earliest of them,
+    /// so the folder keeps opening on a board that has the repo. When this is the last board,
+    /// the repo goes, and the folder's path alias is **left in place**: removing a repo from
+    /// the menu says it is no longer part of this work, not that its history belongs
+    /// somewhere else, and dropping the alias would send the next session in that folder to a
+    /// brand-new empty board -- the split this store is built to prevent.
     pub fn remove_repo(&self, project_id: i64, id: i64, actor: Actor) -> Result<usize> {
         let r = self.repo(project_id, id)?;
         let tx = self.conn.unchecked_transaction()?;
         // Explicit rather than left to ON DELETE CASCADE, for the reason `forget.rs` gives:
-        // `foreign_keys` is per-connection state, and a link left behind here would keep a
-        // ticket pointing at a repo that no longer exists.
-        let unlinked = self.conn.execute("DELETE FROM task_repos WHERE repo_id = ?1", [id])?;
-        self.conn.execute("DELETE FROM repos WHERE id = ?1 AND project_id = ?2", params![id, project_id])?;
+        // `foreign_keys` is per-connection state, and a link left behind would keep a ticket
+        // naming a repo its board no longer has.
+        let unlinked = self.conn.execute(
+            "DELETE FROM task_repos WHERE repo_id = ?1 AND task_id IN (SELECT id FROM tasks WHERE project_id = ?2)",
+            params![id, project_id],
+        )?;
+        self.conn.execute("DELETE FROM board_repos WHERE project_id = ?1 AND repo_id = ?2", params![project_id, id])?;
+        let mut after = String::new();
+        if r.home_project_id == project_id {
+            let next: Option<i64> = self.conn.query_row(
+                "SELECT project_id FROM board_repos WHERE repo_id = ?1 ORDER BY created_at, project_id LIMIT 1",
+                [id],
+                |row| row.get(0),
+            ).optional()?;
+            match next {
+                Some(next) => {
+                    self.move_home(&r, next, actor)?;
+                    after = format!("; it now opens on board \"{}\"", self.project(next)?.name);
+                }
+                None => {
+                    self.conn.execute("DELETE FROM repos WHERE id = ?1", [id])?;
+                }
+            }
+        }
         self.write_event(
             project_id, None, actor, "repo_removed",
-            &format!("{} ({}), was on {unlinked} ticket{}", r.name, r.path, if unlinked == 1 { "" } else { "s" }),
+            &format!("{} ({}), was on {unlinked} ticket{}{after}", r.name, r.path, if unlinked == 1 { "" } else { "s" }),
         )?;
         tx.commit()?;
         Ok(unlinked)
     }
 
-    fn ensure_repo_name_free(&self, project_id: i64, name: &str, except: Option<i64>) -> Result<()> {
+    /// Store-wide: a repo is one thing seen from several boards, so its name has to mean the
+    /// same checkout on each of them.
+    fn ensure_repo_name_free(&self, name: &str, except: Option<i64>) -> Result<()> {
         let taken: Option<i64> = self.conn.query_row(
-            "SELECT id FROM repos WHERE project_id = ?1 AND name = ?2",
-            params![project_id, name],
-            |r| r.get(0),
+            "SELECT id FROM repos WHERE name = ?1", [name], |r| r.get(0),
         ).optional()?;
         match taken {
             Some(id) if Some(id) != except => Err(Error::InvalidValue {
                 field: "name",
                 value: name.to_string(),
-                valid: "a name no other repo on this board already has".into(),
+                valid: "a name no other repo already has -- pass one explicitly".into(),
             }),
             _ => Ok(()),
         }
     }
 
+    /// `base`, or `base-2`, `base-3`... -- for an import, which must not fail on a name the
+    /// target store already uses for a different checkout.
+    pub(crate) fn free_repo_name(&self, base: &str) -> Result<String> {
+        let mut candidate = base.to_string();
+        let mut n = 1;
+        while self.ensure_repo_name_free(&candidate, None).is_err() {
+            n += 1;
+            candidate = format!("{base}-{n}");
+        }
+        Ok(candidate)
+    }
+
     /// Repo references as an agent or a person typed them -- names, in any spelling the
-    /// normalizer folds, or paths -- turned into ids on this board.
+    /// normalizer folds, or paths -- turned into ids of repos on this board.
     ///
     /// An unknown one fails with the names that do exist rather than being skipped: a ticket
     /// silently missing one of its repos is an agent that never opens that checkout.
@@ -299,7 +430,7 @@ impl Store {
         Ok(())
     }
 
-    /// Replaces a task's repos. Callers check ownership first with `check_repos`.
+    /// Replaces a task's repos. Callers check the board has them first, with `check_repos`.
     pub(crate) fn set_task_repos(&self, task_id: i64, ids: &[i64]) -> Result<()> {
         self.conn.execute("DELETE FROM task_repos WHERE task_id = ?1", [task_id])?;
         for id in ids {
@@ -311,11 +442,14 @@ impl Store {
         Ok(())
     }
 
-    /// One task's repos, with their paths.
+    /// One task's repos, with their paths. Scoped through the TASK's board, which is the one
+    /// board a task's links can mean anything on.
     pub fn task_repos(&self, project_id: i64, task_id: i64) -> Result<Vec<Repo>> {
         let sql = format!(
-            "SELECT {} FROM task_repos tr JOIN repos r ON r.id = tr.repo_id
-              WHERE tr.task_id = ?1 AND r.project_id = ?2
+            "SELECT {} FROM task_repos tr
+               JOIN repos r ON r.id = tr.repo_id
+               JOIN tasks t ON t.id = tr.task_id
+              WHERE tr.task_id = ?1 AND t.project_id = ?2
               ORDER BY r.name, r.id",
             repo_cols("r"),
         );
@@ -335,11 +469,13 @@ impl Store {
         ).optional().map(Option::flatten))
     }
 
-    /// Repos and Planio refs for a set of listed tasks, in two queries however many rows.
+    /// Repos and Planio refs for a set of listed tasks on one board, in two queries however
+    /// many rows.
     ///
     /// Only tasks that have either appear. Batched for the reason `tags_for` is: the board
     /// lists a few dozen rows, and a per-row lookup is the kind of thing that stops being free
-    /// the moment someone raises the cap.
+    /// the moment someone raises the cap. Names no column 008 added, so an agent's board keeps
+    /// its repos on a store the hook finds between the two migrations.
     pub fn links_for(&self, project_id: i64, tasks: &[Task]) -> Result<Vec<TaskLinks>> {
         if tasks.is_empty() {
             return Ok(vec![]);
@@ -355,8 +491,10 @@ impl Store {
                 .query_map(rusqlite::params_from_iter(&ids), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
                 .collect::<rusqlite::Result<HashMap<_, _>>>()?;
             let mut st = self.conn.prepare(&format!(
-                "SELECT tr.task_id, r.name FROM task_repos tr JOIN repos r ON r.id = tr.repo_id
-                  WHERE r.project_id = ? AND tr.task_id IN ({holes})
+                "SELECT tr.task_id, r.name FROM task_repos tr
+                   JOIN repos r ON r.id = tr.repo_id
+                   JOIN tasks t ON t.id = tr.task_id
+                  WHERE t.project_id = ? AND tr.task_id IN ({holes})
                   ORDER BY r.name, r.id"
             ))?;
             let mut repos: HashMap<i64, Vec<String>> = HashMap::new();

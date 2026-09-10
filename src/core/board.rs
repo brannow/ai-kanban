@@ -224,6 +224,15 @@ impl Store {
         Ok(out)
     }
 
+    /// Counts across every board, for the person's All Projects view.
+    pub fn status_counts_all(&self) -> Result<Vec<(Status, usize)>> {
+        let mut st = self.conn.prepare("SELECT status, COUNT(*) FROM tasks GROUP BY status")?;
+        let mut out = st.query_map([], |r| Ok((r.get::<_, Status>(0)?, r.get::<_, i64>(1)? as usize)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        out.sort_by_key(|(s, _)| s.board_rank());
+        Ok(out)
+    }
+
     /// The number of boards listed by `board(project: "all")`.
     ///
     /// Capped for the same reason everything else is, but this one is worse: its cost

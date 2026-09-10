@@ -121,11 +121,16 @@
   .pick input, dialog .pick input { width: auto; margin: 0; }
   .reporow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 7px 0; border-bottom: 1px solid var(--line); }
   .reporow .p { color: var(--dim2); font-size: 11px; word-break: break-all; flex: 1 1 200px; }
+  .board { color: var(--idea); font-weight: 600; }
+  /* `.ws` and friends set `display`, which beats the UA's rule for [hidden]; this keeps
+     `el.hidden = true` meaning what it says everywhere. */
+  [hidden] { display: none !important; }
 </style>
 
 <header>
   <h1>ai-kanban</h1>
   <select id="project"></select>
+  <button id="newboard" title="a board for a project, e.g. a Planio project">+ board</button>
   <button id="repobtn" title="the local checkouts this board's tickets live in">repos</button>
   <label class="ws">working in <select id="workstream"></select></label>
   <span id="live">connecting</span>
@@ -148,7 +153,8 @@
       <select name="priority"></select>
       <select name="status"></select>
     </div>
-    <label class="ws wsfield">joins workstream <select name="workstream"></select></label>
+    <label class="ws wsfield" id="newboardfield" hidden>on board <select name="board"></select></label>
+    <label class="ws wsfield" id="newwsfield">joins workstream <select name="workstream"></select></label>
     <input name="planio" placeholder="planio ticket # (optional)" style="margin-top:10px">
     <div class="dim2" style="font-size:11px">repos this touches</div>
     <div id="newrepos" class="row" style="margin-top:4px"></div>
@@ -168,6 +174,14 @@ let META = null, PROJECT = null, CURSOR = 0, BOARD = null, SKEW = 0, OPEN_TASK =
 let EXPANDED = {};
 // Board name -> id. Recall hits name their project; every other call needs the id.
 const PROJECTS = new Map();
+// The picker's value for the All Projects view. Every other value is a board id.
+const ALL = 'all';
+function isAll() { return PROJECT === ALL; }
+// Every board, most recently active first -- {id, name, open} -- for pickers that need ids.
+let BOARDS = [];
+// The live stream. Replaced whenever the view changes, since it is filtered by board.
+let ES = null;
+function tasksUrl() { return isAll() ? '/api/all/tasks' : `/api/projects/${PROJECT}/tasks`; }
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -233,7 +247,7 @@ function fillSelect(el, values, selected) {
 
 async function loadBoard() {
   if (!PROJECT) return;
-  const { body } = await api(`/api/projects/${PROJECT}/board`);
+  const { body } = await api(isAll() ? '/api/all/board' : `/api/projects/${PROJECT}/board`);
   BOARD = body;
   // Reset, not merged: a board reload is the authoritative set for what it lists, and
   // keeping stale entries would show a tag on a task it was removed from.
@@ -260,7 +274,7 @@ async function restoreExpanded() {
     const want = EXPANDED[col.status];
     if (!want || want <= col.tasks.length) continue;
     try {
-      const { body } = await api(`/api/projects/${PROJECT}/tasks`
+      const { body } = await api(tasksUrl()
         + `?status=${encodeURIComponent(col.status)}&limit=${Math.min(want, 200)}`);
       col.tasks = body.tasks;
       col.next = body.next;
@@ -318,10 +332,21 @@ let REPOS_OPEN = false;
 
 // "no repo set" only on a board that tracks repos, and only on open work -- the rule the
 // agent's board line follows, so the two views never disagree about which tickets need one.
+// Whether the task's own board tracks repos. In one board's view that is the board on
+// screen; in All Projects each card answers by its own board's rule.
+function tracksRepos(t) {
+  return isAll() ? (BOARD.boards_with_repos || []).includes(t.project_id) : (BOARD.repos || []).length > 0;
+}
+
+function boardName(pid) {
+  const p = (BOARD.projects || []).find(x => x.id === pid);
+  return p ? p.name : `board ${pid}`;
+}
+
 function repoChips(t) {
   const l = linksOf(t.id);
   let out = l.repos.map(r => `<span class="repo">${esc(r)}</span>`).join('');
-  if (!l.repos.length && (BOARD.repos || []).length && META.open_statuses.includes(t.status)) {
+  if (!l.repos.length && tracksRepos(t) && META.open_statuses.includes(t.status)) {
     out += '<span class="norepo">no repo set</span>';
   }
   if (l.planio) out += `<span class="planio">planio ${l.planio}</span>`;
@@ -339,8 +364,7 @@ function parsePlanio(raw) {
 
 // Checkboxes rather than a free-text field: a ticket can only name repos this board owns,
 // and a typed name that almost matches is exactly the error a picker cannot make.
-function repoPicker(selected) {
-  const list = (BOARD && BOARD.repos) || [];
+function repoPicker(selected, list = (BOARD && BOARD.repos) || []) {
   if (!list.length) return '<span class="dim2">no repos on this board yet — add them under “repos”</span>';
   return list.map(r => `<label class="pick"><input type="checkbox" value="${r.repo.id}"${
     selected.includes(r.repo.id) ? ' checked' : ''}>${esc(r.repo.name)}</label>`).join('');
@@ -357,11 +381,16 @@ function blockerDone(id) {
 function render() {
   const b = BOARD;
   renderWorkstream();
+  // Both belong to ONE board: the repos menu manages a board's repos, and a workstream is a
+  // slice of a board. All Projects has neither to offer.
+  $('#repobtn').hidden = isAll();
+  $('#workstream').closest('label').hidden = isAll();
   $('#columns').innerHTML = b.columns.map(col => {
     const cards = col.tasks.map(t => `
-      <div class="card ${esc(t.task_type)}" data-id="${t.id}">
+      <div class="card ${esc(t.task_type)}" data-id="${t.id}" data-pid="${t.project_id}">
         <span class="t">#${t.id} ${esc(t.title)}</span>
         <span class="m">
+          ${isAll() ? `<span class="board">${esc(boardName(t.project_id))}</span>` : ''}
           <span>${esc(t.task_type)}</span>
           ${t.priority !== 'normal' ? `<span class="pri-${esc(t.priority)}">${esc(t.priority)}</span>` : ''}
           ${t.origin === 'user' ? '<span class="badge-user">user</span>' : ''}
@@ -395,7 +424,7 @@ function render() {
   }).join('');
 
   document.querySelectorAll('.card').forEach(c =>
-    c.onclick = () => openTask(Number(c.dataset.id)));
+    c.onclick = () => openTask(Number(c.dataset.id), Number(c.dataset.pid)));
   document.querySelectorAll('[data-more]').forEach(b =>
     b.onclick = () => loadMore(b.dataset.more));
 }
@@ -411,7 +440,7 @@ async function loadMore(status) {
   const col = BOARD && BOARD.columns.find(c => c.status === status);
   if (!col || !col.next) return;
   try {
-    const { body } = await api(`/api/projects/${PROJECT}/tasks`
+    const { body } = await api(tasksUrl()
       + `?status=${encodeURIComponent(status)}&cursor=${encodeURIComponent(col.next)}`);
     col.tasks = col.tasks.concat(body.tasks);
     col.next = body.next;
@@ -448,9 +477,18 @@ $('#workstream').onchange = e => setWorkstream(e.target.value);
 
 // ---- task detail -----------------------------------------------------------
 
-async function openTask(id) {
-  const { body, etag } = await api(`/api/projects/${PROJECT}/tasks/${id}`);
-  OPEN_TASK = { id, version: body.task.version, etag };
+// `pid` is the task's board. In one board's view that is the board on screen; in All Projects
+// every card carries its own, and cards inside the panel (blocker, blocking) share the open
+// task's.
+async function openTask(id, pid) {
+  pid = pid || (isAll() ? OPEN_TASK && OPEN_TASK.pid : PROJECT);
+  const { body, etag } = await api(`/api/projects/${pid}/tasks/${id}`);
+  // A task can only name its OWN board's repos. In one board's view they came with the
+  // board; in All Projects there is no one board on screen, so they are asked for.
+  const boardRepos = isAll()
+    ? (await api(`/api/projects/${pid}/repos`)).body.repos
+    : (BOARD.repos || []);
+  OPEN_TASK = { id, pid, version: body.task.version, etag };
   REPOS_OPEN = false;
   const t = body.task;
 
@@ -461,7 +499,7 @@ async function openTask(id) {
       <button id="close">close</button>
     </div>
     <div class="m dim2" style="font-size:11px">
-      ${esc(t.task_type)} · ${esc(t.origin)} · v${t.version}<br>
+      board ${esc(body.project.name)} · ${esc(t.task_type)} · ${esc(t.origin)} · v${t.version}<br>
       created ${ago(t.created_at)} ago · updated ${ago(t.updated_at)} ago${lastActivity(body.events) !== null
         ? ` · last activity ${ago(lastActivity(body.events))} ago` : ''}
     </div>
@@ -482,6 +520,10 @@ async function openTask(id) {
       <div class="row" style="margin-top:7px">
         <input id="planio" size="16" placeholder="planio ticket #">
         <span id="repopick" class="row"></span>
+      </div>
+      <div class="row" style="margin-top:7px">
+        <select id="moveto"></select>
+        <button id="move">move to board</button>
       </div>
     </section>
 
@@ -530,10 +572,17 @@ async function openTask(id) {
     body.workstream ? body.workstream.name : '');
   $('#tags').value = (body.tags || []).join(', ');
   $('#planio').value = body.planio || '';
-  $('#repopick').innerHTML = repoPicker((body.repos || []).map(r => r.id));
+  $('#repopick').innerHTML = repoPicker((body.repos || []).map(r => r.id), boardRepos);
+  // Workstreams are slices of ONE board; All Projects has none to offer.
+  $('#ws').hidden = isAll();
+  const others = BOARDS.filter(b => b.id !== pid);
+  $('#moveto').innerHTML = '<option value="">move to…</option>'
+    + others.map(b => `<option value="${b.id}">${esc(b.name)}</option>`).join('');
+  $('#move').hidden = $('#moveto').hidden = !others.length;
   $('#panel').hidden = false;
   $('#close').onclick = () => { $('#panel').hidden = true; OPEN_TASK = null; };
   $('#save').onclick = () => saveTask(id);
+  $('#move').onclick = () => moveTask(id);
   $('#forget').onclick = () => forgetTask(id, t.title);
   $('#panel').querySelectorAll('.card').forEach(c =>
     c.onclick = () => openTask(Number(c.dataset.id)));
@@ -542,8 +591,9 @@ async function openTask(id) {
 async function saveTask(id) {
   const planio = parsePlanio($('#planio').value);
   if (planio === null) { fail('planio: expected a ticket number, e.g. 48213'); return; }
+  const pid = OPEN_TASK.pid;
   try {
-    await api(`/api/projects/${PROJECT}/tasks/${id}`, {
+    await api(`/api/projects/${pid}/tasks/${id}`, {
       method: 'PATCH',
       // The version this edit is based on. Without it the server refuses the write rather
       // than silently overwriting a change made while the panel was open.
@@ -553,7 +603,8 @@ async function saveTask(id) {
         priority: $('#pr').value,
         // Always sent: the control shows the task's current workstream, so leaving it
         // alone and moving it are both explicit rather than one being an omission.
-        workstream: $('#ws').value,
+        // Not sent from All Projects, where the control is hidden: absent leaves it alone.
+        workstream: isAll() ? undefined : $('#ws').value,
         // Always sent, like `workstream`: the field shows the current set, so clearing it
         // and leaving it alone are both explicit rather than one being an omission.
         tags: $('#tags').value.split(',').map(t => t.trim()).filter(Boolean),
@@ -565,17 +616,39 @@ async function saveTask(id) {
       }),
     });
     await loadBoard();
-    await openTask(id);
+    await openTask(id, pid);
   } catch (e) {
     fail(e.message);
-    if (e.code === 'conflict') { await loadBoard(); await openTask(id); }
+    if (e.code === 'conflict') { await loadBoard(); await openTask(id, pid); }
+  }
+}
+
+// Moves the ticket, history and all. The reason typed into "why" goes with it.
+async function moveTask(id) {
+  const to = Number($('#moveto').value);
+  if (!to) return;
+  const pid = OPEN_TASK.pid;
+  try {
+    await api(`/api/projects/${pid}/tasks/${id}/move`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'if-match': `"${OPEN_TASK.version}"` },
+      body: JSON.stringify({ to, log: $('#log').value || null }),
+    });
+    await refreshProjects();
+    await loadBoard();
+    // In one board's view the ticket has just left the screen; in All Projects it is still
+    // there, now under its new board.
+    if (isAll()) { await openTask(id, to); } else { $('#panel').hidden = true; OPEN_TASK = null; }
+  } catch (e) {
+    fail(e.message);
+    if (e.code === 'conflict') { await loadBoard(); await openTask(id, pid); }
   }
 }
 
 async function forgetTask(id, title) {
   if (!confirm(`Permanently forget #${id} "${title}" and its history?\n\nThis cannot be undone.`)) return;
   try {
-    await api(`/api/projects/${PROJECT}/tasks/${id}`, { method: 'DELETE' });
+    await api(`/api/projects/${OPEN_TASK.pid}/tasks/${id}`, { method: 'DELETE' });
     $('#panel').hidden = true;
     OPEN_TASK = null;
     await loadBoard();
@@ -628,9 +701,11 @@ async function runSearch(q) {
 // inline would leave the old EventSource attached to the previous board.
 async function openHit(h) {
   try {
+    const hitBoard = PROJECTS.get(h.project);
     const here = BOARD && BOARD.project && BOARD.project.name;
-    if (h.project !== here) {
-      const id = PROJECTS.get(h.project);
+    // All Projects already shows every board, so a hit opens in place.
+    if (!isAll() && h.project !== here) {
+      const id = hitBoard;
       if (!id) { fail(`board "${h.project}" is not in the picker`); return; }
       const sel = $('#project');
       sel.value = String(id);
@@ -645,7 +720,7 @@ async function openHit(h) {
     // openTask is otherwise only reached from a card that provably exists. From a search
     // result the task may have been forgotten since it was indexed, so a 404 is reachable
     // and would otherwise surface as nothing at all.
-    await openTask(h.task_id);
+    await openTask(h.task_id, hitBoard);
   } catch (e) { fail(e.message); }
 }
 
@@ -653,29 +728,51 @@ async function openHit(h) {
 
 // The only place repos are registered. The agent names repos on tickets but never adds one:
 // registering changes which board a directory resolves to, which is a person's decision.
-function openRepos() {
+async function openRepos() {
   REPOS_OPEN = true;
   OPEN_TASK = null;
   const list = BOARD.repos || [];
+  // Repos on other boards, which this one can share. Asked for each time the menu opens:
+  // another board may have added one since.
+  let shareable = [];
+  try {
+    const { body } = await api('/api/repos');
+    const here = new Set(list.map(r => r.repo.id));
+    shareable = body.repos.filter(x => !here.has(x.repo.id));
+  } catch (e) { fail(e.message); }
+  const me = BOARD.project.id;
   $('#panel').innerHTML = `
     <div class="row" style="justify-content:space-between">
       <h2>repos · ${esc(BOARD.project.name)}</h2>
       <button id="close">close</button>
     </div>
     <div class="dim2" style="font-size:11px">
-      The local checkouts this board's tickets live in. An agent opening any of them lands on
-      this board, and an open ticket naming none of them shows “no repo set”.
+      The local checkouts this board's tickets live in. A repo can be on several boards, but its
+      folder opens on one of them, its home: that is where an agent opening it lands. An open
+      ticket naming none of this board's repos shows “no repo set”.
     </div>
-    <section><h3>registered</h3>${list.map(r => `
+    <section><h3>on this board</h3>${list.map(r => {
+      const home = r.repo.home_project_id === me;
+      return `
       <div class="reporow">
         <b>${esc(r.repo.name)}</b>
-        <span class="p">${esc(r.repo.path)}</span>
+        <span class="p">${esc(r.repo.path)}<br>${home ? 'opens here' : `opens on ${esc(r.home_board)}`}${
+          r.other_boards.length ? ` · also on ${r.other_boards.map(esc).join(', ')}` : ''}</span>
         <span class="dim2">${r.open} open / ${r.total} tickets</span>
+        ${home ? '' : `<button data-home="${r.repo.id}" title="open this folder on this board from now on">make home</button>`}
         <button data-rename="${r.repo.id}">rename</button>
         <button class="danger" data-remove="${r.repo.id}">remove</button>
-      </div>`).join('') || '<div class="empty">none yet</div>'}
+      </div>`;
+    }).join('') || '<div class="empty">none yet</div>'}
     </section>
-    <section><h3>add</h3>
+    ${shareable.length ? `<section><h3>share one from another board</h3>
+      <div class="row">
+        <select id="rshare" class="grow">${shareable.map(x =>
+          `<option value="${esc(x.repo.path)}">${esc(x.repo.name)} (opens on ${esc(x.home_board)})</option>`).join('')}</select>
+        <button id="rshareadd">add</button>
+      </div>
+    </section>` : ''}
+    <section><h3>add a checkout</h3>
       <div class="row">
         <input id="rpath" class="grow" placeholder="~/work/eee-web or an absolute path">
         <input id="rname" size="14" placeholder="name (optional)">
@@ -686,6 +783,9 @@ function openRepos() {
   $('#close').onclick = () => { $('#panel').hidden = true; REPOS_OPEN = false; };
   $('#radd').onclick = addRepo;
   $('#rpath').onkeydown = e => { if (e.key === 'Enter') addRepo(); };
+  if ($('#rshareadd')) $('#rshareadd').onclick = () => postRepo($('#rshare').value, null);
+  $('#panel').querySelectorAll('[data-home]').forEach(b =>
+    b.onclick = () => makeHome(Number(b.dataset.home)));
   $('#panel').querySelectorAll('[data-rename]').forEach(b =>
     b.onclick = () => renameRepo(Number(b.dataset.rename)));
   $('#panel').querySelectorAll('[data-remove]').forEach(b =>
@@ -696,18 +796,32 @@ async function repoWrite(path, opts) {
   try {
     await api(path, opts);
     await loadBoard();
-    openRepos();
+    await openRepos();
   } catch (e) { fail(e.message); }
+}
+
+// A path that is already a repo somewhere is shared rather than refused: it joins this
+// board, and its folder keeps opening where it did.
+function postRepo(path, name) {
+  return repoWrite(`/api/projects/${PROJECT}/repos`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path, name }),
+  });
 }
 
 function addRepo() {
   const path = $('#rpath').value.trim();
   if (!path) return;
-  return repoWrite(`/api/projects/${PROJECT}/repos`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ path, name: $('#rname').value.trim() || null }),
-  });
+  return postRepo(path, $('#rname').value.trim() || null);
+}
+
+function makeHome(id) {
+  const r = BOARD.repos.find(x => x.repo.id === id);
+  if (!confirm(`Open "${r ? r.repo.name : id}" on this board from now on?\n\n`
+    + `An agent opening that folder will land here instead of on ${r ? r.home_board : 'its current board'}. `
+    + `History already written stays where it is.`)) return;
+  return repoWrite(`/api/projects/${PROJECT}/repos/${id}/home`, { method: 'PUT' });
 }
 
 function renameRepo(id) {
@@ -724,31 +838,56 @@ function renameRepo(id) {
 function removeRepo(id) {
   const r = BOARD.repos.find(x => x.repo.id === id);
   const n = r ? r.total : 0;
-  // Says both consequences, because the second is the surprising one: the folder keeps
-  // resolving here, so removing a repo never strands its history on a new empty board.
+  const home = r && r.repo.home_project_id === BOARD.project.id;
+  // Says what happens to the folder, because that is the surprising half: it never ends up
+  // opening on a new empty board.
+  const folder = !home ? `Its folder keeps opening on ${r ? r.home_board : 'its home'}.`
+    : r.other_boards.length ? 'Its folder will open on one of its other boards instead.'
+    : 'The folder keeps resolving to this board.';
   if (!confirm(`Remove repo "${r ? r.repo.name : id}" from this board?\n\n`
-    + `It comes off ${n} ticket${n === 1 ? '' : 's'}. The folder keeps resolving to this board.`)) return;
+    + `It comes off ${n} ticket${n === 1 ? '' : 's'} here. ${folder}`)) return;
   return repoWrite(`/api/projects/${PROJECT}/repos/${id}`, { method: 'DELETE' });
 }
 
-$('#repobtn').onclick = () => { if (BOARD) openRepos(); };
+$('#repobtn').onclick = () => { if (BOARD && !isAll()) openRepos(); };
 
 // ---- new task --------------------------------------------------------------
 
-$('#new').onclick = () => {
+function boardOptions(selected) {
+  return BOARDS.map(b => `<option value="${b.id}"${b.id === selected ? ' selected' : ''}>${esc(b.name)}</option>`).join('');
+}
+
+async function fillNewRepos(pid) {
+  try {
+    const { body } = await api(`/api/projects/${pid}/repos`);
+    $('#newrepos').innerHTML = repoPicker([], body.repos);
+  } catch (e) { fail(e.message); }
+}
+
+$('#new').onclick = async () => {
+  if (!BOARDS.length) { fail('Create a board first with “+ board”.'); return; }
   const f = $('#newdlg form');
-  fillSelect(f.type, META.types, 'task');
-  fillSelect(f.priority, META.priorities, 'normal');
-  fillSelect(f.status, META.open_statuses, 'backlog');
   f.reset();
   fillSelect(f.type, META.types, 'task');
   fillSelect(f.priority, META.priorities, 'normal');
   fillSelect(f.status, META.open_statuses, 'backlog');
-  // Prefilled with the board's current workstream and shown, never silent. A task landing
-  // in a scope the person could not see is the whole bug this UI change exists to fix.
-  f.workstream.innerHTML = workstreamOptions('no workstream (general)',
-    BOARD && BOARD.workstream ? BOARD.workstream.name : '');
-  $('#newrepos').innerHTML = repoPicker([]);
+  // In All Projects there is no board on screen, so the dialog asks which one -- and shows no
+  // workstream, which only exists inside one board. The ticket then inherits that board's
+  // current workstream, as the agent's filing does.
+  const all = isAll();
+  $('#newboardfield').hidden = !all;
+  $('#newwsfield').hidden = all;
+  if (all) {
+    f.board.innerHTML = boardOptions(BOARDS[0].id);
+    f.board.onchange = () => fillNewRepos(Number(f.board.value));
+    await fillNewRepos(Number(f.board.value));
+  } else {
+    // Prefilled with the board's current workstream and shown, never silent. A task landing
+    // in a scope the person could not see is the whole bug this UI change exists to fix.
+    f.workstream.innerHTML = workstreamOptions('no workstream (general)',
+      BOARD && BOARD.workstream ? BOARD.workstream.name : '');
+    $('#newrepos').innerHTML = repoPicker([]);
+  }
   $('#newdlg').showModal();
 };
 
@@ -759,23 +898,44 @@ $('#newdlg').addEventListener('close', async () => {
   if (!f.title.value.trim()) return;
   const planio = parsePlanio(f.planio.value);
   if (planio === null) { fail('planio: expected a ticket number, e.g. 48213'); return; }
+  const pid = isAll() ? Number(f.board.value) : PROJECT;
   try {
-    await api(`/api/projects/${PROJECT}/tasks`, {
+    await api(`/api/projects/${pid}/tasks`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         title: f.title.value, body: f.body.value,
         type: f.type.value, priority: f.priority.value, status: f.status.value,
-        // Always sent, including as "" for general work: the field is on screen, so the
-        // choice shown is the choice made. Omitting it would silently re-inherit.
-        workstream: f.workstream.value,
+        // Always sent in one board's view, including as "" for general work: the field is on
+        // screen, so the choice shown is the choice made. Omitted in All Projects, where
+        // there is no field and the board's current workstream is inherited.
+        workstream: isAll() ? undefined : f.workstream.value,
         repos: pickedRepos($('#newrepos')),
         planio,
       }),
     });
+    await refreshProjects();
     await loadBoard();
   } catch (e) { fail(e.message); }
 });
+
+// ---- boards ----------------------------------------------------------------
+
+// A board for a project that is not one folder -- a Planio project, a customer. The repos
+// added to it in the repos menu are how agents reach it.
+$('#newboard').onclick = async () => {
+  const name = prompt('New board name (for example the Planio project)');
+  if (!name || !name.trim()) return;
+  try {
+    const { body } = await api('/api/projects', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: name.trim() }),
+    });
+    await refreshProjects(body.project.id);
+    await onProjectChange();
+  } catch (e) { fail(e.message); }
+};
 
 // ---- live updates ----------------------------------------------------------
 
@@ -783,7 +943,7 @@ $('#newdlg').addEventListener('close', async () => {
 // docs/http-api.md for why that is cheaper than maintaining a second representation of
 // every mutation.
 function connect() {
-  const es = new EventSource(`/api/stream?project=${PROJECT}`);
+  const es = new EventSource(isAll() ? '/api/stream' : `/api/stream?project=${PROJECT}`);
   const mark = (on, text) => { $('#live').className = on ? 'on' : ''; $('#live').textContent = text; };
 
   es.onopen = () => mark(true, 'live');
@@ -791,8 +951,10 @@ function connect() {
   const onChange = async ev => {
     const d = JSON.parse(ev.data);
     if (d.reset || d.cursor > CURSOR) {
+      // The picker's "(N open)" counts move with every change, on any board.
+      try { await refreshProjects(); } catch { /* the board itself still refreshes */ }
       await loadBoard();
-      if (OPEN_TASK) { try { await openTask(OPEN_TASK.id); } catch { /* it may be gone */ } }
+      if (OPEN_TASK) { try { await openTask(OPEN_TASK.id, OPEN_TASK.pid); } catch { /* it may be gone */ } }
       // Counts in the menu change whenever an agent links a ticket, so it redraws too.
       else if (REPOS_OPEN) openRepos();
     }
@@ -805,34 +967,50 @@ function connect() {
 
 // ---- boot ------------------------------------------------------------------
 
+// Rebuilds the board picker from /api/projects. `select` is what it shows afterwards -- a
+// board just created -- and defaults to what is on screen.
+async function refreshProjects(select) {
+  const { body } = await api('/api/projects');
+  BOARDS = body.projects.map(p => ({ id: p.project.id, name: p.project.name, open: p.open }));
+  PROJECTS.clear();
+  BOARDS.forEach(b => PROJECTS.set(b.name, b.id));
+  const total = BOARDS.reduce((n, b) => n + b.open, 0);
+  const sel = $('#project');
+  sel.innerHTML = `<option value="${ALL}">All projects (${total} open)</option>`
+    + BOARDS.map(b => `<option value="${b.id}">${esc(b.name)} (${b.open} open)</option>`).join('');
+  sel.value = String(select ?? PROJECT ?? '');
+}
+
+async function onProjectChange() {
+  const sel = $('#project');
+  PROJECT = sel.value === ALL ? ALL : Number(sel.value);
+  history.replaceState(null, '', `?project=${PROJECT}`);
+  $('#panel').hidden = true;
+  REPOS_OPEN = false;
+  OPEN_TASK = null;
+  EXPANDED = {};
+  if (ES) ES.close();
+  await loadBoard();
+  ES = connect();
+}
+
 (async function boot() {
   try {
     META = (await api('/api/meta')).body;
-    const { body } = await api('/api/projects');
-    if (!body.projects.length) {
-      $('#columns').innerHTML = '<div class="empty">No boards yet. An agent creates one the first time it uses ai-kanban in a project.</div>';
+    await refreshProjects(null);
+    const sel = $('#project');
+    sel.onchange = onProjectChange;
+    if (!BOARDS.length) {
+      $('#columns').innerHTML = '<div class="empty">No boards yet. Create one with “+ board”, or an agent creates one the first time it uses ai-kanban in a project.</div>';
       return;
     }
-    const sel = $('#project');
-    sel.innerHTML = body.projects.map(p =>
-      `<option value="${p.project.id}">${esc(p.project.name)} (${p.open} open)</option>`).join('');
-    body.projects.forEach(p => PROJECTS.set(p.project.name, p.project.id));
-
+    // The board named in the URL, else the most recently active one. All Projects is one
+    // click away rather than the default, because most visits are about one project.
     const wanted = new URLSearchParams(location.search).get('project');
-    if (wanted && body.projects.some(p => String(p.project.id) === wanted)) sel.value = wanted;
-    PROJECT = Number(sel.value);
-
-    let es = connect();
-    sel.onchange = async () => {
-      PROJECT = Number(sel.value);
-      history.replaceState(null, '', `?project=${PROJECT}`);
-      $('#panel').hidden = true;
-      REPOS_OPEN = false;
-      EXPANDED = {};
-      es.close();
-      await loadBoard();
-      es = connect();
-    };
+    const known = wanted === ALL || BOARDS.some(b => String(b.id) === wanted);
+    sel.value = known ? wanted : String(BOARDS[0].id);
+    PROJECT = sel.value === ALL ? ALL : Number(sel.value);
+    ES = connect();
 
     await loadBoard();
     // Re-render once a minute so relative times stay honest on an idle board.

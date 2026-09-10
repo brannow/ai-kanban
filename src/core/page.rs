@@ -96,6 +96,25 @@ impl Store {
         &self, project_id: i64, statuses: &[Status], cursor: Option<Cursor>, limit: usize,
         workstream: Option<i64>,
     ) -> Result<Page<Task>> {
+        self.tasks_page_scoped(Some(project_id), statuses, cursor, limit, workstream)
+    }
+
+    /// Every board's tasks in one listing, for the person's All Projects view. No workstream:
+    /// a workstream is a slice of ONE board, and has no meaning across several.
+    pub fn tasks_page_all(&self, statuses: &[Status], cursor: Option<Cursor>, limit: usize) -> Result<Page<Task>> {
+        self.tasks_page_scoped(None, statuses, cursor, limit, None)
+    }
+
+    fn tasks_page_scoped(
+        &self, project_id: Option<i64>, statuses: &[Status], cursor: Option<Cursor>, limit: usize,
+        workstream: Option<i64>,
+    ) -> Result<Page<Task>> {
+        // `?1 IS NULL` rather than dropping the clause when unscoped, so `?1` stays referenced
+        // and every later placeholder keeps its number -- `after()` depends on ?3 and ?4.
+        let project = match project_id {
+            Some(_) => "project_id = ?1",
+            None => "?1 IS NULL",
+        };
         let filter = if statuses.is_empty() {
             String::new()
         } else {
@@ -114,7 +133,7 @@ impl Store {
             None => String::new(),
         };
         let sql = format!(
-            "SELECT {TASK_COLS} FROM tasks WHERE project_id = ?1{filter}{ws}{}
+            "SELECT {TASK_COLS} FROM tasks WHERE {project}{filter}{ws}{}
              ORDER BY updated_at DESC, id DESC LIMIT ?2",
             after("updated_at", cursor)
         );

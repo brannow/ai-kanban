@@ -207,12 +207,14 @@ pub struct WorkstreamSummary {
 // Repos
 // ---------------------------------------------------------------------------
 
-/// A local checkout the board's work happens in. A board owns its repos -- see migration
-/// 007 for why that is the board and not the repo being a board of its own.
+/// A local checkout boards' work happens in. Tied to any number of boards; see migrations
+/// 007 and 008 for why boards own repos and why each repo still has exactly one home.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Repo {
     pub id: i64,
-    pub project_id: i64,
+    /// The board its folder resolves to -- where an agent opening it lands. Always one of
+    /// the boards the repo is on.
+    pub home_project_id: i64,
     /// Normalized, so the spelling an agent types matches the one a person registered.
     pub name: String,
     /// Canonical absolute path. What tells an agent where the work actually is.
@@ -220,12 +222,17 @@ pub struct Repo {
     pub created_at: i64,
 }
 
-/// One row of the repos menu: a repo and how many tickets touch it.
+/// One row of a board's repos menu.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoSummary {
     pub repo: Repo,
+    /// Tickets on THIS board naming the repo. Other boards' tickets are theirs to count.
     pub open: usize,
     pub total: usize,
+    /// Named, so the menu can say where the folder opens without a second lookup.
+    pub home_board: String,
+    /// The other boards it is on.
+    pub other_boards: Vec<String>,
 }
 
 /// What a listed task links to: the repos it touches and the Planio ticket it tracks.

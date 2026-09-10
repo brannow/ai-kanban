@@ -482,3 +482,51 @@ async fn repos_are_registered_linked_and_cleared_through_the_api() {
     let (_, list, _) = call(&api, get(&format!("/api/projects/{pid}/repos"))).await;
     assert_eq!(list["repos"], serde_json::json!([]));
 }
+
+#[tokio::test]
+async fn boards_are_created_tickets_move_and_all_projects_shows_every_board() {
+    let (api, pid) = api();
+
+    let (status, body, _) = call(&api, json_req("POST", "/api/projects", serde_json::json!({ "name": "BMUKN" }), None)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let bid = body["project"]["id"].as_i64().unwrap();
+    let (status, _, _) = call(&api, json_req("POST", "/api/projects", serde_json::json!({ "name": "bmukn" }), None)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a name another board has is refused");
+
+    let tid = api.store().create_task(pid, TaskDraft::new("Rework header slider")).unwrap().id;
+    let (_, _, etag) = call(&api, get(&format!("/api/projects/{pid}/tasks/{tid}"))).await;
+    let version = etag.unwrap().trim_matches('"').to_string();
+    let (status, body, _) = call(&api, json_req(
+        "POST", &format!("/api/projects/{pid}/tasks/{tid}/move"),
+        serde_json::json!({ "to": bid, "log": "belongs to BMUKN" }), Some(&version),
+    )).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["project"]["name"], "BMUKN");
+    let (status, _, _) = call(&api, get(&format!("/api/projects/{pid}/tasks/{tid}"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "it left the old board");
+
+    let (status, all, _) = call(&api, get("/api/all/board")).await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(all["projects"].as_array().unwrap().len(), 2);
+    assert_eq!(all["columns"][0]["status"], "backlog");
+    let listed: Vec<i64> = all["columns"].as_array().unwrap().iter()
+        .flat_map(|c| c["tasks"].as_array().unwrap().iter().map(|t| t["id"].as_i64().unwrap()))
+        .collect();
+    assert!(listed.contains(&tid), "every board's tickets: {all}");
+
+    // Sharing a repo leaves its home alone; moving the home is its own step.
+    let checkout = tempfile::tempdir().unwrap();
+    let (_, body, _) = call(&api, json_req("POST", &format!("/api/projects/{pid}/repos"),
+        serde_json::json!({ "path": checkout.path() }), None)).await;
+    let rid = body["repo"]["id"].as_i64().unwrap();
+    let (status, body, _) = call(&api, json_req("POST", &format!("/api/projects/{bid}/repos"),
+        serde_json::json!({ "path": checkout.path() }), None)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["repo"]["home_project_id"], pid);
+    let (status, body, _) = call(&api, Request::builder().method("PUT")
+        .uri(format!("/api/projects/{bid}/repos/{rid}/home")).body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["repo"]["home_project_id"], bid);
+    let (_, repos, _) = call(&api, get("/api/repos")).await;
+    assert_eq!(repos["repos"][0]["home_board"], "BMUKN");
+}

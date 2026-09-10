@@ -18,7 +18,7 @@ pub mod stream;
 use crate::core::{Error, Store};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use std::sync::{Arc, Mutex};
 
@@ -46,12 +46,17 @@ pub fn router(api: Api) -> Router {
     Router::new()
         .route("/", get(|| async { axum::response::Html(INDEX) }))
         .route("/api/meta", get(routes::meta))
-        .route("/api/projects", get(routes::projects))
+        .route("/api/projects", get(routes::projects).post(routes::create_board))
+        .route("/api/all/board", get(routes::all_board))
+        .route("/api/all/tasks", get(routes::all_tasks))
+        .route("/api/repos", get(routes::all_repos))
         .route("/api/projects/{p}", get(routes::project))
         .route("/api/projects/{p}/board", get(routes::board))
         .route("/api/projects/{p}/workstream", put(routes::set_workstream))
         .route("/api/projects/{p}/repos", get(routes::repos).post(routes::create_repo))
         .route("/api/projects/{p}/repos/{r}", patch(routes::update_repo).delete(routes::delete_repo))
+        .route("/api/projects/{p}/repos/{r}/home", put(routes::repo_home))
+        .route("/api/projects/{p}/tasks/{t}/move", post(routes::move_task))
         .route("/api/projects/{p}/tasks", get(routes::tasks).post(routes::create_task))
         .route("/api/projects/{p}/tasks/{t}", get(routes::task))
         .route("/api/projects/{p}/tasks/{t}", patch(routes::update_task))

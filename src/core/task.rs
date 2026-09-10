@@ -359,6 +359,94 @@ impl Store {
         self.task(project_id, id)
     }
 
+    /// Moves a task to another board. Its id stays -- ids are global -- and so does its
+    /// history: its events, and the notes written while working on it, travel with it.
+    ///
+    /// What only means something on the old board is dropped, and the history says so: a
+    /// blocker there (a cross-board `blocked_by` would render as an id the new board cannot
+    /// look up), its workstream, and any repo the new board does not have. Tasks on the old
+    /// board that this one blocked lose that annotation for the same reason.
+    pub fn move_task(
+        &self, project_id: i64, id: i64, to: i64, actor: Actor, log: Option<&str>,
+        expected_version: Option<i64>,
+    ) -> Result<Task> {
+        let before = self.task(project_id, id)?;
+        let target = self.project(to)?;
+        if to == project_id {
+            return Ok(before);
+        }
+        if let Some(v) = expected_version {
+            if v != before.version {
+                return Err(Error::Conflict { id, expected: v, actual: before.version });
+            }
+        }
+        let from = self.project(project_id)?;
+
+        let target_repos: Vec<i64> = self.repos(to)?.into_iter().map(|r| r.id).collect();
+        let dropped: Vec<Repo> = self.task_repos(project_id, id)?
+            .into_iter().filter(|r| !target_repos.contains(&r.id)).collect();
+        let mut lost = Vec::new();
+        if let Some(b) = before.blocked_by {
+            lost.push(format!("blocked by #{b}"));
+        }
+        if let Some(w) = self.task_workstream(project_id, id)? {
+            lost.push(format!("workstream \"{}\"", self.workstream(project_id, w)?.name));
+        }
+        if !dropped.is_empty() {
+            let names: Vec<&str> = dropped.iter().map(|r| r.name.as_str()).collect();
+            lost.push(format!("repos {} (not on this board)", names.join(", ")));
+        }
+        let blocking = self.tasks_blocked_by(project_id, id)?;
+
+        let tx = self.conn.unchecked_transaction()?;
+        self.conn.execute(
+            "UPDATE tasks SET project_id = ?2, blocked_by = NULL, workstream_id = NULL, updated_at = ?3,
+                    version = version + 1
+              WHERE id = ?1 AND project_id = ?4",
+            params![id, to, now(), project_id],
+        )?;
+        // Version bumped: these rows changed, and a form open on one of them must hear it.
+        self.conn.execute(
+            "UPDATE tasks SET blocked_by = NULL, version = version + 1 WHERE blocked_by = ?1 AND project_id = ?2",
+            params![id, project_id],
+        )?;
+        for r in &dropped {
+            self.conn.execute("DELETE FROM task_repos WHERE task_id = ?1 AND repo_id = ?2", params![id, r.id])?;
+        }
+        // Notes follow the task rather than staying behind detached: they were learned doing
+        // this work, and the work now lives on the other board.
+        self.conn.execute(
+            "UPDATE notes SET project_id = ?2 WHERE task_id = ?1 AND project_id = ?3",
+            params![id, to, project_id],
+        )?;
+        self.conn.execute("UPDATE events SET project_id = ?2 WHERE task_id = ?1", params![id, to])?;
+        self.conn.execute(
+            "UPDATE events SET project_id = ?2 WHERE note_id IN (SELECT id FROM notes WHERE task_id = ?1)",
+            params![id, to],
+        )?;
+
+        let left = if lost.is_empty() { String::new() } else { format!("; left behind: {}", lost.join(", ")) };
+        let body = match log.map(str::trim).filter(|l| !l.is_empty()) {
+            Some(l) => format!("{l} (moved from board \"{}\"{left})", from.name),
+            None => format!("moved here from board \"{}\"{left}", from.name),
+        };
+        self.write_event(to, Some(id), actor, "moved", &body)?;
+        // On the board it left, as project history: the task is no longer there to hang it on,
+        // and without this line a ticket simply vanishes from that board's record.
+        let unblocked = if blocking.is_empty() {
+            String::new()
+        } else {
+            let ids: Vec<String> = blocking.iter().map(|t| format!("#{}", t.id)).collect();
+            format!("; {} no longer blocked by it", ids.join(", "))
+        };
+        self.write_event(
+            project_id, None, actor, "moved_out",
+            &format!("#{id} {} moved to board \"{}\"{unblocked}", before.title, target.name),
+        )?;
+        tx.commit()?;
+        self.task(to, id)
+    }
+
     /// A task's workstream id. A query of its own because `workstream_id` is kept out of
     /// `TASK_COLS` -- see migration 005 -- so no `Task` carries it.
     pub fn task_workstream(&self, project_id: i64, id: i64) -> Result<Option<i64>> {

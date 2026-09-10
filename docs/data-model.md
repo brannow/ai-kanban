@@ -163,29 +163,50 @@ straight out of a 30-row limit — shipping the original failure with a new colu
 supposed to fix it. The trade, stated because it is real: an unscoped `doing` task now sorts
 below an active-workstream `backlog` one. Displaced work is counted, never dropped.
 
-### `repos` / `task_repos`, and `tasks.planio`
+### `repos` / `board_repos` / `task_repos`, and `tasks.planio`
 
-Added in migration 007. A **repo** is a local checkout the board's work happens in. A ticket
-names the repos it touches, and a repo carries many tickets.
+Added in migrations 007 and 008. A **repo** is a local checkout work happens in. A ticket names
+the repos it touches, a repo carries many tickets, and a repo can be on several boards.
 
-**A board owns its repos, rather than every repo being its own board.** A body of work — a
-customer, a product, a Planio project — spans several repositories, and a ticket in it touches
-some of them. With one board per repo, a ticket touching two has to live on one, and an agent
-opening the other never sees it. So registering a repo also registers its root as a
-`project_paths` alias: an agent opening *any* of the board's checkouts lands on the same board.
-`project_paths` already let a board own many directories; `repos` names which of them are
-repositories.
+**Boards own repos, rather than every repo being its own board.** A board is a body of work — a
+customer, a product, a Planio project — and it spans several repositories; a ticket in it
+touches some of them. With one board per repo, a ticket touching two has to live on one, and an
+agent opening the other never sees it. A repository can also serve more than one body of work —
+a shared library, a monorepo two projects deploy from — so repos are global and tied to boards
+through `board_repos`, many-to-many. 007 gave each repo one board; 008 replaced that the first
+time real use put one repo on two projects.
 
-**`repos.path` is unique across the store**, for the reason `project_paths.path` is a primary
-key: one directory resolves to exactly one board. Registering a directory another board already
-claims — at that path *or below it* — is refused with the owner named. Below matters:
-resolution checks the deepest alias first, so another board's `src/` alias would keep
-answering and the registration would silently not take effect. `merge` is the repair when both
-boards are the same work.
+**Exactly one home.** What cannot be shared is where a folder resolves: an agent opening a
+directory has to land on one board, the same one every time, or the folder reads a different
+memory on different days. So each repo has a **home** (`repos.home_project_id`) — the board its
+root's `project_paths` alias points at, always one of its boards. It starts as the first board
+the repo is added to. Adding the same checkout to another board *attaches* it and leaves the
+home alone; `set_repo_home` moves it, re-pointing the root alias and every subdirectory the old
+home learned (left behind, a learned `src/` alias would keep answering for the old home). When
+the home lets a repo go, the home passes to the earliest remaining board. "Most recently active
+board" was rejected: it makes resolution depend on the clock.
 
-**Removing a repo leaves its path alias in place.** Taking it out of the menu says it is no
-longer part of this work, not that its history belongs elsewhere. Dropping the alias would send
-the next session in that folder to a brand-new empty board.
+**`repos.path` and `repos.name` are unique across the store.** The path because one directory
+resolves to one board; the name because a repo is one thing seen from several boards, and
+`eee-api` must mean the same checkout on each. Registering a *new* checkout in a directory
+another board already claims — at that path *or below it* — is refused with the owner named.
+Below matters: resolution checks the deepest alias first, so another board's `src/` alias would
+keep answering and the registration would silently not take effect. `merge` is the repair when
+both boards are the same work.
+
+**Removing a repo from its last board leaves its path alias in place.** Taking it out of the
+menu says it is no longer part of this work, not that its history belongs elsewhere. Dropping
+the alias would send the next session in that folder to a brand-new empty board.
+
+**Boards can be created by name** (`create_board`, key `board:<name>`), for a project that is
+not one directory. Such a board has no path of its own; agents reach it through the repos it is
+home to. A name another board has is refused, because two boards with one name is what a split
+looks like.
+
+**A ticket can move between boards** (`move_task`). Task ids are global, so it keeps its id, and
+its events and the notes written on it move with it. What only means something on the old board
+— its blocker, its workstream, a repo the new board lacks, other tasks' `blocked_by` pointing at
+it — is dropped, and the `moved` event says what was left behind.
 
 **A ticket with no repo is flagged, not blocked.** `status` is authoritative and carries
 behaviour — the argument under `tags` below. A status forced by a rule is one the agent did not

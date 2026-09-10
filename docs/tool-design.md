@@ -384,3 +384,15 @@ They **are on the board line**, unlike tags:
 says so; on a board with no repos it never appears. `task_show` lists each repo with its path —
 the answer to "where is this work" — and on an unset one tells the agent to ask the user and
 record the answer with `task_update`.
+
+### Moving a ticket to another board
+
+`task_update(move_to: "BMUKN")` moves a ticket filed on the wrong board, with `log` saying why.
+It is a field on `task_update` rather than a tool of its own, for the reason the workstream move
+is: "move it, and say why" is the intent `task_update` already serves. The response is the
+board the ticket landed on. Its history and notes travel with it; its blocker, its workstream
+and any repo the new board lacks stay behind, and the history says which.
+
+Boards themselves are not created by the agent. A board named by a model is how one project
+quietly becomes two (`ai-kanban` today, `ai_kanban` tomorrow), so a person creates named boards
+in the web UI, and the agent reaches them through their repos.

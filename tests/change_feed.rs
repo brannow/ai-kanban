@@ -87,6 +87,21 @@ fn every_mutation_moves_the_change_cursor() {
 
     s.remove_repo(pid, r.id, Actor::User).unwrap();
     moved(&s, "removing a repo");
+
+    let board = s.create_board("BMUKN").unwrap();
+    moved(&s, "creating a board");
+
+    let shared_dir = dir.path().join("shared");
+    std::fs::create_dir_all(&shared_dir).unwrap();
+    let shared = s.add_repo(pid, &shared_dir, None, Actor::User).unwrap();
+    s.add_repo(board.id, &shared_dir, None, Actor::User).unwrap();
+    moved(&s, "sharing a repo with a second board");
+
+    s.set_repo_home(board.id, shared.id, Actor::User).unwrap();
+    moved(&s, "moving a repo's home");
+
+    s.move_task(pid, t.id, board.id, Actor::User, None, None).unwrap();
+    moved(&s, "moving a task to another board");
 }
 
 #[test]

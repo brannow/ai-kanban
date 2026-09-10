@@ -82,7 +82,13 @@ GET    /api/projects/{p}/events               ?cursor= &limit=   the history
 GET    /api/projects/{p}/repos                the repos menu: repos + ticket counts
 POST   /api/projects/{p}/repos                {path, name?} -> 201, Repo
 PATCH  /api/projects/{p}/repos/{r}            {name} -- rename only
-DELETE /api/projects/{p}/repos/{r}            off the board and off its tickets
+DELETE /api/projects/{p}/repos/{r}            off this board and this board's tickets
+PUT    /api/projects/{p}/repos/{r}/home       its folder opens on this board from now on
+POST   /api/projects                          {name} -> 201, a board created by name
+POST   /api/projects/{p}/tasks/{t}/move       {to, log} -- If-Match required
+GET    /api/repos                             every repo, with the board its folder opens on
+GET    /api/all/board                         All Projects: every board's tickets, one set of columns
+GET    /api/all/tasks                         ?status= &cursor= -- paging an All Projects column
 GET    /api/recall                            ?q= &project= &limit=
 GET    /api/stream                            SSE, live updates
 ```
@@ -447,13 +453,18 @@ Migration 007 (see `docs/data-model.md`). A board owns the local checkouts its t
 in, and the web UI's **repos** button is the only place they are registered.
 
 - `POST /repos` takes `{"path": "~/work/eee-web", "name": "eee-web"}`. `~/` is expanded here,
-  because that is how a person types a path. The name defaults to the folder's and is
-  normalized. Registering a path twice returns the existing repo. A directory another board
+  because that is how a person types a path. The name defaults to the folder's, is normalized,
+  and is unique across the store. A path that is already a repo — on another board — is
+  **shared**: attached here, its home unchanged. A *new* checkout in a directory another board
   already claims — at the path or below it — is a **409 `claimed`** carrying that board's
   `board` and `key`, because the repair is `ai-kanban merge`.
+- `PUT /repos/{r}/home` makes this board the repo's home: its folder, and every subdirectory
+  the old home had learned, opens here from now on.
 - `PATCH /repos/{r}` renames. The path is not editable: a different path is a different
   checkout, and may belong to another board, so moving one is a remove and an add.
-- `DELETE /repos/{r}` takes it off every ticket. The folder keeps resolving to this board.
+- `DELETE /repos/{r}` takes it off this board and this board's tickets. If this was its home
+  and other boards have it, the home passes to the earliest of them; from its last board, the
+  repo goes and the folder keeps resolving here.
 - **No `If-Match` on repo writes.** The guard is for a form held open while an agent writes the
   same row, and no agent writes repos.
 
@@ -463,6 +474,23 @@ JSON `null` in an optional field deserializes as "absent", so it cannot mean "cl
 `task_links` keyed by task id like `task_tags` — `{"repos": ["eee-web"], "planio": 48213}` —
 and `/board` also returns `repos`, every repo with `open` and `total` ticket counts, so the
 cards, the pickers and the menu all come from one read.
+
+## Boards by name, moving tickets, All Projects
+
+`POST /api/projects` with `{"name": "BMUKN"}` creates a board for a project that is not one
+folder (key `board:bmukn`). A name another board has is refused. Agents reach such a board
+through the repos it is home to.
+
+`POST /projects/{p}/tasks/{t}/move` with `{"to": <board id or key>, "log": "..."}` moves a
+ticket, `If-Match` required. It is an action rather than a `PATCH` field because it changes the
+URL the task lives at. The response carries the task and the board it landed on.
+
+`GET /api/all/board` is the **All Projects** view: every board's tickets in one set of columns,
+the same shape as `/board` plus `projects` (so a card can name its board) and
+`boards_with_repos` (so "no repo set" follows each card's own board). No workstream — that is a
+slice of one board. `GET /api/all/tasks` pages its columns. This is the person's view only: the
+agent's cross-board view stays `board(project: "all")`, a per-board summary, because for a
+reader paying per token every open task across every project is a pile, not a board.
 
 ## Explicitly not in v1
 

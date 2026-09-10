@@ -213,6 +213,9 @@ pub struct TaskUpdateParams {
     pub repos: Option<String>,
     /// The Planio ticket this tracks. Pass 0 to clear it.
     pub planio: Option<i64>,
+    /// Move it to another board, by name as `board(project: "all")` lists them. Its history
+    /// and notes go with it; `log` says why.
+    pub move_to: Option<String>,
     /// Why this changed. This is the part worth reading in six months -- record the
     /// reasoning, not the fact that something moved.
     pub log: Option<String>,
@@ -389,6 +392,12 @@ impl AiKanban {
     fn task_update(&self, Parameters(p): Parameters<TaskUpdateParams>) -> Result<String, ErrorData> {
         let store = self.store();
         let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
+        // Resolved before anything is written, so a misspelled board fails the whole call
+        // rather than applying the edit and then refusing the move.
+        let target = match p.move_to.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(name) => Some(store.project_by_name_or_key(name).map_err(fail)?),
+            None => None,
+        };
 
         let patch = TaskPatch {
             title: p.title.clone(),
@@ -415,13 +424,23 @@ impl AiKanban {
             repos: repo_ids(&store, resolved.project.id, &p.repos)?,
             // 0 clears, as it does for `blocked_by`.
             planio: p.planio.map(|n| if n == 0 { None } else { Some(n) }),
-            log: p.log.clone(),
+            // With a move, the reason goes on the move's event instead: one reason, one
+            // entry, rather than the same sentence twice in the history.
+            log: if target.is_some() { None } else { p.log.clone() },
             // Unguarded, deliberately -- see `TaskPatch::expected_version`.
             expected_version: None,
             actor: Actor::Agent,
         };
         store.update_task(resolved.project.id, p.task, patch).map_err(fail)?;
-        let snap = store.board_after_mutation(resolved.project.id, p.task).map_err(fail)?;
+        let board = match &target {
+            Some(t) => {
+                store.move_task(resolved.project.id, p.task, t.id, Actor::Agent, p.log.as_deref(), None).map_err(fail)?;
+                t.id
+            }
+            None => resolved.project.id,
+        };
+        // The board the task is on now, so "did it land" is answered where it landed.
+        let snap = store.board_after_mutation(board, p.task).map_err(fail)?;
         Ok(render::board(&snap))
     }
 

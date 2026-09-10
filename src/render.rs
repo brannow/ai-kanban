@@ -475,9 +475,9 @@ pub fn import_report(r: &crate::core::transfer::ImportReport) -> String {
             out.push_str(&format!("  path already claimed by another board, left alone: {path}\n"));
         }
         for path in &p.repos_skipped {
-            // Same rule one level up: a checkout is registered on exactly one board, and its
-            // tickets from this export lose that repo rather than stealing it.
-            out.push_str(&format!("  repo already registered on another board, left alone: {path}\n"));
+            // Said, because the consequence is invisible otherwise: the repo is on this board
+            // and its tickets keep it, but opening its folder still lands on the other board.
+            out.push_str(&format!("  repo already opens on another board here, shared without moving it: {path}\n"));
         }
     }
     for key in &r.skipped_existing {

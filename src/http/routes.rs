@@ -166,6 +166,22 @@ pub async fn projects(State(api): State<Api>) -> ApiResult<Json<serde_json::Valu
     })))
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct BoardBody {
+    pub name: Option<String>,
+}
+
+/// Creates a board by name -- a Planio project, a customer. A person's act, like adding
+/// repos: the agent reaches a board through its repos and never creates one by name, because
+/// a name an agent generates is how one project quietly becomes two.
+pub async fn create_board(
+    State(api): State<Api>, Json(b): Json<BoardBody>,
+) -> ApiResult<impl IntoResponse> {
+    let store = api.store();
+    let project = store.create_board(b.name.as_deref().unwrap_or_default())?;
+    Ok((StatusCode::CREATED, Json(json!({ "project": project }))))
+}
+
 pub async fn project(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<Json<serde_json::Value>> {
     let store = api.store();
     let project = resolve(&store, &p)?;
@@ -507,6 +523,42 @@ pub async fn update_task(
     Ok((etag(version), Json(json!({ "task": task }))))
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct MoveBody {
+    /// The board to move to, by id or key -- the same forms `{p}` accepts.
+    pub to: Option<serde_json::Value>,
+    pub log: Option<String>,
+}
+
+/// Moves a task to another board, keeping its id and history. An action of its own rather
+/// than a `PATCH` field, because it changes the URL the task lives at.
+///
+/// `If-Match` required, like any other write to a task: a form held open while an agent moves
+/// the same task is the lost update the guard exists for.
+pub async fn move_task(
+    State(api): State<Api>, Path((p, t)): Path<(String, i64)>, headers: HeaderMap,
+    Json(b): Json<MoveBody>,
+) -> ApiResult<impl IntoResponse> {
+    let expected = if_match(&headers)?;
+    let store = api.store();
+    let project = resolve(&store, &p)?;
+    let to = match &b.to {
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        _ => {
+            return Err(ApiError(Error::InvalidValue {
+                field: "to",
+                value: String::new(),
+                valid: "the id or key of the board to move to".into(),
+            }))
+        }
+    };
+    let target = resolve(&store, &to)?;
+    let task = store.move_task(project.id, t, target.id, Actor::User, b.log.as_deref(), Some(expected))?;
+    let version = task.version;
+    Ok((etag(version), Json(json!({ "task": task, "project": target }))))
+}
+
 /// Permanent. See `src/core/forget.rs` -- this is the only surface it is reachable from, and
 /// deliberately so.
 pub async fn forget_task(
@@ -516,6 +568,108 @@ pub async fn forget_task(
     let project = resolve(&store, &p)?;
     store.forget_task(project.id, t)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// All Projects
+//
+// The person's view across every board. The agent's cross-board view stays a per-board
+// summary (`board(project: "all")`): for a reader paying per token, every open task across
+// every project is a pile, not a board. A person scanning columns is not paying per token,
+// and asked for exactly this.
+// ---------------------------------------------------------------------------
+
+type Extras = (Vec<(i64, Status)>, Vec<(i64, Vec<String>)>, Vec<TaskLinks>);
+
+/// Blocker statuses, tags and links for tasks from any number of boards. Every one of those
+/// lookups is scoped to a board -- the store is global, and a bare id can name another board's
+/// row -- so the rows are grouped by the board they are on and each group asked separately.
+fn extras_across(store: &Store, tasks: &[Task]) -> Result<Extras, Error> {
+    let mut by_board: std::collections::BTreeMap<i64, Vec<Task>> = std::collections::BTreeMap::new();
+    for t in tasks {
+        by_board.entry(t.project_id).or_default().push(t.clone());
+    }
+    let (mut blockers, mut tags, mut links) = (Vec::new(), Vec::new(), Vec::new());
+    for (pid, rows) in &by_board {
+        blockers.extend(store.blocker_status(*pid, rows)?);
+        tags.extend(store.tags_for(*pid, rows)?);
+        links.extend(store.links_for(*pid, rows)?);
+    }
+    Ok((blockers, tags, links))
+}
+
+fn tags_json(tags: &[(i64, Vec<String>)]) -> serde_json::Map<String, serde_json::Value> {
+    tags.iter().map(|(id, t)| (id.to_string(), json!(t))).collect()
+}
+
+/// Every board's tickets in one set of columns. Same shape as `/board`, plus `projects` so a
+/// card can name its board, and no workstream -- that is a slice of ONE board.
+pub async fn all_board(State(api): State<Api>) -> ApiResult<Json<serde_json::Value>> {
+    let store = api.store();
+    // One read transaction, for the reason `/board` takes one.
+    let tx = store.conn.unchecked_transaction()?;
+    let counts = store.status_counts_all()?;
+    let mut statuses: Vec<Status> = Status::ALL.to_vec();
+    statuses.sort_by_key(|s| s.column_rank());
+
+    let mut columns = Vec::new();
+    let mut listed: Vec<Task> = Vec::new();
+    for s in statuses {
+        let page = store.tasks_page_all(&[s], None, PAGE)?;
+        listed.extend(page.items.iter().cloned());
+        columns.push(json!({
+            "status": s.as_str(),
+            "total": counts.iter().find(|(k, _)| *k == s).map(|(_, n)| *n).unwrap_or(0),
+            "tasks": page.items,
+            "next": page.next.map(encode_cursor),
+        }));
+    }
+    let (blockers, tags, links) = extras_across(&store, &listed)?;
+    let projects = store.all_projects()?;
+    // Which boards track repos, so a card can say "no repo set" by its OWN board's rule.
+    let mut with_repos = Vec::new();
+    for p in &projects {
+        if store.repo_count(p.id)? > 0 {
+            with_repos.push(p.id);
+        }
+    }
+    let cursor = store.change_cursor()?;
+    tx.commit()?;
+
+    Ok(Json(json!({
+        "now": crate::core::now(),
+        "cursor": cursor,
+        "all": true,
+        "projects": projects,
+        "boards_with_repos": with_repos,
+        "counts": counts.iter().map(|(s, n)| json!({ "status": s.as_str(), "count": n })).collect::<Vec<_>>(),
+        "columns": columns,
+        "blocker_status": blockers.iter()
+            .map(|(id, s)| json!({ "id": id, "status": s.as_str() }))
+            .collect::<Vec<_>>(),
+        "task_tags": tags_json(&tags),
+        "task_links": links_json(&links),
+    })))
+}
+
+/// A further page of one All Projects column.
+pub async fn all_tasks(
+    State(api): State<Api>, Query(q): Query<PageParams>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let store = api.store();
+    let page = store.tasks_page_all(
+        &parse_status_list(&q.status)?,
+        decode_cursor(&q.cursor)?,
+        q.limit.unwrap_or(PAGE).min(200),
+    )?;
+    let (_, tags, links) = extras_across(&store, &page.items)?;
+    Ok(Json(json!({
+        "now": crate::core::now(),
+        "tasks": page.items,
+        "task_tags": tags_json(&tags),
+        "task_links": links_json(&links),
+        "next": page.next.map(encode_cursor),
+    })))
 }
 
 /// Task links keyed by task id, like `task_tags`. Only tasks with a repo or a Planio ref appear.
@@ -597,8 +751,29 @@ pub async fn update_repo(
     Ok(Json(json!({ "repo": repo })))
 }
 
-/// Takes the repo off the board and off every ticket naming it. See `Store::remove_repo` for
-/// why the directory keeps resolving to this board afterwards.
+/// Makes this board the repo's home: its folder opens here from now on.
+pub async fn repo_home(
+    State(api): State<Api>, Path((p, r)): Path<(String, i64)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let store = api.store();
+    let project = resolve(&store, &p)?;
+    let repo = store.set_repo_home(project.id, r, Actor::User)?;
+    Ok(Json(json!({ "repo": repo })))
+}
+
+/// Every repo in the store with the board its folder opens on -- what a board can attach.
+pub async fn all_repos(State(api): State<Api>) -> ApiResult<Json<serde_json::Value>> {
+    let store = api.store();
+    let names: std::collections::HashMap<i64, String> =
+        store.all_projects()?.into_iter().map(|p| (p.id, p.name)).collect();
+    let repos: Vec<serde_json::Value> = store.all_repos()?.into_iter()
+        .map(|r| json!({ "home_board": names.get(&r.home_project_id), "repo": r }))
+        .collect();
+    Ok(Json(json!({ "repos": repos })))
+}
+
+/// Takes the repo off this board and off this board's tickets. See `Store::remove_repo` for
+/// where its folder opens afterwards.
 pub async fn delete_repo(
     State(api): State<Api>, Path((p, r)): Path<(String, i64)>,
 ) -> ApiResult<StatusCode> {

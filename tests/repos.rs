@@ -7,6 +7,7 @@
 //! against a store this binary has not migrated.
 
 use ai_kanban::core::model::*;
+use ai_kanban::core::note::NoteDraft;
 use ai_kanban::core::recall::{RecallQuery, DEFAULT_LIMIT};
 use ai_kanban::core::task::{TaskDraft, TaskPatch};
 use ai_kanban::core::{Error, Store};
@@ -283,7 +284,10 @@ fn repos_planio_and_links_survive_export_and_import() {
 }
 
 #[test]
-fn an_import_leaves_a_checkout_with_the_board_that_already_registered_it() {
+fn an_import_shares_a_checkout_that_already_opens_on_another_board() {
+    // One directory, one home: the import attaches the repo so its tickets keep it, but the
+    // folder keeps opening on the board that had it -- and the report says so, because
+    // nothing else would.
     let f = fixture();
     let api = f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
     f.s.create_task(f.pid, TaskDraft { repos: vec![api.id], ..TaskDraft::new("invoice rounding") }).unwrap();
@@ -297,33 +301,33 @@ fn an_import_leaves_a_checkout_with_the_board_that_already_registered_it() {
 
     let report = target.import(&dump).unwrap();
     assert_eq!(report.projects[0].repos_skipped, vec![canon(&f.api)]);
-    assert!(render::import_report(&report).contains("repo already registered"), "a skip must be said, not silent");
-    assert_eq!(target.repos(owner).unwrap().len(), 1, "the owner keeps it");
+    assert!(render::import_report(&report).contains("shared without moving it"), "a kept home must be said, not silent");
+    assert_eq!(target.repos(owner).unwrap()[0].home_project_id, owner, "the owner keeps the home");
+    let imported = target.all_projects().unwrap().into_iter().find(|p| p.id != owner).unwrap().id;
+    let task = target.board(imported, &BoardQuery::board()).unwrap().tasks[0].clone();
+    assert_eq!(names(&target.task_repos(imported, task.id).unwrap()), ["eee-api"], "its ticket keeps the repo");
 }
 
 #[test]
-fn merging_boards_keeps_repos_and_the_tickets_naming_them() {
-    // Deleting the merged board cascades to its repos and their links. A merge that did not
-    // move them first would strip every ticket from that board of its repos, silently.
+fn merging_boards_keeps_repos_their_homes_and_the_tickets_naming_them() {
+    // Deleting the merged board cascades to its attachments, to every repo homed there, and
+    // to their links. A merge that did not move them first would strip every ticket from that
+    // board of its repos, silently.
     let f = fixture();
-    f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
-
+    let shared = f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
     let b_dir = f.root.path().join("half");
-    let b_api = f.root.path().join("half-api");
     std::fs::create_dir_all(&b_dir).unwrap();
-    std::fs::create_dir_all(&b_api).unwrap();
     let b = f.s.resolve_project(&b_dir).unwrap().project.id;
     let web = f.s.add_repo(b, &f.web, None, Actor::User).unwrap();
-    // Same NAME as the survivor's repo, different checkout: must not be folded into it.
-    f.s.add_repo(b, &b_api, Some("eee-api"), Actor::User).unwrap();
-    let t = f.s.create_task(b, TaskDraft { repos: vec![web.id], ..TaskDraft::new("contact form spam") }).unwrap();
+    f.s.add_repo(b, &f.api, None, Actor::User).unwrap();
+    let t = f.s.create_task(b, TaskDraft { repos: vec![web.id, shared.id], ..TaskDraft::new("contact form spam") }).unwrap();
 
     let report = f.s.merge_projects(f.pid, b).unwrap();
     assert_eq!(report.repos, 2);
-    let merged = names(&f.s.repos(f.pid).unwrap());
-    assert_eq!(merged.len(), 3, "{merged:?}");
-    assert!(merged.contains(&"eee-web".to_string()));
-    assert_eq!(names(&f.s.task_repos(f.pid, t.id).unwrap()), ["eee-web"]);
+    assert_eq!(names(&f.s.repos(f.pid).unwrap()), ["eee-api", "eee-web"], "a repo on both ends up on the survivor once");
+    assert_eq!(names(&f.s.task_repos(f.pid, t.id).unwrap()), ["eee-api", "eee-web"]);
+    assert_eq!(f.s.resolve_project(&f.web).unwrap().project.id, f.pid,
+        "a repo homed on the merged board now opens on the survivor");
 }
 
 #[test]
@@ -362,6 +366,7 @@ fn a_store_from_before_repos_still_renders_its_board_and_its_hook() {
         // The FTS table and its triggers name `planio`, so they go before the column can.
         "DROP TRIGGER tasks_ai; DROP TRIGGER tasks_ad; DROP TRIGGER tasks_au;
          DROP TABLE tasks_fts;
+         DROP TABLE board_repos;
          DROP TABLE task_repos;
          DROP TABLE repos;
          ALTER TABLE tasks DROP COLUMN planio;",
@@ -373,4 +378,143 @@ fn a_store_from_before_repos_still_renders_its_board_and_its_hook() {
     assert!(snap.links.is_empty());
     assert!(ai_kanban::hook::context_for(&f.s, &f.board_dir).is_some(),
         "the SessionStart hook must still produce output");
+}
+
+#[test]
+fn a_store_between_the_two_repo_migrations_still_renders_its_board_and_its_hook() {
+    // 008 added `board_repos`. A store the hook meets at 007 has repos but not that table,
+    // and has to render as "tracks no repos" rather than lose its board.
+    let f = fixture();
+    let api = f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
+    f.s.create_task(f.pid, TaskDraft { repos: vec![api.id], ..TaskDraft::new("invoice rounding") }).unwrap();
+    f.s.conn.execute_batch("DROP TABLE board_repos;").unwrap();
+
+    assert_eq!(f.s.repo_count(f.pid).unwrap(), 0);
+    let text = render::board(&f.s.board(f.pid, &BoardQuery::board()).unwrap());
+    assert!(text.contains("invoice rounding") && !text.contains("no repo set"), "{text}");
+    assert!(ai_kanban::hook::context_for(&f.s, &f.board_dir).is_some());
+}
+
+fn board(f: &Fixture, name: &str) -> i64 {
+    f.s.create_board(name).unwrap().id
+}
+
+#[test]
+fn a_repo_can_serve_several_boards_and_its_folder_opens_on_its_home() {
+    let f = fixture();
+    let other = board(&f, "BMUKN");
+    let api = f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
+    let shared = f.s.add_repo(other, &f.api, None, Actor::User).unwrap();
+    assert_eq!(shared.id, api.id, "the same checkout is the same repo on every board");
+    assert_eq!(shared.home_project_id, f.pid, "sharing a repo does not move where its folder opens");
+
+    f.s.create_task(f.pid, TaskDraft { repos: vec![api.id], ..TaskDraft::new("ours") }).unwrap();
+    f.s.create_task(other, TaskDraft { repos: vec![api.id], ..TaskDraft::new("theirs") }).unwrap();
+
+    let here = &f.s.repo_summaries(f.pid).unwrap()[0];
+    let there = &f.s.repo_summaries(other).unwrap()[0];
+    assert_eq!((here.total, there.total), (1, 1), "each board counts its own tickets");
+    assert_eq!(here.other_boards, ["BMUKN"]);
+    assert_eq!(there.home_board, "eee");
+    assert_eq!(f.s.resolve_project(&f.api).unwrap().project.id, f.pid);
+}
+
+#[test]
+fn moving_the_home_moves_where_the_folder_and_its_subdirectories_open() {
+    let f = fixture();
+    let other = board(&f, "BMUKN");
+    let api = f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
+    // A subdirectory the old home learned. Left behind, it would keep answering for the old
+    // home -- resolution checks the deepest alias first -- and the move would half happen.
+    let src = f.api.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    assert_eq!(f.s.resolve_project(&src).unwrap().project.id, f.pid);
+
+    f.s.add_repo(other, &f.api, None, Actor::User).unwrap();
+    f.s.set_repo_home(other, api.id, Actor::User).unwrap();
+
+    assert_eq!(f.s.resolve_project(&f.api).unwrap().project.id, other);
+    assert_eq!(f.s.resolve_project(&src).unwrap().project.id, other);
+    // Read from the events rather than the rendered board: a board with no tasks renders only
+    // "No tasks yet", which would hide the line this is checking.
+    let old: Vec<String> = f.s.recent_events(f.pid, 8).unwrap().into_iter().map(|e| e.body).collect();
+    assert!(old.iter().any(|b| b.contains("now opens on board \"BMUKN\"")), "the board the folder left must say so: {old:?}");
+    assert!(f.s.set_repo_home(f.pid, 999, Actor::User).is_err(), "only a repo on this board can be homed here");
+}
+
+#[test]
+fn when_the_home_lets_a_repo_go_another_of_its_boards_takes_it() {
+    // Otherwise the folder would keep opening on a board that no longer has the repo.
+    let f = fixture();
+    let other = board(&f, "BMUKN");
+    let api = f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
+    f.s.add_repo(other, &f.api, None, Actor::User).unwrap();
+
+    f.s.remove_repo(f.pid, api.id, Actor::User).unwrap();
+    assert!(f.s.repos(f.pid).unwrap().is_empty());
+    assert_eq!(f.s.repos(other).unwrap()[0].home_project_id, other);
+    assert_eq!(f.s.resolve_project(&f.api).unwrap().project.id, other);
+}
+
+#[test]
+fn a_repo_name_means_one_checkout_on_every_board() {
+    let f = fixture();
+    let other = board(&f, "BMUKN");
+    f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
+    assert!(f.s.add_repo(other, &f.web, Some("eee-api"), Actor::User).is_err());
+}
+
+#[test]
+fn a_board_is_created_by_name_and_a_name_is_not_reused() {
+    // Two boards with one name is what a split looks like in `ai-kanban projects`.
+    let f = fixture();
+    let b = f.s.create_board("BMUKN").unwrap();
+    assert_eq!((b.name.as_str(), b.key.as_str()), ("BMUKN", "board:bmukn"));
+    assert!(f.s.create_board("bmukn").is_err());
+    assert!(f.s.create_board("eee").is_err(), "the fixture's own board already has that name");
+    assert!(f.s.create_board("   ").is_err());
+    assert!(f.s.all_projects().unwrap().iter().any(|p| p.id == b.id));
+}
+
+#[test]
+fn moving_a_ticket_keeps_its_history_and_says_what_it_left_behind() {
+    let f = fixture();
+    let other = board(&f, "BMUKN");
+    let shared = f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
+    f.s.add_repo(other, &f.api, None, Actor::User).unwrap();
+    let local = f.s.add_repo(f.pid, &f.web, None, Actor::User).unwrap();
+    let ws = f.s.ensure_workstream(f.pid, "slider").unwrap();
+    f.s.set_current_workstream(f.pid, ws.id).unwrap();
+
+    let blocker = f.s.create_task(f.pid, TaskDraft::new("pick a slider library")).unwrap();
+    let t = f.s.create_task(f.pid, TaskDraft {
+        repos: vec![shared.id, local.id], blocked_by: Some(blocker.id), planio: Some(1234),
+        ..TaskDraft::new("Rework header slider")
+    }).unwrap();
+    let dependent = f.s.create_task(f.pid, TaskDraft { blocked_by: Some(t.id), ..TaskDraft::new("hero copy") }).unwrap();
+    let note = f.s.create_note(f.pid, NoteDraft { task_id: Some(t.id), ..NoteDraft::new("the slider is swiper v8") }, Actor::Agent).unwrap();
+    f.s.update_task(f.pid, t.id, TaskPatch { log: Some("started on the markup".into()), ..Default::default() }).unwrap();
+
+    let moved = f.s.move_task(f.pid, t.id, other, Actor::User, Some("belongs to BMUKN"), None).unwrap();
+    assert_eq!((moved.id, moved.project_id, moved.blocked_by), (t.id, other, None));
+    assert!(f.s.task_opt(f.pid, t.id).unwrap().is_none(), "it is gone from the old board");
+    assert_eq!(names(&f.s.task_repos(other, t.id).unwrap()), ["eee-api"], "a repo the new board lacks stays behind");
+    assert_eq!(f.s.task_planio(other, t.id).unwrap(), Some(1234));
+    assert_eq!(f.s.task_workstream(other, t.id).unwrap(), None);
+    assert_eq!(f.s.task(f.pid, dependent.id).unwrap().blocked_by, None,
+        "a blocker on another board would render as an id nobody here can look up");
+    assert!(f.s.note(other, note.id).is_ok(), "notes written on it travel with it");
+
+    let history: Vec<String> = f.s.task_events(t.id).unwrap().into_iter().map(|e| e.body).collect();
+    assert!(history.iter().any(|b| b == "started on the markup"), "old history travels: {history:?}");
+    let last = history.last().unwrap();
+    assert!(last.contains("belongs to BMUKN") && last.contains("eee-web") && last.contains("workstream"), "{last}");
+
+    let left = render::board(&f.s.board(f.pid, &BoardQuery::board()).unwrap());
+    assert!(left.contains("moved to board \"BMUKN\""), "the board it left must say where it went: {left}");
+    let hits = f.s.recall(&RecallQuery { text: "slider", project_id: Some(other), limit: DEFAULT_LIMIT }).unwrap().hits;
+    assert!(hits.iter().any(|h| h.kind == HitKind::Task && h.id == t.id), "{hits:?}");
+
+    let stale = f.s.move_task(other, t.id, f.pid, Actor::User, None, Some(1));
+    assert!(matches!(stale, Err(Error::Conflict { .. })), "the web UI's move is version-guarded");
 }

@@ -86,13 +86,21 @@ pub struct WorkstreamExport {
     pub closed_at: Option<i64>,
 }
 
-/// Carried by name, which is unique on its board, for the reason workstreams are: an id means
+/// Carried by name, which is unique in its store, for the reason workstreams are: an id means
 /// nothing in a store that numbers its rows differently.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoExport {
     pub name: String,
     pub path: String,
     pub created_at: i64,
+    /// Whether this board was the repo's home. Defaults to true: an export written before
+    /// repos could be shared only ever listed a board's own repos.
+    #[serde(default = "home_by_default")]
+    pub home: bool,
+}
+
+fn home_by_default() -> bool {
+    true
 }
 
 /// Rows carry their **source** id, and only so that references inside the same export can
@@ -173,8 +181,9 @@ pub struct ImportedProject {
     /// sessions into this one. Skipping loses an alias, which the next session in that
     /// directory restores anyway.
     pub paths_skipped: Vec<String>,
-    /// Repo paths another board here already registered. A checkout belongs to one board,
-    /// for the same reason a path alias does, so these stay where they are.
+    /// Repos this board was home to in the export that are already homed on another board
+    /// here. They are attached, tickets keep them, but the folder keeps opening where it did:
+    /// one directory resolves to one board, and an import is not the place to move that.
     #[serde(default)]
     pub repos_skipped: Vec<String>,
 }
@@ -272,16 +281,22 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?;
 
         let mut st = self.conn.prepare(
-            "SELECT name, path, created_at FROM repos WHERE project_id = ?1 ORDER BY id",
+            "SELECT r.name, r.path, br.created_at, r.home_project_id = br.project_id
+               FROM board_repos br JOIN repos r ON r.id = br.repo_id
+              WHERE br.project_id = ?1 ORDER BY r.id",
         )?;
         let repos: Vec<RepoExport> = st
-            .query_map([p.id], |r| Ok(RepoExport { name: r.get(0)?, path: r.get(1)?, created_at: r.get(2)? }))?
+            .query_map([p.id], |r| Ok(RepoExport {
+                name: r.get(0)?, path: r.get(1)?, created_at: r.get(2)?, home: r.get(3)?,
+            }))?
             .collect::<rusqlite::Result<_>>()?;
 
         let mut task_repos: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
         let mut st = self.conn.prepare(
-            "SELECT tr.task_id, r.name FROM task_repos tr JOIN repos r ON r.id = tr.repo_id
-              WHERE r.project_id = ?1 ORDER BY tr.task_id, r.name",
+            "SELECT tr.task_id, r.name FROM task_repos tr
+               JOIN repos r ON r.id = tr.repo_id
+               JOIN tasks t ON t.id = tr.task_id
+              WHERE t.project_id = ?1 ORDER BY tr.task_id, r.name",
         )?;
         for row in st.query_map([p.id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
             let (task, name) = row?;
@@ -454,21 +469,47 @@ impl Store {
         }
 
         // Repos before tasks, for the reason workstreams go first: a task names its repos,
-        // so the rows have to exist. Inserted directly rather than through `add_repo`, which
+        // so the rows have to exist. Written directly rather than through `add_repo`, which
         // writes an event and checks the directory exists -- a restore replays the export's
         // own history, and may run on a machine where the checkout is not (yet) cloned.
         let mut repo_ids = std::collections::HashMap::new();
         let mut repos_skipped = Vec::new();
         for r in &pe.repos {
-            let inserted = self.conn.execute(
-                "INSERT OR IGNORE INTO repos (project_id, name, path, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![pid, r.name, r.path, r.created_at],
+            let existing: Option<i64> = self.conn
+                .query_row("SELECT id FROM repos WHERE path = ?1", [&r.path], |row| row.get(0))
+                .ok();
+            let rid = match existing {
+                // Already a repo here: shared, not stolen. Attached so tickets keep it, but
+                // its home -- where its folder opens -- stays with the board that has it.
+                Some(id) => {
+                    if r.home {
+                        repos_skipped.push(r.path.clone());
+                    }
+                    id
+                }
+                // New here, so this is the only board it is on, and so its home -- even when
+                // it was homed elsewhere in the source store.
+                None => {
+                    let name = self.free_repo_name(&r.name)?;
+                    self.conn.execute(
+                        "INSERT INTO repos (home_project_id, name, path, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![pid, name, r.path, r.created_at],
+                    )?;
+                    let id = self.conn.last_insert_rowid();
+                    // Its folder opens on its home. OR IGNORE: a path another board claims is
+                    // left alone, as the project's own paths are above.
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO project_paths (path, project_id, created_at) VALUES (?1, ?2, ?3)",
+                        params![r.path, pid, r.created_at],
+                    )?;
+                    id
+                }
+            };
+            self.conn.execute(
+                "INSERT OR IGNORE INTO board_repos (project_id, repo_id, created_at) VALUES (?1, ?2, ?3)",
+                params![pid, rid, r.created_at],
             )?;
-            if inserted == 0 {
-                repos_skipped.push(r.path.clone());
-                continue;
-            }
-            repo_ids.insert(r.name.clone(), self.conn.last_insert_rowid());
+            repo_ids.insert(r.name.clone(), rid);
         }
 
         // Tasks in two passes. `blocked_by` points at another task in the same export, so
