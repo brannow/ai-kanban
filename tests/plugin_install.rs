@@ -156,3 +156,46 @@ fn installing_into_a_private_claude_directory_touches_nothing_else() {
     assert!(!tmp.path().join(".claude").exists(),
         "a private install must not also write to the default directory");
 }
+
+#[test]
+fn the_generated_hooks_file_uses_only_top_level_keys_the_loader_accepts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = stub(tmp.path());
+    let plugin = generate(tmp.path(), &bin);
+
+    // The loader accepts exactly these four and warns on anything else, once per session
+    // start: `ai-kanban: hooks.json: unknown key "x" ignored`. The hooks still run, so this
+    // never fails a test by itself -- it just makes the plugin noisy, and noisy is what gets
+    // uninstalled. That is the same reason the `[ -x ]` guard exists, reached by a different
+    // route.
+    //
+    // The reason this is a test and not a CI `claude plugin validate` step: validate checks
+    // the manifest, not this file's top-level keys. It passes a `hooks.json` full of junk
+    // keys. It cannot catch a regression here.
+    //
+    // We shipped `"_comment"` and warned on every session start until someone noticed.
+    const ALLOWED: [&str; 4] = ["description", "hooks", "modules", "surface"];
+
+    let hooks: serde_json::Value = serde_json::from_str(&read(&plugin, "hooks.json")).unwrap();
+    let obj = hooks.as_object().expect("hooks.json must be a JSON object");
+    for key in obj.keys() {
+        assert!(ALLOWED.contains(&key.as_str()),
+            "hooks.json top-level key {key:?} makes the loader warn on every session start; \
+             allowed: {ALLOWED:?}");
+    }
+
+    assert!(obj.contains_key("description"), "the plugin should say what its hooks do");
+
+    // The loader builds one warning from two sources: top-level keys, and the keys of every
+    // matcher entry. Matcher entries allow only these two -- and `description` being legal
+    // one level up is exactly what makes it plausible for someone to add one down here.
+    let events = hooks["hooks"].as_object().expect("hooks must be an object of events");
+    for (event, entries) in events {
+        for entry in entries.as_array().expect("an event maps to an array of matcher entries") {
+            for key in entry.as_object().expect("a matcher entry is an object").keys() {
+                assert!(matches!(key.as_str(), "matcher" | "hooks"),
+                    "hooks.{event}[..] key {key:?} makes the loader warn; allowed: matcher, hooks");
+            }
+        }
+    }
+}

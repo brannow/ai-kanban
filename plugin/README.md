@@ -26,3 +26,23 @@ go quiet rather than erroring on every session.
 
 `mcp.json` deliberately does **not** guard: an MCP server that dies silently is a board
 that is mysteriously absent, which is harder to diagnose than a startup error.
+
+## Keep the top level of `hooks.json` to what the loader allows
+
+The plugin loader accepts exactly four top-level keys — `description`, `hooks`, `modules`,
+`surface` — and warns on anything else: `ai-kanban: hooks.json: unknown key "x" ignored`, on
+every session start. That is the same "hook that complains" failure as above, arriving by a
+different route: the hooks still run, but the plugin is visibly noisy, and noisy is what gets
+uninstalled.
+
+This cost us a real warning. The templates carried a `"_comment"` key explaining that the
+rendered file is generated — helpful to a contributor, but `hooks.json` ships to *consumers*,
+and a note about a Makefile they do not have never belonged there. `description` is the
+consumer-facing field: it says what the hooks do, nothing about how this repo builds them.
+
+`claude plugin validate` does **not** catch this — it validates the manifest, not the hook
+file's top-level keys. The guard is `tests/plugin_install.rs`, which asserts the rendered
+top level against the allowlist.
+
+The rendered `hooks.json` and `mcp.json` are generated on every `make install`. Editing the
+installed copy is pointless; edit the `.in` templates here.
