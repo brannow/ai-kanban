@@ -299,21 +299,42 @@ impl Store {
     fn move_home(&self, r: &Repo, to: i64, actor: Actor) -> Result<()> {
         let from = self.project(r.home_project_id)?;
         let target = self.project(to)?;
-        // Only the old home's aliases move. A subdirectory some third board claimed on its own
-        // (split off with a `.ai-kanban` marker, say) was never this repo's to hand over.
-        self.conn.execute(
-            &format!("UPDATE project_paths SET project_id = ?2 WHERE project_id = ?3 AND {AT_OR_BELOW}"),
-            params![r.path, to, from.id],
-        )?;
-        // And the root itself, in case the old home never held it. `add_path_alias` never takes
-        // a path from another board, so this cannot steal one either.
-        self.add_path_alias(to, Path::new(&r.path))?;
-        self.conn.execute("UPDATE repos SET home_project_id = ?2 WHERE id = ?1", params![r.id, to])?;
+        self.rehome(r, to)?;
         self.write_event(to, None, actor, "repo_home",
             &format!("{} now opens on this board, moved from \"{}\"", r.name, from.name))?;
         self.write_event(from.id, None, actor, "repo_home",
             &format!("{} now opens on board \"{}\"", r.name, target.name))?;
         Ok(())
+    }
+
+    /// The data half of a home move, without the events: forgetting a board moves homes too,
+    /// and its events must not name the board being forgotten.
+    pub(crate) fn rehome(&self, r: &Repo, to: i64) -> Result<()> {
+        // Only the old home's aliases move. A subdirectory some third board claimed on its own
+        // (split off with a `.ai-kanban` marker, say) was never this repo's to hand over.
+        self.conn.execute(
+            &format!("UPDATE project_paths SET project_id = ?2 WHERE project_id = ?3 AND {AT_OR_BELOW}"),
+            params![r.path, to, r.home_project_id],
+        )?;
+        // And the root itself, in case the old home never held it. `add_path_alias` never takes
+        // a path from another board, so this cannot steal one either.
+        self.add_path_alias(to, Path::new(&r.path))?;
+        self.conn.execute("UPDATE repos SET home_project_id = ?2 WHERE id = ?1", params![r.id, to])?;
+        Ok(())
+    }
+
+    /// A repo by id, whichever boards it is on. Only for callers acting on the repo as a whole
+    /// -- forgetting it -- where no single board scopes the question.
+    pub(crate) fn repo_anywhere(&self, id: i64) -> Result<Repo> {
+        let found = self.conn.query_row(
+            &format!("SELECT {REPO_COLS} FROM repos WHERE id = ?1"), [id], row_to_repo,
+        ).optional()?;
+        found.ok_or_else(|| Error::InvalidValue {
+            field: "repo",
+            value: format!("#{id}"),
+            valid: self.all_repos().map(|v| v.into_iter().map(|r| r.name).collect::<Vec<_>>().join(", "))
+                .unwrap_or_default(),
+        })
     }
 
     pub fn rename_repo(&self, project_id: i64, id: i64, name: &str, actor: Actor) -> Result<Repo> {

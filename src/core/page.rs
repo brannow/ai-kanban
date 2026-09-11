@@ -224,7 +224,14 @@ impl Store {
     /// client whatever board they are watching, and per-project filtering happens when the
     /// change is dispatched.
     pub fn change_cursor(&self) -> Result<i64> {
-        Ok(self.conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0))?)
+        // The AUTOINCREMENT sequence as well as the newest id: forgetting a board deletes its
+        // events and leaves nowhere to write a tombstone, so it advances the sequence instead.
+        // MAX(id) alone would stay put -- or drop -- and the change would never be seen.
+        Ok(self.conn.query_row(
+            "SELECT MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0),
+                        COALESCE((SELECT MAX(id) FROM events), 0))",
+            [], |r| r.get(0),
+        )?)
     }
 
     /// Which projects changed since `since`, so a poll can tell one client from another.

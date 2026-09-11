@@ -854,6 +854,20 @@ pub async fn delete_repo(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The repo gone from every board, not just this one. Global because repos are: no one board
+/// scopes a question about all of them.
+pub async fn forget_repo(State(api): State<Api>, Path(r): Path<i64>) -> ApiResult<StatusCode> {
+    api.store().forget_repo(r)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn forget_board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<StatusCode> {
+    let store = api.store();
+    let project = resolve(&store, &p)?;
+    store.forget_board(project.id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ---------------------------------------------------------------------------
 // Notes
 // ---------------------------------------------------------------------------

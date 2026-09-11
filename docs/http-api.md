@@ -275,7 +275,26 @@ matching by text would be a guess, and a wrong guess deletes another entity's hi
 after forgetting something that genuinely must not persist, search `recall` for it — the
 operation is precise, not exhaustive.
 
-Core: `Store::forget_task` / `Store::forget_note`, `src/core/forget.rs`.
+```
+DELETE /api/projects/{p}      a whole board
+DELETE /api/repos/{r}         a repo, off every board and ticket
+```
+
+Forgetting a **board** deletes its tasks, notes, workstreams, history and path aliases, so the
+next session opened in one of its folders starts a fresh board. Repos it was home to pass to
+the earliest other board sharing them; repos only it had go. With no board left to hold a
+tombstone, it advances the events sequence instead, which `change_cursor` reads alongside
+`MAX(events.id)` — otherwise the delete would be invisible to every live page.
+
+Forgetting a **repo** differs from `DELETE /projects/{p}/repos/{r}` (off one board): it
+leaves the store, off every board and every ticket. Its folder's path aliases stay, because
+they belong to a board whose history is still there. The tombstone is `repo #3`, on each
+board that had it.
+
+The web UI puts both in the repos panel's danger zone, and forgetting a board asks for its
+name typed out.
+
+Core: `Store::forget_task` / `forget_note` / `forget_repo` / `forget_board`, `src/core/forget.rs`.
 
 ### Errors
 

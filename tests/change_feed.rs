@@ -21,7 +21,7 @@ use ai_kanban::core::Store;
 
 /// What the HTTP server polls.
 fn cursor(s: &Store) -> i64 {
-    s.conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0)).unwrap()
+    s.change_cursor().unwrap()
 }
 
 #[test]
@@ -102,6 +102,14 @@ fn every_mutation_moves_the_change_cursor() {
 
     s.move_task(pid, t.id, board.id, Actor::User, None, None).unwrap();
     moved(&s, "moving a task to another board");
+
+    s.forget_repo(shared.id).unwrap();
+    moved(&s, "forgetting a repo");
+
+    // The last one on purpose: it deletes the board's events, which is exactly what could
+    // leave MAX(id) standing still or going backwards.
+    s.forget_board(board.id).unwrap();
+    moved(&s, "forgetting a board");
 }
 
 #[test]

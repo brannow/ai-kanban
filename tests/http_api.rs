@@ -49,6 +49,23 @@ fn json_req(method: &str, path: &str, body: Value, if_match: Option<&str>) -> Re
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn a_board_and_a_repo_can_be_forgotten() {
+    let (api, pid) = api();
+    let dir = tempfile::tempdir().unwrap();
+    let rid = api.store.lock().unwrap().add_repo(pid, dir.path(), None, Actor::User).unwrap().id;
+    let del = |path: String| Request::builder().method("DELETE").uri(path).body(Body::empty()).unwrap();
+
+    let (status, _, _) = call(&api, del(format!("/api/repos/{rid}"))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(api.store.lock().unwrap().all_repos().unwrap().is_empty());
+
+    let (status, _, _) = call(&api, del(format!("/api/projects/{pid}"))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, _) = call(&api, get(&format!("/api/projects/{pid}"))).await;
+    assert_ne!(status, StatusCode::OK, "the board is gone");
+}
+
+#[tokio::test]
 async fn the_board_arrives_in_column_order() {
     // The UI renders columns in the order it receives them, so the server owns the order:
     // backlog on the left, doing in the middle. It is `column_rank`, not the agent's
