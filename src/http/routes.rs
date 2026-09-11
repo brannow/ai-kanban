@@ -199,6 +199,7 @@ pub async fn project(State(api): State<Api>, Path(p): Path<String>) -> ApiResult
         // split wants the former.
         "paths": store.project_paths(project.id)?,
         "counts": store.status_counts(project.id)?,
+        "profiles": profiles_json(&store, project.id)?,
     })))
 }
 
@@ -412,6 +413,8 @@ pub async fn task(
         "blocking": detail.blocking,
         "notes": detail.notes,
         "events": detail.events,
+        // Which "open in …" buttons the panel shows.
+        "profiles": profiles_json(&store, project.id)?,
         "project": detail.project,
         // Looked up rather than read off the task: `workstream_id` is kept out of
         // `TASK_COLS` (see migration 005), so no `Task` carries it. The panel needs the
@@ -565,12 +568,13 @@ pub async fn move_task(
     Ok((etag(version), Json(json!({ "task": task, "project": target }))))
 }
 
-/// Starts work on a ticket: a new Ghostty window running Claude Code in the ticket's first
-/// repo, with the others added, primed with the ticket (`render::start_prompt`).
+/// Starts work on a ticket: Claude Code in a new Ghostty tab (a window when Ghostty is not
+/// open) in the ticket's first repo, with the others added, primed with the ticket
+/// (`render::start_prompt`).
 ///
 /// A ticket with no repo is refused -- the session has to start in a checkout, and guessing
-/// one would start it in the wrong place. The launch is recorded on the ticket, which is also
-/// what lets a live page see it happened.
+/// one would start it in the wrong place. So is a profile the board does not allow. The launch
+/// is recorded on the ticket, which is also what lets a live page see it happened.
 pub async fn start_task(
     State(api): State<Api>, Path((p, t)): Path<(String, i64)>, headers: HeaderMap,
     Json(b): Json<StartBody>,
@@ -579,6 +583,12 @@ pub async fn start_task(
     let profile = super::launch::Profile::parse(b.profile.as_deref())?;
     let store = api.store();
     let project = resolve(&store, &p)?;
+    if store.denied_profiles(project.id)?.iter().any(|d| d == profile.label()) {
+        return Err(ApiError(Error::Forbidden(format!(
+            "board {} does not allow {} sessions -- it can be allowed in the board's repos menu",
+            project.name, profile.label()
+        ))));
+    }
     let detail = store.task_detail(project.id, t)?;
     // Only work nobody has started. A ticket in doing already has a session on it, and one
     // in blocked, done or archived is not ready to be picked up -- a second window on either
@@ -598,16 +608,54 @@ pub async fn start_task(
         }));
     };
     let add: Vec<String> = rest.iter().map(|r| r.path.clone()).collect();
-    super::launch::open_claude(profile, &first.path, &add, &crate::render::start_prompt(&detail))?;
+    let opened = super::launch::open_claude(profile, &first.path, &add, &crate::render::start_prompt(&detail))?;
     store.log_on(project.id, Some(t), Actor::User,
         &format!("started a {} session in {}", profile.label(), first.name))?;
-    Ok(Json(json!({ "started_in": first.path, "profile": profile.label() })))
+    Ok(Json(json!({ "started_in": first.path, "profile": profile.label(), "opened": opened.label() })))
 }
 
 #[derive(Debug, Deserialize, Default)]
 pub struct StartBody {
     /// `claude` (the default) or `claude-work` -- see `launch::Profile`.
     pub profile: Option<String>,
+}
+
+/// Every launch profile and whether this board allows it, for the ticket panel's buttons and
+/// the board's setting.
+fn profiles_json(store: &Store, project_id: i64) -> Result<serde_json::Value, Error> {
+    let denied = store.denied_profiles(project_id)?;
+    Ok(json!(super::launch::Profile::ALL.iter().map(|p| json!({
+        "name": p.label(),
+        "allowed": !denied.iter().any(|d| d == p.label()),
+    })).collect::<Vec<_>>()))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ProfileBody {
+    pub allowed: Option<bool>,
+}
+
+/// Allows or refuses a session profile on one board -- e.g. `claude-work` only on the boards
+/// that are work. Locked to the board page like `start_task`: it is half of what decides
+/// which setup a session starts in.
+pub async fn set_profile(
+    State(api): State<Api>, Path((p, name)): Path<(String, String)>, headers: HeaderMap,
+    Json(b): Json<ProfileBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    same_origin(&headers)?;
+    // Validated here, not in core: the store keeps names, the launcher knows which exist.
+    let profile = super::launch::Profile::parse(Some(&name))?;
+    let Some(allowed) = b.allowed else {
+        return Err(ApiError(Error::InvalidValue {
+            field: "allowed",
+            value: String::new(),
+            valid: "true or false".into(),
+        }));
+    };
+    let store = api.store();
+    let project = resolve(&store, &p)?;
+    store.set_profile_allowed(project.id, profile.label(), allowed, Actor::User)?;
+    Ok(Json(json!({ "profiles": profiles_json(&store, project.id)? })))
 }
 
 /// The start endpoint launches a program, so unlike every other route it must not be callable

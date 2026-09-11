@@ -588,7 +588,7 @@ async function openTask(id, pid) {
         <button id="move">move to board</button>
       </div>
       <div class="row" style="margin-top:7px">
-        <button data-start="claude" title="a new Ghostty window running claude in this ticket's repo, primed with the ticket">open in claude</button>
+        <button data-start="claude" title="a new Ghostty tab (a window if Ghostty is closed) running claude in this ticket's repo, primed with the ticket">open in claude</button>
         <button data-start="claude-work" title="the same, with your claude-work setup (~/.claude-work)">open in claude-work</button>
         <span id="startnote" class="dim2" style="font-size:11px"></span>
       </div>
@@ -653,11 +653,15 @@ async function openTask(id, pid) {
   // Only backlog work can be started -- the server refuses the rest too. Judged on the saved
   // status, not the select: an unsaved change has not moved the ticket anywhere yet.
   const startable = t.status === 'backlog';
+  // Profiles this board refuses are not offered at all -- set in the board's repos menu.
+  const allowed = new Set((body.profiles || []).filter(p => p.allowed).map(p => p.name));
   $('#panel').querySelectorAll('[data-start]').forEach(b => {
+    b.hidden = !allowed.has(b.dataset.start);
     b.disabled = !startable;
     b.onclick = () => startTask(id, b.dataset.start);
   });
-  $('#startnote').textContent = !startable ? 'only backlog tickets can be started'
+  $('#startnote').textContent = !allowed.size ? 'this board allows no sessions (see its repos menu)'
+    : !startable ? 'only backlog tickets can be started'
     : !(body.repos || []).length ? 'needs a repo first' : '';
   // The link follows the field as it is typed, so it always opens the number shown.
   const syncPlanioLink = () => {
@@ -743,7 +747,7 @@ async function startTask(id, profile) {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ profile }),
     });
-    $('#startnote').textContent = `${body.profile} opened in ${body.started_in}`;
+    $('#startnote').textContent = `${body.profile} opened in a new Ghostty ${body.opened} in ${body.started_in}`;
   } catch (e) { fail(e.message); }
 }
 
@@ -850,6 +854,8 @@ async function openRepos(pid) {
     const here = new Set(list.map(r => r.repo.id));
     shareable = body.repos.filter(x => !here.has(x.repo.id));
   } catch (e) { fail(e.message); }
+  let profiles = [];
+  try { profiles = (await api(`/api/projects/${pid}`)).body.profiles || []; } catch (e) { fail(e.message); }
   const me = pid;
   $('#panel').innerHTML = `
     <div class="row" style="justify-content:space-between">
@@ -889,6 +895,14 @@ async function openRepos(pid) {
         <button id="radd" class="primary">add</button>
       </div>
     </section>
+    <section><h3>sessions</h3>
+      <div class="row">${profiles.map(p => `
+        <label><input type="checkbox" data-profile="${esc(p.name)}"${p.allowed ? ' checked' : ''}> open in ${esc(p.name)}</label>`).join('')}
+      </div>
+      <div class="dim2" style="font-size:11px">
+        Which Claude Code setups this board's tickets can be opened in.
+      </div>
+    </section>
     <section><h3>danger</h3>
       ${list.length ? `<div class="row">
         <select id="rforget" class="grow">${list.map(r =>
@@ -919,6 +933,12 @@ async function openRepos(pid) {
   $('#panel').querySelectorAll('[data-remove]').forEach(b =>
     b.onclick = () => removeRepo(Number(b.dataset.remove)));
   if ($('#rforgetgo')) $('#rforgetgo').onclick = () => forgetRepo(Number($('#rforget').value));
+  $('#panel').querySelectorAll('[data-profile]').forEach(c =>
+    c.onchange = () => repoWrite(`/api/projects/${me}/profiles/${encodeURIComponent(c.dataset.profile)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ allowed: c.checked }),
+    }));
   $('#bforget').onclick = () => forgetBoard(me, title);
 }
 

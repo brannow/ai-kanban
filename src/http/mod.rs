@@ -55,6 +55,7 @@ pub fn router(api: Api) -> Router {
         .route("/api/projects/{p}", get(routes::project).delete(routes::forget_board))
         .route("/api/projects/{p}/board", get(routes::board))
         .route("/api/projects/{p}/workstream", put(routes::set_workstream))
+        .route("/api/projects/{p}/profiles/{name}", put(routes::set_profile))
         .route("/api/projects/{p}/repos", get(routes::repos).post(routes::create_repo))
         .route("/api/projects/{p}/repos/{r}", patch(routes::update_repo).delete(routes::delete_repo))
         .route("/api/projects/{p}/repos/{r}/home", put(routes::repo_home))

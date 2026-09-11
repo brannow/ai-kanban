@@ -178,6 +178,7 @@ impl Store {
         tx.execute("DELETE FROM board_repos WHERE project_id = ?1", [project_id])?;
         tx.execute("UPDATE tasks SET blocked_by = NULL WHERE project_id = ?1", [project_id])?;
         tx.execute("DELETE FROM current_workstream WHERE project_id = ?1", [project_id])?;
+        tx.execute("DELETE FROM board_denied_profiles WHERE project_id = ?1", [project_id])?;
         tx.execute("DELETE FROM tasks WHERE project_id = ?1", [project_id])?;
         tx.execute("DELETE FROM workstreams WHERE project_id = ?1", [project_id])?;
         tx.execute("DELETE FROM project_paths WHERE project_id = ?1", [project_id])?;

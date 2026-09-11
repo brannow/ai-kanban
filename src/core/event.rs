@@ -39,7 +39,11 @@ fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
 /// `workstream_entered` is here and `workstream_created` deliberately is not: starting a
 /// piece of work is history a cold agent benefits from ("we began the contact-form work"),
 /// whereas switching which slice you are looking at is navigation, not news.
-pub(crate) const HOUSEKEEPING_KINDS: &[&str] = &["path_learned", "workstream_entered"];
+///
+/// `profile_allowed` / `profile_denied` are which buttons the board page offers a person, and
+/// say nothing about the work.
+pub(crate) const HOUSEKEEPING_KINDS: &[&str] =
+    &["path_learned", "workstream_entered", "profile_allowed", "profile_denied"];
 
 /// Events whose body is a copy of the title of the thing they happened to. Recall excludes
 /// them, or every task and note matches twice: once as itself, once as an event repeating
