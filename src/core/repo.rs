@@ -25,9 +25,17 @@
 //!
 //! # Who registers them
 //!
-//! A person, through the web UI's repos menu. The agent names repos on tasks and never
-//! registers one: registering changes which board a directory resolves to, and that is not a
-//! side effect an agent should reach for while filing a side quest.
+//! A person, through the web UI's repos menu -- and an agent, through `repo_add` or
+//! `ai-kanban repo add`. Registering was the agent's business all along and was simply
+//! unreachable: it was told to name repos on tickets, on a board where the first repo could
+//! only be created in a UI it cannot open, so the honest move -- hand-written SQL past the
+//! name normalizer -- was worse than the thing being prevented.
+//!
+//! What made it look dangerous is that registering changes which board a directory resolves
+//! to. It cannot do that behind anyone's back: a path another board already claims is
+//! refused outright (`PathClaimed`), and attaching a checkout another board homes leaves the
+//! home where it is. Moving a home is `set_repo_home`, a separate act, and still only the
+//! person's.
 
 use crate::core::error::{Error, Result};
 use crate::core::model::{Actor, Repo, RepoSummary, Task, TaskLinks};
@@ -144,8 +152,8 @@ impl Store {
             field: "repo",
             value: value.to_string(),
             valid: if names.is_empty() {
-                "none yet -- a person adds this board's repos in the web UI's repos menu \
-                 (ai-kanban serve)".into()
+                "none yet -- register this board's checkouts with repo_add (or \
+                 `ai-kanban repo add <path>`)".into()
             } else {
                 names.join(", ")
             },

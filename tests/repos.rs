@@ -178,8 +178,8 @@ fn a_ticket_cannot_name_another_boards_repo() {
 fn an_unknown_repo_lists_the_ones_that_exist_or_says_where_they_come_from() {
     let f = fixture();
     let err = f.s.resolve_repos(f.pid, &["eee-api".into()]).unwrap_err();
-    assert!(render::error(&err).contains("repos menu"),
-        "an agent cannot add repos, so an empty board must say who does: {}", render::error(&err));
+    assert!(render::error(&err).contains("repo_add"),
+        "an empty board must name the tool that fixes it: {}", render::error(&err));
 
     f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
     let err = f.s.resolve_repos(f.pid, &["eee-apx".into()]).unwrap_err();
@@ -533,4 +533,56 @@ fn moving_a_ticket_keeps_its_history_and_says_what_it_left_behind() {
 
     let stale = f.s.move_task(other, t.id, f.pid, Actor::User, None, Some(1));
     assert!(matches!(stale, Err(Error::Conflict { .. })), "the web UI's move is version-guarded");
+}
+
+#[test]
+fn the_repo_menu_shows_the_path_and_only_names_a_home_that_is_elsewhere() {
+    // The path is the point: it is what tells an agent which directory the work is in. The
+    // home board is noise on the common row and only worth a line when it is NOT this board.
+    let f = fixture();
+    f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
+    let out = render::repo_menu("eee", &f.s.repo_summaries(f.pid).unwrap());
+    assert!(out.contains("eee-api"), "{out}");
+    assert!(out.contains(&canon(&f.api)), "{out}");
+    assert!(!out.contains("opens on board"), "its home IS this board: {out}");
+
+    // Shared onto a second board: there the row has to say where the folder actually opens,
+    // or an agent reads the path as leading back to the board it is looking at.
+    let other = f.s.create_board("web").unwrap();
+    f.s.add_repo(other.id, &f.api, None, Actor::User).unwrap();
+    let out = render::repo_menu("web", &f.s.repo_summaries(other.id).unwrap());
+    assert!(out.contains("opens on board \"eee\""), "{out}");
+}
+
+#[test]
+fn an_empty_board_is_told_how_to_get_its_first_repo() {
+    // The case that made every ticket say "no repo set": a board that tracks no repos, and
+    // an agent with no idea that registering one is something it may do.
+    let f = fixture();
+    let out = render::repo_menu("eee", &f.s.repo_summaries(f.pid).unwrap());
+    assert!(out.contains("repo_add"), "{out}");
+}
+
+#[test]
+fn the_cross_board_listing_names_the_board_each_folder_opens_on() {
+    let f = fixture();
+    f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
+    let homes: std::collections::HashMap<i64, String> =
+        f.s.all_projects().unwrap().into_iter().map(|p| (p.id, p.name)).collect();
+    let repos: Vec<(Repo, String)> = f.s.all_repos().unwrap().into_iter()
+        .map(|r| { let h = homes[&r.home_project_id].clone(); (r, h) }).collect();
+    let out = render::repo_directory(&repos);
+    assert!(out.contains("1 repo\n"), "{out}");
+    assert!(out.contains("(opens on eee)"), "{out}");
+}
+
+#[test]
+fn adding_a_repo_twice_is_not_an_error() {
+    // Agents retry. A second `repo_add` of the same checkout has to be the state the caller
+    // asked for, not a failure it has to interpret -- and it must not make a second repo.
+    let f = fixture();
+    let first = f.s.add_repo(f.pid, &f.api, None, Actor::Agent).unwrap();
+    let again = f.s.add_repo(f.pid, &f.api, None, Actor::Agent).unwrap();
+    assert_eq!(first.id, again.id);
+    assert_eq!(f.s.repos(f.pid).unwrap().len(), 1);
 }

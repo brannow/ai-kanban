@@ -802,8 +802,10 @@ fn links_json(links: &[TaskLinks]) -> serde_json::Map<String, serde_json::Value>
 // Repos
 //
 // No `If-Match` on these writes, unlike tasks and notes. The guard exists for a form held
-// open while an agent writes the same row -- and no agent writes repos. They are registered,
-// renamed and removed only from here, so there is no second writer to lose an update to.
+// open while an agent overwrites the same row, and a repo has no such row: an agent can now
+// register and remove repos (`repo_add`, `repo_remove`), but neither edits a field this form
+// owns. A rename is still only from here, and a repo removed underneath an open form fails
+// the rename outright rather than losing what was typed into it.
 // ---------------------------------------------------------------------------
 
 /// The repos menu: every repo on the board, with how many tickets touch it.
@@ -824,16 +826,6 @@ pub struct RepoBody {
     pub name: Option<String>,
 }
 
-/// `~` is expanded here rather than in core: it is how a person types a path into a form, and
-/// anyone calling core from a shell already had it expanded for them.
-fn expand_home(raw: &str) -> std::path::PathBuf {
-    let rest = if raw == "~" { Some("") } else { raw.strip_prefix("~/") };
-    match (rest, dirs::home_dir()) {
-        (Some(rest), Some(home)) => home.join(rest),
-        _ => raw.into(),
-    }
-}
-
 pub async fn create_repo(
     State(api): State<Api>, Path(p): Path<String>, Json(b): Json<RepoBody>,
 ) -> ApiResult<impl IntoResponse> {
@@ -847,7 +839,7 @@ pub async fn create_repo(
             valid: "the path of a local checkout".into(),
         }));
     }
-    let repo = store.add_repo(project.id, &expand_home(raw), b.name.as_deref(), Actor::User)?;
+    let repo = store.add_repo(project.id, &crate::expand_home(raw), b.name.as_deref(), Actor::User)?;
     Ok((StatusCode::CREATED, Json(json!({ "repo": repo }))))
 }
 

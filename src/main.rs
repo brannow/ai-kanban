@@ -21,6 +21,9 @@ USAGE:
     ai-kanban export [project...]  Write the store as JSON on stdout
     ai-kanban import <file>        Restore projects from an export
     ai-kanban projects             List every board in the store
+    ai-kanban repo list [board]    Repos on a board, or \"all\" for every repo in the store
+    ai-kanban repo add <path>      Register a checkout on this directory's board
+    ai-kanban repo rm <repo>       Take a repo off this directory's board
     ai-kanban merge <keep> <gone>  Repair a board that split into two
     ai-kanban where                Print the path to the store
     ai-kanban --help
@@ -142,6 +145,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             print!("{}", ai_kanban::render::merge_report(&report));
             Ok(())
         }
+        Some("repo") => repo_cmd(),
         Some("where") => {
             println!("{}", Store::default_path()?.display());
             Ok(())
@@ -152,6 +156,84 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(other) => {
             eprintln!("unknown command: {other}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// `repo list | add | rm`. The board is the one this directory belongs to, the same rule the
+/// MCP tools follow -- a person running this stands in the checkout they mean.
+///
+/// `add` may bring a board into being, because registering a checkout is exactly the act
+/// that says "this directory is work"; `list` and `rm` never do, so running them in some
+/// unrelated folder cannot leave an empty board behind.
+fn repo_cmd() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let arg = |n: usize| args.get(n).map(String::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let cwd = std::env::current_dir()?;
+    let store = Store::open_default()?;
+
+    let here = |store: &Store| -> Result<ai_kanban::core::model::Project, Box<dyn std::error::Error>> {
+        match store.find_project(&cwd)? {
+            Some(p) => Ok(p),
+            None => Err(Box::new(ai_kanban::core::Error::NoProjectContext)),
+        }
+    };
+
+    match arg(0) {
+        Some("list") | None => {
+            if arg(1).is_some_and(|a| a.eq_ignore_ascii_case("all")) {
+                let homes: std::collections::HashMap<i64, String> =
+                    store.all_projects()?.into_iter().map(|p| (p.id, p.name)).collect();
+                let repos: Vec<_> = store.all_repos()?.into_iter()
+                    .map(|r| { let h = homes.get(&r.home_project_id).cloned().unwrap_or_default(); (r, h) })
+                    .collect();
+                print!("{}", ai_kanban::render::repo_directory(&repos));
+                return Ok(());
+            }
+            let project = match arg(1) {
+                Some(name) => store.project_by_name_or_key(name)?,
+                None => here(&store)?,
+            };
+            print!("{}", ai_kanban::render::repo_menu(&project.name, &store.repo_summaries(project.id)?));
+            Ok(())
+        }
+        Some("add") => {
+            let Some(path) = arg(1) else {
+                eprintln!("usage: ai-kanban repo add <path> [name]");
+                std::process::exit(2);
+            };
+            let project = store.resolve_project(&cwd)?.project;
+            let repo = store.add_repo(
+                project.id, &ai_kanban::expand_home(path), arg(2), ai_kanban::core::model::Actor::User,
+            )?;
+            println!("{} -> {} (board {})", repo.name, repo.path, project.name);
+            Ok(())
+        }
+        Some("rm") => {
+            let Some(name) = arg(1) else {
+                eprintln!("usage: ai-kanban repo rm <repo>");
+                std::process::exit(2);
+            };
+            let project = here(&store)?;
+            // Resolved by name or path through core, so the CLI and the MCP tool accept the
+            // same spellings and give the same error when one is wrong.
+            let ids = store.resolve_repos(project.id, &[name.to_string()])?;
+            let Some(&id) = ids.first() else {
+                return Err(Box::new(ai_kanban::core::Error::InvalidValue {
+                    field: "repo",
+                    value: name.to_string(),
+                    valid: "a repo on this board -- `ai-kanban repo list` shows them".into(),
+                }));
+            };
+            let repo = store.repo(project.id, id)?;
+            let unlinked = store.remove_repo(project.id, id, ai_kanban::core::model::Actor::User)?;
+            println!("{} removed from {}, off {unlinked} ticket{}",
+                repo.name, project.name, if unlinked == 1 { "" } else { "s" });
+            Ok(())
+        }
+        Some(other) => {
+            eprintln!("unknown repo command: {other}\n\nusage: ai-kanban repo list|add|rm");
             std::process::exit(2);
         }
     }

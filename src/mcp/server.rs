@@ -272,6 +272,31 @@ pub struct LogParams {
     pub project: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct RepoAddParams {
+    /// The local checkout, e.g. "/Users/me/code/eee-web" or "~/code/eee-web". The directory
+    /// has to exist on this machine.
+    pub path: String,
+    /// What to call it. Defaults to the directory's name, which is usually right.
+    pub name: Option<String>,
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct RepoListParams {
+    /// Which board. Omit for the current project. Pass "all" for every repo in the store
+    /// with the board its folder opens on -- how to tell whether a checkout is already
+    /// registered somewhere else.
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct RepoRemoveParams {
+    /// The repo, by name as the board lists it, or by path.
+    pub repo: String,
+    pub project: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
@@ -528,6 +553,90 @@ impl AiKanban {
             None => Default::default(),
         };
         Ok(render::recall(&result, cross, &missing))
+    }
+
+
+    /// Register a local checkout on this board, so tickets can name it and so an agent
+    /// opening that folder lands here. Pass the directory; the name defaults to its own.
+    ///
+    /// Safe to call again: a checkout this board already has comes back unchanged, and one
+    /// that is already a repo on another board is attached to this board without moving
+    /// where its folder opens.
+    #[tool(name = "repo_add", annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true))]
+    fn repo_add(&self, Parameters(p): Parameters<RepoAddParams>) -> Result<String, ErrorData> {
+        let store = self.store();
+        let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
+        let pid = resolved.project.id;
+        // Read before the write, so the response can say which of the three things happened.
+        // Asking afterwards could not distinguish "created" from "was already here".
+        let before = store.repos(pid).map_err(fail)?;
+        let repo = store
+            .add_repo(pid, &crate::expand_home(p.path.trim()), p.name.as_deref(), Actor::Agent)
+            .map_err(fail)?;
+        let note = match before.iter().find(|r| r.id == repo.id) {
+            Some(_) => format!("{} was already on this board.", repo.name),
+            None if repo.home_project_id == pid => {
+                format!("{} added. Its folder now opens on this board.", repo.name)
+            }
+            // Attached, not created: saying where it opens matters most here, because it is
+            // the one case where the folder does NOT lead back to the board that just took it.
+            None => format!(
+                "{} added to this board. Its folder still opens on the board it is homed on.",
+                repo.name
+            ),
+        };
+        let menu = store.repo_summaries(pid).map_err(fail)?;
+        Ok(format!("{}\n{note}\nName it on a ticket with task_add or task_update `repos`.\n",
+            render::repo_menu(&resolved.project.name, &menu)))
+    }
+
+    /// The repos on this board -- their names, as a ticket must spell them, and the folder
+    /// each one opens. Pass project "all" to see every repo in the store instead.
+    #[tool(name = "repo_list", annotations(read_only_hint = true, idempotent_hint = true))]
+    fn repo_list(&self, Parameters(p): Parameters<RepoListParams>) -> Result<String, ErrorData> {
+        let store = self.store();
+        if p.project.as_deref().map(|s| s.eq_ignore_ascii_case(ALL)).unwrap_or(false) {
+            let homes: std::collections::HashMap<i64, String> = store
+                .all_projects().map_err(fail)?.into_iter().map(|x| (x.id, x.name)).collect();
+            let repos: Vec<(Repo, String)> = store.all_repos().map_err(fail)?.into_iter()
+                .map(|r| {
+                    let home = homes.get(&r.home_project_id).cloned().unwrap_or_default();
+                    (r, home)
+                })
+                .collect();
+            return Ok(render::repo_directory(&repos));
+        }
+        let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
+        let menu = store.repo_summaries(resolved.project.id).map_err(fail)?;
+        Ok(render::repo_menu(&resolved.project.name, &menu))
+    }
+
+    /// Take a repo off this board and off this board's tickets, when it turns out not to be
+    /// part of this work. Other boards keep it; if this board was its home and others have
+    /// it, the folder starts opening on the earliest of those instead.
+    ///
+    /// Nothing is deleted except the link -- the tickets, notes and history stay.
+    #[tool(name = "repo_remove", annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false))]
+    fn repo_remove(&self, Parameters(p): Parameters<RepoRemoveParams>) -> Result<String, ErrorData> {
+        let store = self.store();
+        let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
+        let pid = resolved.project.id;
+        // Through the same resolver `task_add`'s `repos` uses, so one spelling works on both
+        // and an unknown one fails with the names that exist.
+        let ids = store.resolve_repos(pid, std::slice::from_ref(&p.repo)).map_err(fail)?;
+        let Some(&id) = ids.first() else {
+            return Err(fail(Error::InvalidValue {
+                field: "repo",
+                value: p.repo.clone(),
+                valid: "a repo on this board -- repo_list shows them".into(),
+            }));
+        };
+        let name = store.repo(pid, id).map_err(fail)?.name;
+        let unlinked = store.remove_repo(pid, id, Actor::Agent).map_err(fail)?;
+        let menu = store.repo_summaries(pid).map_err(fail)?;
+        Ok(format!("{}\n{name} removed from this board, off {unlinked} ticket{}.\n",
+            render::repo_menu(&resolved.project.name, &menu),
+            if unlinked == 1 { "" } else { "s" }))
     }
 
     /// Record what happened or what was decided. Use it for decisions and session summaries

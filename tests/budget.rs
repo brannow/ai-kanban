@@ -203,3 +203,28 @@ fn the_all_boards_view_is_capped_by_board_count() {
     assert!(text.contains("35 more"), "the omitted boards must be reported: {text}");
     assert!(tokens(&text) < 700, "all-boards view cost {} tokens", tokens(&text));
 }
+
+#[test]
+fn the_repo_menu_stays_affordable_on_a_board_with_many_checkouts() {
+    // `repo_list` is uncapped, on purpose: a menu you pick from cannot hide a row, and the
+    // first thing a truncated one would cost is the repo an agent was looking for. That makes
+    // its cost scale with something the project does not control -- how many checkouts a board
+    // has -- so it is measured at a scale well past any real monorepo rather than capped.
+    let (s, pid) = year_old_project();
+    let root = std::env::temp_dir().join(format!("aik-budget-menu-{}", std::process::id()));
+    for i in 0..20 {
+        let d = root.join(format!("payments-service-{i}"));
+        std::fs::create_dir_all(&d).unwrap();
+        s.add_repo(pid, &d, None, Actor::User).unwrap();
+    }
+    // The board's own name, not a literal: a mismatch would put "opens on board ..." on every
+    // row and measure a case that cannot happen.
+    let board = s.project(pid).unwrap().name;
+    let text = render::repo_menu(&board, &s.repo_summaries(pid).unwrap());
+    eprintln!("\n=== repo_list, 20 repos -- ~{} tokens ===\n{}", tokens(&text), text);
+    // Generous partly because the fixture's paths are macOS temp paths, ~90 characters of
+    // `/private/var/folders/...` that a real checkout does not carry. The tripwire is an
+    // order-of-magnitude regression, not this number.
+    assert!(tokens(&text) < 750, "repo_list cost {} tokens", tokens(&text));
+    std::fs::remove_dir_all(&root).ok();
+}

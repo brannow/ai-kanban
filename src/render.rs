@@ -250,7 +250,8 @@ pub fn task_detail(d: &TaskDetail) -> String {
     } else if d.board_has_repos && t.status.is_open() {
         // The board only flags it; here, at the moment of starting, it says what to do.
         out.push_str("\nno repo set -- ask the user which repos this touches, then record them \
-                      with task_update `repos`\n");
+                      with task_update `repos`. A checkout the board does not have yet is \
+                      registered with repo_add.\n");
     }
 
     if !d.tags.is_empty() {
@@ -561,6 +562,48 @@ pub fn error(e: &crate::core::Error) -> String {
         }
         other => format!("{other}\n"),
     }
+}
+
+/// A board's repos: what the agent can name on a ticket, and where each one opens.
+///
+/// The path is on the line because that is the whole reason an agent asks for this list --
+/// it needs to know which directory the work is in. The home board is named only when it is
+/// **not** this board, since "opens here" is the unremarkable case and printing it on every
+/// row would cost a line's worth of tokens to say nothing.
+pub fn repo_menu(board: &str, repos: &[RepoSummary]) -> String {
+    let mut out = format!("Board: {board}\n\n");
+    if repos.is_empty() {
+        out.push_str("No repos on this board yet. Add one with repo_add, passing the path of \
+                      the checkout.\n");
+        return out;
+    }
+    let pad = repos.iter().map(|r| r.repo.name.chars().count()).max().unwrap_or(0);
+    out.push_str("repos\n");
+    for r in repos {
+        out.push_str(&format!("  {:pad$}  {}", r.repo.name, r.repo.path));
+        if r.home_board != board {
+            out.push_str(&format!("  (opens on board \"{}\")", r.home_board));
+        }
+        if r.total > 0 {
+            out.push_str(&format!("  {} ticket{}, {} open", r.total, plural(r.total), r.open));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Every repo in the store with the board its folder opens on -- the cross-board view, for
+/// "is this checkout already registered somewhere?", which no single board can answer.
+pub fn repo_directory(repos: &[(Repo, String)]) -> String {
+    if repos.is_empty() {
+        return "No repos in the store yet.\n".to_string();
+    }
+    let pad = repos.iter().map(|(r, _)| r.name.chars().count()).max().unwrap_or(0);
+    let mut out = format!("{} repo{}\n", repos.len(), plural(repos.len()));
+    for (r, home) in repos {
+        out.push_str(&format!("  {:pad$}  {}  (opens on {})\n", r.name, r.path, home));
+    }
+    out
 }
 
 fn plural(n: usize) -> &'static str { if n == 1 { "" } else { "s" } }

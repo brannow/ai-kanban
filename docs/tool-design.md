@@ -368,10 +368,28 @@ syntax, deliberately — see `docs/data-model.md`.
 leaves them alone, `""` clears `repos`, and `0` clears `planio` — the `blocked_by` sentinel,
 for the same reason.
 
-An unknown repo name fails with the names that exist. On a board with none, it says who adds
-them, because the agent cannot: registering a repo changes which board a directory resolves
-to, and that is the person's call, made in the web UI's repos menu. So there is no `repo_add`
-tool — no new tool at all. Repos ride the intents that already exist, as workstreams do.
+An unknown repo name fails with the names that exist. On a board with none, it says how to
+register one — `repo_add`.
+
+There are three repo tools, and they were added late, after the version of this section that
+argued for none. The argument was that registering changes which board a directory resolves to
+and is therefore the person's call. The hole in it: an agent is told to name repos on tickets,
+and on a board with no repos yet the only way to get the first one was a UI the agent cannot
+open. What it actually did was write SQL into the store by hand, straight past the name
+normalizer `eee-web` / `EEE_Web` exists to catch. A tool the agent routes around is not a
+restriction, it is a bug with a rationale.
+
+- `repo_add` — path, optional name. Idempotent by construction: a checkout this board already
+  has comes back unchanged, one another board homes is attached without moving its home, and a
+  path another board claims is refused with `merge` as the repair. Those three cases are what
+  makes it safe to hand to an agent; the consequential act — moving a repo's home — is still
+  only the person's, in the UI.
+- `repo_list` — the board's repos with their paths, or `project: "all"` for every repo in the
+  store with the board its folder opens on.
+- `repo_remove` — off this board and this board's tickets. Nothing is deleted but the link.
+
+`ai-kanban repo add|list|rm` is the same three from a terminal, over the same `Store` calls, so
+neither surface can grow its own idea of what a repo name means.
 
 They **are on the board line**, unlike tags:
 

@@ -228,8 +228,11 @@ acts on; which checkouts a ticket lives in and which ticket it is are what an ag
 pick the work up at all. Measured at its worst — two repos and a ref on every listed row — in
 `tests/budget.rs`.
 
-**A person registers repos**, in the web UI's repos menu. The agent names repos on tasks and
-never registers one, because registering changes which board a directory resolves to.
+**Repos are registered from any surface**: the web UI's repos menu, `repo_add`, or
+`ai-kanban repo add`. All three call `Store::add_repo`, which is where the name is normalized
+and where a path another board already claims is refused — the guard that makes it safe for an
+agent to register one. What stays the person's call is *moving* a repo's home
+(`set_repo_home`), since that is what changes where an existing folder resolves.
 
 ### `tasks`
 
