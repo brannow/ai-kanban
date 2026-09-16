@@ -65,7 +65,8 @@ ecosystems, to solve "remember what happened last week".
 - **Not a platform, not an ecosystem.** No orchestration layer, no per-task runtime, no
   scheduler, no daemon.
 - **Not a Jira clone.** No sprints, estimates, burndown, assignees, WIP limits, or workflow
-  states beyond the five that carry meaning. Board-management ceremony serves humans managing
+  states beyond the ones that carry meaning — a status earns its place by changing what an
+  agent does, never by labelling a stage. Board-management ceremony serves humans managing
   humans.
 - **Not a team planning tool.** One person and their agents.
 - **Not a chat log.** Events record what happened and why, not a transcript.
@@ -74,6 +75,14 @@ ecosystems, to solve "remember what happened last week".
 
 The test for any proposed feature: does an agent starting cold work better because of it? If
 the honest answer is "it would look more complete", it does not belong.
+
+**The to-do list is the one thing here that does not pass that test, and is in anyway.** It
+is the person's own list, added because they asked for it, and it makes no agent work better.
+What keeps it consistent with the rest rather than a hole in it: it costs the agent *nothing*
+— no tool, no tokens on the board, no line in the history it reads, no status it has to
+understand. It is quarantined in `core::todo`, reachable only from the web UI, and every
+agent-facing surface is asserted blind to it in `tests/todos.rs`. A second feature bought
+against this precedent would need the same quarantine, and most would not survive it.
 
 ## Consumers, in priority order
 

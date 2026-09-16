@@ -70,6 +70,10 @@ pub fn router(api: Api) -> Router {
         .route("/api/projects/{p}/notes/{n}", delete(routes::forget_note))
         .route("/api/projects/{p}/events", get(routes::events))
         .route("/api/recall", get(routes::recall))
+        // Global, not under /api/projects: the person's to-do list is the same list from
+        // every board. Nothing on the agent's surface reaches it.
+        .route("/api/todos", get(routes::todos).post(routes::create_todo))
+        .route("/api/todos/{id}", patch(routes::update_todo).delete(routes::delete_todo))
         .route("/api/stream", get(stream::sse))
         .with_state(api)
 }
@@ -124,6 +128,7 @@ impl IntoResponse for ApiError {
                 serde_json::json!({ "existing": existing }),
             ),
             Error::NoteNotFound { .. } => (StatusCode::NOT_FOUND, "not_found", serde_json::json!({})),
+            Error::TodoNotFound { .. } => (StatusCode::NOT_FOUND, "not_found", serde_json::json!({})),
             Error::ProjectNotFound { existing, .. } => (
                 StatusCode::NOT_FOUND,
                 "not_found",

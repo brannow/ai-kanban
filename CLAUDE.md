@@ -61,7 +61,12 @@ Apply it to every change to the tool surface. Details and worked examples in
   stream polls (`MAX(events.id)`), so a write with no event is invisible to a live page.
   `tests/change_feed.rs` asserts it for every mutation. Infrastructure events go in
   `HOUSEKEEPING_KINDS`, which keeps them out of the agent's `recent` without hiding them
-  from the feed.
+  from the feed. The one exception is `todos`, which writes no events on purpose and carries
+  its own `todo_rev` counter for the live page — see `docs/data-model.md`.
+- **Nothing on the agent's surface may reach `core::todo`.** The person's to-do list is the
+  only thing here the agent is blind to, and that is the whole feature. No tool, no rendered
+  line, no hook output, no recall index. `tests/todos.rs` asserts it against the real tool
+  router, so a tool added later that exposed one would fail there.
 - **Hook code must never write, never create, and never fail loudly.** It runs in every
   directory the user opens Claude Code in.
 - Comments explain *why*. What the code does is already visible.

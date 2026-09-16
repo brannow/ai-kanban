@@ -20,6 +20,9 @@ specific each time:
 | `events` | What happened, and **why** | Append-only, never edited |
 | `notes` | What is true about this codebase | Edited in place, outlives its task |
 
+A fourth table, `todos`, is deliberately *not* in that list: it answers nothing for an
+agent, and no agent-facing path reads it. See "The person's to-do list" below.
+
 Notes are the one people try to delete. Without them, knowledge is a time-stamped narrative
 in which a superseded fact sits next to the current one with nothing marking which is which.
 "The guard runs before the rewrite" and "actually the rewrite runs first" are both in the
@@ -469,3 +472,46 @@ adoption possible, it does not cause it. See `docs/plan.md`.
 
 Task dependencies beyond `blocked_by`, sprints, estimates, burndown, assignees, WIP limits.
 Board-management ceremony that serves humans managing humans.
+
+---
+
+## The person's to-do list
+
+`todos` is the one table in this store that exists for the human alone. "Renew the domain",
+"call the tax office" — the list that sits beside the work rather than inside it. Added
+because it was asked for; kept honest by costing the agent nothing.
+
+**Why it is not a task.** A task carries a status the agent moves, an `origin` the project
+measures itself by, a workstream, repos, a blocker. A to-do carries none of that. Filed as a
+task it would need a board, appear in front of an agent reading that board cold, and spend
+tokens telling it about errands it can do nothing about.
+
+**Why it is global.** No `project_id`. The list is the same list from every board, which is
+both what was asked for and what the data wants — nobody keeps their errands per repository.
+It also means the list survives `forget_board`, which cascades away everything that carries a
+project id.
+
+**Why it writes no events.** This is the documented exception to "every mutation writes an
+event" (`tests/change_feed.rs`). The events table is the agent's history and feeds `recent` on
+the board it reads cold, and `events.project_id` is `NOT NULL`, so a global to-do has no
+honest row to write there anyway. The cost is that the live page cannot see to-do changes
+through `MAX(events.id)`; `todo_rev` is the counter that repairs it, and the live stream
+carries it beside the cursor. It is a counter rather than `MAX(updated_at)` because
+timestamps are whole seconds, and rather than `MAX(id)` because deleting a row moves that
+number backwards.
+
+**Why there is no `version`.** Every other row a browser can edit carries one, because a form
+sits open for minutes while an agent writes the same row from another process. This is the
+one table no agent writes, so that race is unreachable, and an `If-Match` on a checkbox would
+be ceremony bought with nothing.
+
+**Checked items are swept a day later** (`core::todo::SWEEP_AFTER`), on read — there is no
+scheduler. Leaving a checked item up is what lets a person see what they finished and undo a
+mis-click, and both of those expire on roughly that scale.
+
+**What "the agent cannot touch it" means, exactly.** There is no MCP tool, no line in the
+rendered board, nothing in the session-start hook, and nothing in the recall index — asserted
+against the real tool router and the real rendered output in `tests/todos.rs`. What it does
+not mean is cryptographic: the store is one SQLite file, and an agent with a shell can read
+any file on the machine. The guarantee is about the surface, which is the part that governs
+what an agent does on its own initiative.

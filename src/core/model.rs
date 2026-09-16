@@ -193,6 +193,23 @@ pub struct Note {
     pub version: i64,
 }
 
+/// An item on the person's own to-do list. Global -- no `project_id` -- and touched by no
+/// agent-facing surface. See `core::todo`.
+///
+/// No `version` either, unlike `Task` and `Note`. That guard exists because a browser form
+/// sits open for minutes while an agent writes the same row from another process, and this is
+/// the one table no agent writes. A checkbox that demanded an `If-Match` would be paying for
+/// a race that cannot happen.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Todo {
+    pub id: i64,
+    pub text: String,
+    /// `None` = not checked. A timestamp because checked items are swept a day later.
+    pub done_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 // ---------------------------------------------------------------------------
 // Workstreams
 // ---------------------------------------------------------------------------

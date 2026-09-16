@@ -129,6 +129,14 @@
   .reporow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 7px 0; border-bottom: 1px solid var(--line); }
   .reporow .p { color: var(--dim2); font-size: 11px; word-break: break-all; flex: 1 1 200px; }
   .board { color: var(--idea); font-weight: 600; }
+  /* The person's to-do list. Deliberately plainer than a task card: it is a checklist, not
+     a ticket, and anything that made it look like a card would invite reading it as one. */
+  .tdrow { display: flex; gap: 8px; align-items: baseline; padding: 6px 0; border-bottom: 1px solid var(--line); }
+  .tdrow label { flex: 1; display: flex; gap: 8px; align-items: baseline; cursor: pointer; word-break: break-word; }
+  .tdrow.done label { color: var(--dim2); text-decoration: line-through; }
+  .tdrow button { background: none; border: 0; color: var(--dim2); padding: 0 4px; font-size: 11px; }
+  .tdrow button:hover { color: var(--accent); }
+  .tdrow button.danger:hover { color: var(--bug); }
   /* `.ws` and friends set `display`, which beats the UA's rule for [hidden]; this keeps
      `el.hidden = true` meaning what it says everywhere. */
   [hidden] { display: none !important; }
@@ -139,6 +147,7 @@
   <select id="project"></select>
   <button id="newboard" title="a board for a project, e.g. a Planio project">+ board</button>
   <button id="repobtn" title="the local checkouts this board's tickets live in">repos</button>
+  <button id="todobtn" title="your own list, the same from every board — no agent can see or change it">to-dos</button>
   <label class="ws">working in <select id="workstream"></select></label>
   <span id="live">connecting</span>
   <span class="grow"></span>
@@ -485,6 +494,7 @@ async function setWorkstream(name) {
     });
     $('#panel').hidden = true;
     REPOS_OPEN = false;
+    TODOS_OPEN = false;
     // A different slice of the board is a different set of columns; carrying the expansion
     // over would re-open something the reader never expanded here.
     EXPANDED = {};
@@ -509,6 +519,7 @@ function panelDirty() {
   if ($('#panel').hidden) return false;
   if (OPEN_TASK && OPEN_TASK.clean !== undefined && $('#st')) return taskFormState() !== OPEN_TASK.clean;
   if (REPOS_OPEN) return !!(($('#rpath') && $('#rpath').value.trim()) || ($('#rname') && $('#rname').value.trim()));
+  if (TODOS_OPEN) return !!($('#tdnew') && $('#tdnew').value.trim());
   return false;
 }
 
@@ -522,6 +533,7 @@ function closePanel() {
   $('#panel').hidden = true;
   OPEN_TASK = null;
   REPOS_OPEN = false;
+  TODOS_OPEN = false;
 }
 
 // A click outside the drawer closes it, through the same unsaved-edit guard as Esc.
@@ -551,6 +563,7 @@ async function openTask(id, pid) {
     : (BOARD.repos || []);
   OPEN_TASK = { id, pid, version: body.task.version, etag };
   REPOS_OPEN = false;
+  TODOS_OPEN = false;
   const t = body.task;
 
   const statuses = META.statuses.map(s => s.value);
@@ -778,6 +791,7 @@ async function runSearch(q) {
   try {
     const { body } = await api(`/api/recall?q=${encodeURIComponent(q)}`);
     REPOS_OPEN = false;
+    TODOS_OPEN = false;
     OPEN_TASK = null;
     $('#panel').innerHTML = `
       <div class="row" style="justify-content:space-between">
@@ -834,12 +848,129 @@ async function openHit(h) {
   } catch (e) { fail(e.message); }
 }
 
+// ---- the person's to-do list ------------------------------------------------
+
+// Global: the same list from every board, including All Projects. Nothing here goes near a
+// task -- see src/core/todo.rs for why it is a separate table, and why no agent surface can
+// reach it.
+let TODOS_OPEN = false;
+let TODOS = [];
+// -1 rather than 0 so the first stream frame, whatever revision it carries, counts as news.
+let TODO_REV = -1;
+let TODO_COUNT = 0;
+
+// Unchecked items only. A badge counting checked ones would keep claiming work that is done.
+function paintTodoBadge() {
+  $('#todobtn').textContent = TODO_COUNT ? `to-dos ${TODO_COUNT}` : 'to-dos';
+}
+
+async function fetchTodos() {
+  const { body } = await api('/api/todos');
+  TODOS = body.todos;
+  TODO_REV = body.rev;
+  TODO_COUNT = body.open;
+  paintTodoBadge();
+}
+
+// Redrawn in place rather than re-opened, so a live tick cannot throw away what is being
+// typed: the add box's text and its caret survive the repaint.
+function drawTodos() {
+  const box = $('#tdnew');
+  const draft = box ? box.value : '';
+  const focused = box && document.activeElement === box;
+  const rows = TODOS.map(t => `
+    <div class="tdrow${t.done_at ? ' done' : ''}">
+      <label><input type="checkbox" data-td="${t.id}"${t.done_at ? ' checked' : ''}><span>${esc(t.text)}</span></label>
+      <button data-tdedit="${t.id}">edit</button>
+      <button class="danger" data-tdrm="${t.id}" title="remove">&times;</button>
+    </div>`).join('');
+  $('#panel').innerHTML = `
+    <div class="row" style="justify-content:space-between">
+      <h2>to-dos</h2>
+      <button id="close">close</button>
+    </div>
+    <div class="dim2" style="font-size:11px">
+      Yours. The same list from every board, and no agent can see it or change it — it is not
+      on the board, not in an agent's history, and there is no tool for it.
+    </div>
+    <section>
+      <div class="row">
+        <input id="tdnew" class="grow" placeholder="add a to-do…" maxlength="500">
+        <button id="tdadd" class="primary">add</button>
+      </div>
+      <div style="margin-top:10px">${rows || '<div class="empty">nothing on the list</div>'}</div>
+      <div class="dim2" style="font-size:11px; margin-top:8px">
+        Checked items stay here, struck through, and clear themselves a day after you check
+        them. Uncheck one to keep it.
+      </div>
+    </section>`;
+  $('#panel').hidden = false;
+  $('#close').onclick = closePanel;
+  // The task panel installs these to watch for unsaved edits; this drawer has its own
+  // dirty check, so the handlers from whatever was open before must not stay attached.
+  $('#panel').oninput = $('#panel').onchange = null;
+  $('#tdnew').value = draft;
+  if (focused) { $('#tdnew').focus(); $('#tdnew').setSelectionRange(draft.length, draft.length); }
+  $('#tdadd').onclick = addTodo;
+  $('#tdnew').onkeydown = e => { if (e.key === 'Enter') addTodo(); };
+  $('#panel').querySelectorAll('[data-td]').forEach(c =>
+    c.onchange = () => todoWrite(`/api/todos/${c.dataset.td}`, 'PATCH', { done: c.checked }));
+  $('#panel').querySelectorAll('[data-tdedit]').forEach(b =>
+    b.onclick = () => editTodo(Number(b.dataset.tdedit)));
+  $('#panel').querySelectorAll('[data-tdrm]').forEach(b =>
+    b.onclick = () => todoWrite(`/api/todos/${b.dataset.tdrm}`, 'DELETE'));
+}
+
+async function openTodos() {
+  TODOS_OPEN = true;
+  OPEN_TASK = null;
+  REPOS_OPEN = false;
+  try { await fetchTodos(); } catch (e) { fail(e.message); }
+  drawTodos();
+  $('#tdnew').focus();
+}
+
+// Every write refetches rather than patching the list in place: the sweep can remove a row
+// as a side effect of any read, so the server's answer is the only trustworthy list.
+async function todoWrite(path, method, body) {
+  try {
+    await api(path, {
+      method,
+      ...(body ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } : {}),
+    });
+    await fetchTodos();
+    if (TODOS_OPEN) drawTodos();
+  } catch (e) {
+    fail(e.message);
+    // Whatever the checkbox now shows, it is not what the server has.
+    try { await fetchTodos(); if (TODOS_OPEN) drawTodos(); } catch { /* the error above stands */ }
+  }
+}
+
+function addTodo() {
+  const text = $('#tdnew').value.trim();
+  if (!text) return;
+  $('#tdnew').value = '';
+  return todoWrite('/api/todos', 'POST', { text });
+}
+
+function editTodo(id) {
+  const t = TODOS.find(x => x.id === id);
+  if (!t) return;
+  const text = prompt('To-do:', t.text);
+  if (text === null || text.trim() === t.text) return;
+  return todoWrite(`/api/todos/${id}`, 'PATCH', { text });
+}
+
+$('#todobtn').onclick = () => { if (confirmLeave()) openTodos(); };
+
 // ---- repos -----------------------------------------------------------------
 
 // The only place repos are registered. The agent names repos on tickets but never adds one:
 // registering changes which board a directory resolves to, which is a person's decision.
 async function openRepos(pid) {
   REPOS_OPEN = true;
+  TODOS_OPEN = false;
   OPEN_TASK = null;
   REPO_BOARD = pid;
   let list = [];
@@ -1129,6 +1260,16 @@ function connect() {
   es.onerror = () => mark(false, 'reconnecting');
   const onChange = async ev => {
     const d = JSON.parse(ev.data);
+    // Checked separately from the board's cursor: the to-do list writes no events, so a
+    // to-do change moves its own revision and leaves the cursor exactly where it was.
+    if (d.reset || (d.todos !== undefined && d.todos !== TODO_REV)) {
+      // The badge always moves; the open drawer redraws only when nothing is half-typed in
+      // it, the same rule the task panel follows.
+      try {
+        await fetchTodos();
+        if (TODOS_OPEN && !panelDirty()) drawTodos();
+      } catch { /* the badge keeps its last figure */ }
+    }
     if (d.reset || d.cursor > CURSOR) {
       // The picker's "(N open)" counts move with every change, on any board.
       try { await refreshProjects(); } catch { /* the board itself still refreshes */ }
@@ -1169,6 +1310,7 @@ async function onProjectChange() {
   history.replaceState(null, '', `?project=${PROJECT}`);
   $('#panel').hidden = true;
   REPOS_OPEN = false;
+  TODOS_OPEN = false;
   OPEN_TASK = null;
   EXPANDED = {};
   if (ES) ES.close();
@@ -1179,6 +1321,9 @@ async function onProjectChange() {
 (async function boot() {
   try {
     META = (await api('/api/meta')).body;
+    // Before the board: the badge is in the header on every board, including the empty-state
+    // page below, and it is the only thing that tells a person the list has anything on it.
+    try { await fetchTodos(); } catch { /* the list is not worth failing the page over */ }
     await refreshProjects(null);
     const sel = $('#project');
     sel.onchange = onProjectChange;
