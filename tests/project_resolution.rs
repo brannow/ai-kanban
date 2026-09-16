@@ -394,3 +394,125 @@ fn a_directory_that_becomes_a_git_repo_later_keeps_its_board() {
     assert_eq!(after.how, Resolution::KnownPath);
     assert_eq!(after.project.id, before.project.id);
 }
+
+/// A linked worktree of `main` at `wt`, laid out the way `git worktree add` leaves it: a
+/// `.git` file pointing at `<main>/.git/worktrees/<name>`, whose `commondir` leads back.
+fn fake_worktree(main: &Path, wt: &Path, name: &str) {
+    let gitdir = main.join(".git").join("worktrees").join(name);
+    fs::create_dir_all(&gitdir).unwrap();
+    fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+    fs::create_dir_all(wt).unwrap();
+    fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+}
+
+#[test]
+fn a_worktree_of_a_repo_without_a_remote_joins_the_main_board() {
+    // With no remote, both sides used to key on their own directory -- `path:<main>` and
+    // `path:<worktree>` -- so every worktree started an empty board.
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("repo");
+    let wt = tmp.path().join("repo-feature");
+    fs::create_dir_all(&main).unwrap();
+    fake_repo(&main, None);
+    fake_worktree(&main, &wt, "repo-feature");
+    let s = store();
+
+    let m = s.resolve_project(&main).unwrap();
+    let w = s.resolve_project(&wt).unwrap();
+
+    assert_eq!(w.project.id, m.project.id, "worktree must not fork the board");
+    assert_eq!(w.how, Resolution::KnownPath);
+    assert!(!w.created);
+}
+
+#[test]
+fn a_worktree_used_before_its_main_checkout_still_lands_on_the_same_board() {
+    // Order must not matter. The worktree derives its identity from the main checkout's
+    // root, so a later session in the main checkout arrives at the same key.
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("repo");
+    let wt = tmp.path().join("elsewhere").join("feature");
+    fs::create_dir_all(&main).unwrap();
+    fake_repo(&main, None);
+    fake_worktree(&main, &wt, "feature");
+    let s = store();
+
+    let w = s.resolve_project(&wt).unwrap();
+    assert!(w.created);
+    assert_eq!(w.project.name, "repo", "named after the repo, not the worktree directory");
+    assert_eq!(w.project.key, format!("path:{}", fs::canonicalize(&main).unwrap().display()));
+
+    let m = s.resolve_project(&main).unwrap();
+    assert_eq!(m.project.id, w.project.id);
+    assert!(!m.created);
+}
+
+#[test]
+fn a_worktree_joins_a_board_keyed_before_the_repo_had_a_remote() {
+    // ai-kanban's own situation: its board was created as `path:` while the repo had no
+    // remote. Once `origin` exists, a worktree derives `git:<remote>` -- a key no board
+    // has -- unless it resolves as the main checkout, whose path the board already claims.
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("repo");
+    let wt = tmp.path().join("repo-wt");
+    fs::create_dir_all(&main).unwrap();
+    fake_repo(&main, None);
+    let s = store();
+    let before = s.resolve_project(&main).unwrap();
+    assert_eq!(before.how, Resolution::GitRoot);
+
+    fake_repo(&main, Some("git@github.com:me/repo.git"));
+    fake_worktree(&main, &wt, "repo-wt");
+    let w = s.resolve_project(&wt).unwrap();
+
+    assert_eq!(w.project.id, before.project.id, "a remote added later must not fork worktrees off");
+    assert_eq!(s.find_project(&wt).unwrap().unwrap().id, before.project.id, "the read-only lookup must agree");
+}
+
+#[test]
+fn a_submodule_keeps_its_own_board() {
+    // A submodule's `.git` is also a file, but its gitdir has no `commondir` (verified with
+    // a real `git submodule add`): it is a separate repository, not another checkout of the
+    // superproject.
+    let tmp = tempfile::tempdir().unwrap();
+    let sup = tmp.path().join("super");
+    fs::create_dir_all(&sup).unwrap();
+    fake_repo(&sup, Some("git@github.com:me/super.git"));
+    let modgit = sup.join(".git").join("modules").join("lib");
+    fs::create_dir_all(&modgit).unwrap();
+    fs::write(modgit.join("config"), "[remote \"origin\"]\n\turl = git@github.com:me/lib.git\n").unwrap();
+    let sub = sup.join("lib");
+    fs::create_dir_all(&sub).unwrap();
+    // Relative, as `git submodule add` writes it (checked against git 2.55).
+    fs::write(sub.join(".git"), "gitdir: ../.git/modules/lib\n").unwrap();
+    let s = store();
+
+    let parent = s.resolve_project(&sup).unwrap();
+    let child = s.resolve_project(&sub).unwrap();
+
+    assert_ne!(child.project.id, parent.project.id);
+    assert_eq!(child.project.key, "git:github.com/me/lib");
+}
+
+#[test]
+fn a_worktree_honours_a_marker_that_exists_only_in_the_main_checkout() {
+    // An untracked `.ai-kanban` is never copied into a worktree. The worktree has to continue
+    // its walk from the same place in the main checkout, not from its root, or the package
+    // lands on the repo-wide board in the worktree and on its own board in the main checkout.
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("monorepo");
+    let wt = tmp.path().join("monorepo-wt");
+    fs::create_dir_all(main.join("packages").join("api")).unwrap();
+    fake_repo(&main, Some("git@github.com:me/monorepo.git"));
+    fs::write(main.join("packages").join("api").join(".ai-kanban"), "monorepo/api\n").unwrap();
+    fake_worktree(&main, &wt, "monorepo-wt");
+    let deep = wt.join("packages").join("api").join("src");
+    fs::create_dir_all(&deep).unwrap();
+    let s = store();
+
+    let in_main = s.resolve_project(&main.join("packages").join("api")).unwrap();
+    let in_wt = s.resolve_project(&deep).unwrap();
+
+    assert_eq!(in_main.project.key, "monorepo/api");
+    assert_eq!(in_wt.project.id, in_main.project.id);
+}

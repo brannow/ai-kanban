@@ -279,34 +279,58 @@ fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// Where a checkout's git data lives.
+struct GitDir {
+    /// The directory holding the shared config.
+    common: PathBuf,
+    /// A linked worktree: `.git` is a *file* pointing at `<main>/.git/worktrees/<name>`,
+    /// whose `commondir` leads back to the main repo's `.git`.
+    linked: bool,
+}
+
+fn git_dir(repo_root: &Path) -> Option<GitDir> {
+    let dot_git = repo_root.join(".git");
+    if dot_git.is_dir() {
+        return Some(GitDir { common: dot_git, linked: false });
+    }
+    let contents = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = PathBuf::from(contents.strip_prefix("gitdir:")?.trim());
+    let gitdir = if gitdir.is_absolute() { gitdir } else { repo_root.join(gitdir) };
+    match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(c) => {
+            let common = PathBuf::from(c.trim());
+            let common = if common.is_absolute() { common } else { gitdir.join(common) };
+            Some(GitDir { common, linked: true })
+        }
+        // A `.git` file with no `commondir` is a submodule: its git data is its own, and
+        // there is no main checkout for it to belong to.
+        Err(_) => Some(GitDir { common: gitdir, linked: false }),
+    }
+}
+
+/// The main checkout a linked worktree belongs to.
+///
+/// `None` for a main checkout, a submodule, and a worktree of a bare repo -- whose common
+/// dir is not a `.git` inside any checkout, so there is no directory to answer as.
+fn main_checkout(repo_root: &Path) -> Option<PathBuf> {
+    let git = git_dir(repo_root)?;
+    if !git.linked {
+        return None;
+    }
+    // `commondir` is usually relative (`../..`), so the path has to be normalized before
+    // its parent means anything. A main checkout that has since moved fails here, and the
+    // worktree falls back to standing on its own.
+    let common = std::fs::canonicalize(&git.common).ok()?;
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    common.parent().map(Path::to_path_buf)
+}
+
 /// Reads `remote.origin.url` from git's config by hand rather than shelling out to `git`:
 /// no subprocess per resolution, and no dependency on git being installed.
-///
-/// Handles the worktree case, where `.git` is a *file* pointing at
-/// `<main>/.git/worktrees/<name>`. Getting this wrong is precisely how a worktree forks
-/// into its own board -- the failure `project_paths` exists to prevent.
 fn git_remote(repo_root: &Path) -> Option<String> {
-    let dot_git = repo_root.join(".git");
-    let config_path = if dot_git.is_dir() {
-        dot_git.join("config")
-    } else {
-        let contents = std::fs::read_to_string(&dot_git).ok()?;
-        let gitdir = contents.strip_prefix("gitdir:")?.trim();
-        let gitdir = PathBuf::from(gitdir);
-        let gitdir = if gitdir.is_absolute() { gitdir } else { repo_root.join(gitdir) };
-        // `commondir` points back at the main repo's .git, which owns the shared config.
-        match std::fs::read_to_string(gitdir.join("commondir")) {
-            Ok(c) => {
-                let c = c.trim();
-                let common = PathBuf::from(c);
-                let common = if common.is_absolute() { common } else { gitdir.join(common) };
-                common.join("config")
-            }
-            Err(_) => gitdir.join("config"),
-        }
-    };
-
-    let text = std::fs::read_to_string(config_path).ok()?;
+    let text = std::fs::read_to_string(git_dir(repo_root)?.common.join("config")).ok()?;
     let mut in_origin = false;
     for line in text.lines() {
         let t = line.trim();
@@ -407,6 +431,28 @@ impl Store {
                 return Ok(Some(Found::Known(p)));
             }
             if dir.join(".git").exists() {
+                // A linked worktree is its main checkout, checked out somewhere else, so it
+                // resolves exactly as the main checkout does. Deriving an identity from the
+                // worktree's own root instead forks the board whenever the two keys differ:
+                // always with no remote (each is `path:` on its own directory), and when the
+                // board was keyed before the repo had a remote (`path:` vs `git:`). Claude
+                // Code isolates work in worktrees, so that fork lands on the agent that is
+                // least likely to notice it is reading an empty board.
+                //
+                // It continues from the *same place* in the main checkout, not from its root:
+                // a marker that exists only there (untracked, so never copied into the
+                // worktree) must still claim `<worktree>/packages/api` as it claims
+                // `<main>/packages/api`. The main checkout's `.git` is a directory, so the
+                // walk from there ends at the main checkout at the latest.
+                if let Some(main) = main_checkout(dir) {
+                    // Not `main.join("")`: that yields `<main>/`, whose string form matches no
+                    // stored path and derives a different `path:` key.
+                    let same_place = match start.strip_prefix(dir) {
+                        Ok(below) if !below.as_os_str().is_empty() => main.join(below),
+                        _ => main,
+                    };
+                    return self.walk(&same_place);
+                }
                 let name = basename(dir);
                 return Ok(Some(Found::Identity(match git_remote(dir) {
                     Some(url) => (format!("git:{}", normalize_remote(&url)), name, dir.to_path_buf(), Resolution::GitRemote),

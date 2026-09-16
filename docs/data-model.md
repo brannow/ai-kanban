@@ -62,6 +62,21 @@ else the repo root path. Normalization collapses `git@github.com:me/repo.git` an
 `https://github.com/me/repo` to one key, because cloning over SSH on one machine and HTTPS
 on another is the least obvious route to a split board.
 
+That key is **not** fixed over a repo's life. A repo with no remote keys on its root path.
+Once it gets a remote, a fresh derivation yields `git:<remote>`, which no board has. So
+**a linked worktree resolves as its main checkout**, not as a repo of its own: its `.git`
+file leads through `commondir` to the main `.git`, and the walk continues from there.
+Deriving from the worktree's own root forked the board in two ways. With no remote, the two
+checkouts were `path:` on two different directories. When the board predated the remote,
+they were `path:` versus `git:`. Worktrees are how Claude Code isolates work, so the fork
+landed on an agent with no reason to suspect the board it read was empty. A submodule also
+has a `.git` file, but no `commondir`; it is a separate repository and keeps its own board.
+
+What is still open: a **separate clone** of a repo whose board was keyed before the remote
+existed derives `git:` and starts a new board. The obvious repair, re-keying `path:` to
+`git:` on resolve, changes the stable identity that `import` matches on. So it is a
+decision of its own, not a side effect of the worktree fix.
+
 Resolution (`src/core/project.rs`) is **one upward walk**, in two passes:
 
 1. **Markers, all the way up.** The deepest `.ai-kanban` wins. This is a pass of its own,
