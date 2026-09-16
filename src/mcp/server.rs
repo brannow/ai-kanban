@@ -147,7 +147,8 @@ fn repo_ids(store: &Store, project_id: i64, raw: &Option<String>) -> Result<Opti
 pub struct BoardParams {
     /// Which board. Omit for the current project. Pass "all" for a summary of every board.
     pub project: Option<String>,
-    /// Restrict to statuses, comma separated: backlog, doing, blocked, done, archived.
+    /// Restrict to statuses, comma separated: backlog, doing, blocked, testing, done,
+    /// archived.
     /// Omit for open work only.
     pub status: Option<String>,
     /// Show more than the default. Pass "all" to lift the cap on listed tasks.
@@ -192,7 +193,8 @@ pub struct TaskAddParams {
 pub struct TaskUpdateParams {
     /// The task id, as shown on the board.
     pub task: i64,
-    /// backlog, doing, blocked, done or archived.
+    /// backlog, doing, blocked, testing, done or archived. Use testing for work that is
+    /// written but not yet verified -- it stays open, so it is still there next session.
     pub status: Option<String>,
     /// Move it to another workstream. Pass "" to make it general work with no workstream.
     ///

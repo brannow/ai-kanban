@@ -236,7 +236,7 @@ On this board:
 ```
 "finished" is not a valid status.
 
-Valid values: backlog, doing, blocked, done, archived
+Valid values: backlog, doing, blocked, testing, done, archived
 ```
 
 Both are one call away from correct. The listing is scoped to the resolved board — showing
@@ -356,7 +356,7 @@ is the design: the board listing is paid for on every `task_add`, and tags carry
 an agent must act on — which is the whole reason they are safe to offer at all. An agent can
 therefore set a tag it will not see on the board. That is correct. Tags exist so a person can
 say "in review" or "waiting-on-vendor" without inventing workflow states the agent would then
-have to interpret, which is what keeps the five statuses fixed.
+have to interpret, which is what keeps the status set fixed.
 
 They are indexed by `recall`, so typing a tag finds the tasks carrying it. There is no filter
 syntax, deliberately — see `docs/data-model.md`.

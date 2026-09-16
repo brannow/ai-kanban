@@ -236,8 +236,15 @@ agent to register one. What stays the person's call is *moving* a repo's home
 
 ### `tasks`
 
-`status` is one of `backlog | doing | blocked | done | archived`. There is no `next` —
-priority covers it. `archived` is terminal and hidden from the default board.
+`status` is one of `backlog | doing | blocked | testing | done | archived`. There is no
+`next` — priority covers it. `archived` is terminal and hidden from the default board.
+
+`testing` is work that is written but not accepted: the code exists, and a run, a review or a
+person still has to say it holds. It counts as **open**, and that is the whole point — a task
+parked there is unfinished work, and calling it done is how "built but never verified" dies
+with the session that built it. It ranks just behind `doing` on the agent's board, ahead of
+`blocked` and `backlog`, because it is the closest thing on the board to finished and the
+easiest thing for a returning agent to close out.
 
 **`status` is authoritative; `blocked_by` is annotation.** They may disagree:
 `status = 'blocked'` with `blocked_by = NULL` is legal and means "blocked on something
@@ -264,7 +271,7 @@ carry the same column for the same reason.
 Passing it is **optional**, and the two consumers differ: the HTTP API always sends it, the
 MCP agent never does. The reasoning is in `docs/http-api.md` and on `TaskPatch::expected_version`.
 
-**`tags` — the escape valve that keeps the five statuses fixed.**
+**`tags` — the escape valve that keeps the status set fixed.**
 
 People ask for custom board columns. They cannot have them, and the reason is not
 conservatism: every status carries BEHAVIOUR, not just a label. `is_open()` decides what
@@ -274,6 +281,11 @@ open, should I pick work from it" except in the user's head — which inverts th
 the agent would need knowledge of the USER'S configuration, worse than needing ours. And
 since the store is global and recall crosses projects, one board's "in review" against
 another's "reviewing" quietly makes cross-project search meaningless.
+
+`testing` (migration 010) is not a counterexample. It is defined once, in `Status`, with its
+openness and its ordering settled for every consumer, and it means the same thing on every
+board — which is exactly what a user-defined column cannot offer. The bar for a new status is
+that behaviour, not the label.
 
 Tags carry no semantics an agent must honour, which is exactly what makes them safe. A person
 gets "in review", "waiting-on-vendor", "frontend" without inventing workflow states.

@@ -8,6 +8,7 @@
 
 use ai_kanban::core::migrate::{migration_versions, BASELINE_VERSION, MIN_READABLE_VERSION, SCHEMA_VERSION};
 use ai_kanban::core::model::*;
+use ai_kanban::core::task::{TaskDraft, TaskPatch};
 use ai_kanban::core::Store;
 
 /// A file-backed store. Migrations are about what survives a reopen, so in-memory will not do.
@@ -139,6 +140,71 @@ fn min_readable_version_keeps_up_with_what_reads_require() {
     s.board(1, &BoardQuery::board()).unwrap();
     s.task(1, 1).unwrap();
     s.note(1, 1).unwrap();
+}
+
+/// A store exactly as the binary before migration 010 left it: current in every other way,
+/// but with the five-status CHECK constraint and stamped at 9.
+///
+/// Rewinding `user_version` alone would not do it -- the store would still carry the new
+/// constraint, so the migration under test would have nothing to prove.
+fn pre_testing_status_store(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "PRAGMA writable_schema = ON;
+         UPDATE sqlite_schema
+            SET sql = replace(sql, ',''testing''', '')
+          WHERE type = 'table' AND name = 'tasks';
+         PRAGMA writable_schema = RESET;
+         PRAGMA user_version = 9;",
+    ).unwrap();
+    assert!(
+        conn.execute("UPDATE tasks SET status = 'testing' WHERE id = 1", []).is_err(),
+        "the fixture is only meaningful if it really predates the status"
+    );
+}
+
+#[test]
+fn the_testing_status_reaches_a_store_that_predates_it_without_touching_its_rows() {
+    // The hazard this covers is not the constraint, which is easy -- it is the rows. The
+    // documented way to change a CHECK is to rebuild the table, and with foreign keys on,
+    // dropping `tasks` implicitly deletes every row first, cascading `task_repos` away and
+    // clearing every `blocked_by`. That loss would be silent: the board would come back
+    // looking fine, just with no repo links and no blockers anywhere in the store.
+    let (_d, path) = on_disk();
+    let dir = tempfile::tempdir().unwrap();
+    let checkout = dir.path().join("web");
+    std::fs::create_dir_all(&checkout).unwrap();
+
+    let (pid, blocker, task) = {
+        let s = Store::open(&path).unwrap();
+        let pid = s.resolve_project(dir.path()).unwrap().project.id;
+        let repo = s.add_repo(pid, &checkout, Some("web"), Actor::User).unwrap();
+        let blocker = s.create_task(pid, TaskDraft::new("first")).unwrap();
+        let mut draft = TaskDraft::new("waits on it");
+        draft.blocked_by = Some(blocker.id);
+        draft.repos = vec![repo.id];
+        let task = s.create_task(pid, draft).unwrap();
+        (pid, blocker.id, task.id)
+    };
+
+    pre_testing_status_store(&path);
+
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+
+    let mut patch = TaskPatch::default();
+    patch.status = Some(Status::Testing);
+    s.update_task(pid, task, patch).unwrap();
+
+    let after = s.task(pid, task).unwrap();
+    assert_eq!(after.status, Status::Testing);
+    assert_eq!(after.blocked_by, Some(blocker), "the blocker annotation must survive the migration");
+    let links = s.links_for(pid, std::slice::from_ref(&after)).unwrap();
+    assert_eq!(
+        links.iter().find(|l| l.task_id == task).map(|l| l.repos.len()),
+        Some(1),
+        "the repo link must survive the migration"
+    );
 }
 
 #[test]

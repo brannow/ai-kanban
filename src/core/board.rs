@@ -101,7 +101,8 @@ impl Store {
     /// It is a *bounded* board rather than a bare acknowledgement because "did it land"
     /// should never need a second call -- and a bare "ok" would guarantee one.
     ///
-    /// It shows **in-flight work only** (`doing`, `blocked`) plus the task that changed.
+    /// It shows **in-flight work only** (`doing`, `testing`, `blocked`) plus the task that
+    /// changed.
     /// The obvious alternative -- the same open-task list a `board` call returns -- was
     /// measured on a realistic board and spent most of its budget listing a dozen unrelated
     /// backlog items. That is noise the agent pays for on every single `task_add`, and the
@@ -118,7 +119,7 @@ impl Store {
         // item: widening the filter to include its status would pull the entire backlog
         // back in and undo the narrowing. The task itself is guaranteed to appear via the
         // splice below, which is the mechanism that makes the narrow filter safe.
-        q.status = vec![Status::Doing, Status::Blocked];
+        q.status = vec![Status::Doing, Status::Testing, Status::Blocked];
         let mut snap = self.board(project_id, &q)?;
         // Report every open status that is not being listed, so "+29 backlog" appears even
         // though backlog was filtered out. Silently omitting a whole status would make the
@@ -184,8 +185,8 @@ impl Store {
               WHERE project_id = ?1 AND {} AND status IN ({placeholders})
               ORDER BY {}
                        CASE status
-                         WHEN 'doing' THEN 0 WHEN 'blocked' THEN 1 WHEN 'backlog' THEN 2
-                         WHEN 'done' THEN 3 ELSE 4 END,
+                         WHEN 'doing' THEN 0 WHEN 'testing' THEN 1 WHEN 'blocked' THEN 2
+                         WHEN 'backlog' THEN 3 WHEN 'done' THEN 4 ELSE 5 END,
                        CASE priority
                          WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
                        updated_at DESC,

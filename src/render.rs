@@ -125,6 +125,11 @@ fn header(snap: &BoardSnapshot) -> String {
     let doing = snap.count_of(Status::Doing);
     let mut bits = vec![format!("{open} open")];
     if doing > 0 { bits.push(format!("{doing} doing")); }
+    // Named in the header rather than folded into "open": work waiting to be verified is
+    // the kind a returning agent can finish, and it is invisible if it only ever shows up
+    // inside a total.
+    let testing = snap.count_of(Status::Testing);
+    if testing > 0 { bits.push(format!("{testing} testing")); }
     let done = snap.count_of(Status::Done);
     if done > 0 { bits.push(format!("{done} done")); }
 

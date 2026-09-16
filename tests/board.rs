@@ -421,3 +421,30 @@ fn an_ungrouped_board_that_is_hiding_work_says_how_to_narrow_it() {
     assert!(!scoped.contains("pass it to board as `workstream`"),
         "never nag a board that is already narrowed: {scoped}");
 }
+
+#[test]
+fn work_left_in_testing_stays_on_the_board_and_is_named_in_the_header() {
+    // The whole reason `testing` is a status and not a tag: a task parked there is
+    // unfinished, so it has to survive the session that parked it. If it were counted as
+    // finished it would drop off the default board, and a cold agent would be told the work
+    // holds when nobody has checked that it does.
+    let (s, pid) = fixture();
+    let t = s.create_task(pid, TaskDraft::new("rewrote the redirect handling")).unwrap();
+    s.update_task(pid, t.id, TaskPatch { status: Some(Status::Testing), ..Default::default() }).unwrap();
+
+    let b = s.board(pid, &BoardQuery::board()).unwrap();
+    assert!(b.tasks.iter().any(|x| x.id == t.id), "testing work stays listed by default");
+    assert_eq!(b.open_count(), 1);
+    assert!(ai_kanban::render::board(&b).contains("1 testing"), "the header names it");
+}
+
+#[test]
+fn testing_work_outranks_the_backlog_an_agent_has_not_started() {
+    let (s, pid) = fixture();
+    let _backlog = s.create_task(pid, TaskDraft::new("someday")).unwrap();
+    let verify = s.create_task(pid, TaskDraft::new("written, not verified")).unwrap();
+    s.update_task(pid, verify.id, TaskPatch { status: Some(Status::Testing), ..Default::default() }).unwrap();
+
+    let b = s.board(pid, &BoardQuery::board()).unwrap();
+    assert_eq!(b.tasks[0].id, verify.id, "the closest thing to finished comes first");
+}

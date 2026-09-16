@@ -38,7 +38,7 @@
 //! person's.
 
 use crate::core::error::{Error, Result};
-use crate::core::model::{Actor, Repo, RepoSummary, Task, TaskLinks};
+use crate::core::model::{Actor, Repo, RepoSummary, Status, Task, TaskLinks};
 use crate::core::store::{now, Store};
 use crate::core::workstream::{is_missing_schema, normalize_name};
 use rusqlite::{params, OptionalExtension};
@@ -166,9 +166,10 @@ impl Store {
     /// Repos with no tickets are listed too -- one added a moment ago has none, and a menu that
     /// hid it would be one nobody could pick from.
     pub fn repo_summaries(&self, project_id: i64) -> Result<Vec<RepoSummary>> {
+        let open = Status::open_sql_list();
         let sql = format!(
             "SELECT {}, COUNT(t.id),
-                    COALESCE(SUM(CASE WHEN t.status IN ('backlog','doing','blocked') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN t.status IN ({open}) THEN 1 ELSE 0 END), 0),
                     home.name
                FROM board_repos br
                JOIN repos r ON r.id = br.repo_id

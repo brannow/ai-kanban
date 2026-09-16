@@ -60,7 +60,15 @@ macro_rules! sql_enum {
 sql_enum!(
     /// `archived` is terminal and hidden from the default board. There is deliberately no
     /// `next` -- priority covers it.
-    Status { Backlog => "backlog", Doing => "doing", Blocked => "blocked", Done => "done", Archived => "archived" },
+    ///
+    /// `testing` is work that is written but not accepted: the code exists, and something
+    /// (a run, a review, a person) still has to say it holds. It is OPEN, because a task
+    /// sitting there is unfinished work an agent may have to pick back up -- counting it as
+    /// done is how knowledge of "built but never verified" dies at the end of a session.
+    /// It is a fixed status rather than a tag (see `migrations/006_task_tags.sql`) for the
+    /// reason that file gives: it carries behaviour -- openness and ordering -- that every
+    /// consumer must agree on, and it means the same thing on every board.
+    Status { Backlog => "backlog", Doing => "doing", Blocked => "blocked", Testing => "testing", Done => "done", Archived => "archived" },
     default = Backlog
 );
 
@@ -90,7 +98,16 @@ impl Status {
     /// Board display order. Not a DB concern -- it is presentation, but it is the *same*
     /// presentation for every adapter, so it lives with the type rather than in one renderer.
     pub fn board_rank(self) -> u8 {
-        match self { Status::Doing => 0, Status::Blocked => 1, Status::Backlog => 2, Status::Done => 3, Status::Archived => 4 }
+        match self {
+            Status::Doing => 0,
+            // Ahead of `blocked` and `backlog`: a task in testing is the closest thing on
+            // the board to finished, and it is the one a returning agent can close out.
+            Status::Testing => 1,
+            Status::Blocked => 2,
+            Status::Backlog => 3,
+            Status::Done => 4,
+            Status::Archived => 5,
+        }
     }
     /// Left-to-right column order on the person's web board: backlog, then blocked, doing in
     /// the middle, finished work on the right.
@@ -100,11 +117,19 @@ impl Status {
     /// would change what a cold agent is told. A person scanning columns sees every column at
     /// once, so their order is free to follow how they read the board instead.
     pub fn column_rank(self) -> u8 {
-        match self { Status::Backlog => 0, Status::Blocked => 1, Status::Doing => 2, Status::Done => 3, Status::Archived => 4 }
+        match self { Status::Backlog => 0, Status::Blocked => 1, Status::Doing => 2, Status::Testing => 3, Status::Done => 4, Status::Archived => 5 }
+    }
+    /// The open statuses as a SQL literal list, for the `status IN (...)` counts that cannot
+    /// bind a variable-length parameter list. Derived rather than typed out: a status added
+    /// to the enum has to reach every "how much is still open" count on the board, and a
+    /// hand-written copy is what silently leaves one of them behind. Never caller input.
+    pub fn open_sql_list() -> String {
+        Self::ALL.iter().filter(|s| s.is_open())
+            .map(|s| format!("'{}'", s.as_str())).collect::<Vec<_>>().join(",")
     }
     /// Counted as "open" in board headers and remainder counts.
     pub fn is_open(self) -> bool {
-        matches!(self, Status::Backlog | Status::Doing | Status::Blocked)
+        matches!(self, Status::Backlog | Status::Doing | Status::Blocked | Status::Testing)
     }
 }
 

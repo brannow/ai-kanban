@@ -76,7 +76,7 @@ async fn the_board_arrives_in_column_order() {
     assert_eq!(status, StatusCode::OK);
     let order: Vec<&str> = body["columns"].as_array().unwrap().iter()
         .map(|c| c["status"].as_str().unwrap()).collect();
-    assert_eq!(order, ["backlog", "blocked", "doing", "done", "archived"]);
+    assert_eq!(order, ["backlog", "blocked", "doing", "testing", "done", "archived"]);
     assert!(body["cursor"].is_number(), "a board read carries the cursor it was taken at");
     assert!(body["now"].is_number(), "raw timestamps plus now, so the browser can tick ages");
 }
@@ -160,7 +160,7 @@ async fn meta_carries_the_enums_so_the_ui_never_hardcodes_them() {
     assert_eq!(status, StatusCode::OK);
     let statuses: Vec<&str> = body["statuses"].as_array().unwrap()
         .iter().map(|s| s["value"].as_str().unwrap()).collect();
-    assert_eq!(statuses, ["backlog", "blocked", "doing", "done", "archived"], "column order");
+    assert_eq!(statuses, ["backlog", "blocked", "doing", "testing", "done", "archived"], "column order");
     assert!(body["schema_version"].as_i64().unwrap() >= 1);
     assert!(body["cursor"].is_null(), "meta is cacheable and must not carry a moving value");
 }
