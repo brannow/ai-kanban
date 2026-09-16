@@ -73,7 +73,18 @@ Resolution (`src/core/project.rs`) is **one upward walk**, in two passes:
 2. **Then, per level:** a known path in `project_paths`, else a `.git` directory (keyed on
    the normalized remote if present, else the root path).
 
-If the walk finds nothing, the starting directory becomes its own project.
+If the walk finds nothing, the starting directory becomes its own project — **except** `$HOME`,
+any directory above it, a filesystem root, or the temp dir, where resolution fails with a
+message naming the ways out. Those directories sit above every project. Once one of them is
+a board, it is a known path that step 2 matches for every non-git directory beneath it, so
+unrelated projects silently merge into one board named after the user. That happened on a
+real store: a Rust toolchain and a Swift app shared one board named after the user. The refusal
+is only for this fallback. A marker or a `.git` in `$HOME` still resolves, and a board that
+already claims one of these directories still resolves, so it can be read and repaired.
+
+The set is closed on purpose. "Any directory that already contains boards" would also catch
+`~/Projects`, but then whether a directory can get a board would depend on store state that
+changes over time.
 
 Checking learned aliases at **every** level, not just the starting directory, is what stops
 a subdirectory of a **non-git** project from becoming its own board. With no `.git` to mark

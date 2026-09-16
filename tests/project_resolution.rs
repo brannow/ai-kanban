@@ -6,7 +6,7 @@
 //! resolver does.
 
 use ai_kanban::core::project::{normalize_remote, Resolution};
-use ai_kanban::core::Store;
+use ai_kanban::core::{Error, Store};
 use std::fs;
 use std::path::Path;
 
@@ -257,4 +257,140 @@ fn a_marker_added_after_the_fact_still_takes_effect() {
     assert_eq!(after.how, Resolution::Marker);
     assert_eq!(after.project.key, "monorepo/api");
     assert_ne!(after.project.id, before.project.id);
+}
+
+fn refused(r: ai_kanban::core::Result<ai_kanban::core::project::Resolved>) -> bool {
+    matches!(r, Err(Error::SharedDirectory { .. }))
+}
+
+#[test]
+fn the_home_directory_never_becomes_a_board_by_default() {
+    // The failure seen on a real store: a session started in $HOME made it a board, and
+    // since a known path is matched at every level of the walk, every non-git directory
+    // beneath it then joined that one board.
+    let home = tempfile::tempdir().unwrap();
+    let s = store();
+
+    let r = s.resolve_project_from(home.path(), Some(home.path()));
+    let err = r.expect_err("$HOME must be refused");
+    assert!(matches!(err, Error::SharedDirectory { .. }), "got {err:?}");
+    assert!(s.all_projects().unwrap().is_empty(), "a refused resolve must not create a board");
+
+    // The way out the message offers has to be one that actually works -- see the marker test.
+    assert!(ai_kanban::render::error(&err).contains(".ai-kanban"));
+}
+
+#[test]
+fn directories_above_home_are_refused_too() {
+    let parent = tempfile::tempdir().unwrap();
+    let home = parent.path().join("alice");
+    fs::create_dir_all(&home).unwrap();
+    let s = store();
+
+    assert!(refused(s.resolve_project_from(parent.path(), Some(&home))));
+    assert!(refused(s.resolve_project_from(Path::new("/"), Some(&home))));
+    assert!(s.all_projects().unwrap().is_empty());
+}
+
+#[test]
+fn projects_under_home_each_keep_their_own_board() {
+    // The damage replayed. A session in $HOME comes first; two unrelated non-git projects
+    // beneath it follow. They must end up on two boards, not on one named after the user.
+    let home = tempfile::tempdir().unwrap();
+    let docs = home.path().join("Documents").join("wow-docs");
+    let app = home.path().join("Documents").join("md2pdf");
+    fs::create_dir_all(&docs).unwrap();
+    fs::create_dir_all(&app).unwrap();
+    let s = store();
+
+    assert!(refused(s.resolve_project_from(home.path(), Some(home.path()))));
+    let a = s.resolve_project_from(&docs, Some(home.path())).unwrap();
+    let b = s.resolve_project_from(&app, Some(home.path())).unwrap();
+
+    assert_eq!(a.how, Resolution::Directory);
+    assert_eq!(a.project.name, "wow-docs");
+    assert_eq!(b.project.name, "md2pdf");
+    assert_ne!(a.project.id, b.project.id);
+}
+
+#[test]
+fn a_sibling_that_only_shares_a_prefix_with_home_is_not_refused() {
+    // `/Users/alice-old` is not above `/Users/alice`. Paths compare by component, not by string.
+    let parent = tempfile::tempdir().unwrap();
+    let home = parent.path().join("alice");
+    let sibling = parent.path().join("alice-old");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&sibling).unwrap();
+    let s = store();
+
+    assert!(s.resolve_project_from(&sibling, Some(&home)).unwrap().created);
+}
+
+#[test]
+fn a_marker_in_home_still_makes_it_a_board() {
+    // The escape hatch the refusal names. Only the fallback is refused; an explicit marker
+    // says the directory was meant.
+    let home = tempfile::tempdir().unwrap();
+    fs::write(home.path().join(".ai-kanban"), "dotfiles\n").unwrap();
+    let s = store();
+
+    let r = s.resolve_project_from(home.path(), Some(home.path())).unwrap();
+    assert_eq!(r.how, Resolution::Marker);
+    assert_eq!(r.project.key, "dotfiles");
+}
+
+#[test]
+fn a_git_repo_in_home_still_makes_it_a_board() {
+    // A dotfiles checkout in $HOME is a real project with a real anchor.
+    let home = tempfile::tempdir().unwrap();
+    fake_repo(home.path(), Some("git@github.com:me/dotfiles.git"));
+    let s = store();
+
+    let r = s.resolve_project_from(home.path(), Some(home.path())).unwrap();
+    assert_eq!(r.how, Resolution::GitRemote);
+}
+
+#[test]
+fn a_board_that_already_claims_home_still_resolves() {
+    // Stores from before the refusal can already have one. Refusing it too would leave
+    // that board unreadable from the place it lives, which is where someone repairs it.
+    let home = tempfile::tempdir().unwrap();
+    let elsewhere = home.path().join("legacy");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let s = store();
+    let pid = s.resolve_project_from(&elsewhere, Some(home.path())).unwrap().project.id;
+    s.add_path_alias(pid, &fs::canonicalize(home.path()).unwrap()).unwrap();
+
+    let r = s.resolve_project_from(home.path(), Some(home.path())).unwrap();
+    assert_eq!(r.how, Resolution::KnownPath);
+    assert_eq!(r.project.id, pid);
+}
+
+#[test]
+fn the_temp_directory_itself_is_refused_but_directories_in_it_are_not() {
+    let s = store();
+    assert!(refused(s.resolve_project_from(&std::env::temp_dir(), None)));
+
+    // Every other test in this suite resolves a tempdir inside it.
+    let inside = tempfile::tempdir().unwrap();
+    assert!(s.resolve_project_from(inside.path(), None).is_ok());
+}
+
+#[test]
+fn a_directory_that_becomes_a_git_repo_later_keeps_its_board() {
+    // Pinned on purpose, because it looks like a bug worth fixing. A plain directory gets a
+    // board, then `git init` runs in it. The learned alias still answers first, so the
+    // directory stays on its board. Letting the new `.git` win would re-key the directory
+    // out from under every task already filed there.
+    let tmp = tempfile::tempdir().unwrap();
+    let s = store();
+
+    let before = s.resolve_project(tmp.path()).unwrap();
+    assert_eq!(before.how, Resolution::Directory);
+
+    fake_repo(tmp.path(), Some("git@github.com:me/later.git"));
+    let after = s.resolve_project(tmp.path()).unwrap();
+
+    assert_eq!(after.how, Resolution::KnownPath);
+    assert_eq!(after.project.id, before.project.id);
 }

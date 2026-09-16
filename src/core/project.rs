@@ -15,32 +15,39 @@
 //!
 //! # Order
 //!
-//! Resolution is a single walk upward from the caller's directory. At **each** level, in
-//! this order:
+//! Resolution is a single walk upward from the caller's directory, in two passes:
 //!
-//! 1. `.ai-kanban` marker file. Explicit beats inferred -- the escape hatch for monorepo
-//!    packages and non-git directories.
+//! 1. `.ai-kanban` marker file, all the way up first. Explicit beats inferred -- the escape
+//!    hatch for monorepo packages and non-git directories.
+//!
+//! Then, at **each** level:
+//!
 //! 2. A known path in `project_paths`. A board already claimed this directory.
 //! 3. A `.git` directory. Keyed on the normalized remote URL if there is one, else the root
 //!    path.
 //!
-//! If the walk finds nothing, the starting directory becomes its own project.
+//! If the walk finds nothing, the starting directory becomes its own project -- unless it is
+//! `$HOME`, a directory above it, a filesystem root or the temp dir, which is refused. Those
+//! sit above every project, and a board anchored there becomes a known path that rule 2
+//! matches for *every* non-git directory beneath it: distinct projects silently merge into
+//! one board named after the user. A marker or a `.git` there still resolves normally --
+//! the refusal is only for the fallback, where nothing says the directory was meant.
 //!
-//! The checks are interleaved per level rather than run as three separate passes, and that
-//! ordering carries real weight:
+//! That ordering carries real weight:
 //!
 //! * Checking learned aliases at every level (not just the starting directory) is what
 //!   stops a subdirectory of a **non-git** project from becoming its own board. Without it
 //!   `~/notes` and `~/notes/drafts` are two separate memories, because with no `.git` to
 //!   mark a root the walk has nothing else to anchor on.
-//! * Checking the marker *before* the alias at each level is what keeps a monorepo package
-//!   from being swallowed by the repo-wide board sitting above it.
+//! * Giving markers a pass of their own, before any alias, is what keeps a monorepo package
+//!   from being swallowed by the repo-wide board above it -- including when the package
+//!   already learned an alias before the marker was added (see `walk`).
 //!
 //! Note what is absent: `roots/list`. SEP-2577 (Final) deprecates it, and names environment
 //! variables as a replacement, so the caller's path comes from `CLAUDE_PROJECT_DIR` first
 //! and cwd second. Roots may be consulted opportunistically by the adapter, never here.
 
-use crate::core::error::Result;
+use crate::core::error::{Error, Result};
 use crate::core::model::Project;
 use crate::core::store::{now, Store};
 use rusqlite::OptionalExtension;
@@ -77,6 +84,13 @@ impl Store {
     /// alias either way. Recording on every call is what makes the second clone join the
     /// first one's board.
     pub fn resolve_project(&self, start: &Path) -> Result<Resolved> {
+        self.resolve_project_from(start, dirs::home_dir().as_deref())
+    }
+
+    /// `resolve_project` with the home directory passed in rather than read from the
+    /// environment. Tests need a fake `$HOME`, and setting `HOME` for real is process-wide
+    /// under a multithreaded test runner.
+    pub fn resolve_project_from(&self, start: &Path, home: Option<&Path>) -> Result<Resolved> {
         let start = canonical(start);
 
         let (key, name, root, how) = match self.walk(&start)? {
@@ -88,6 +102,11 @@ impl Store {
                 return Ok(Resolved { project, how: Resolution::KnownPath, created: false });
             }
             Some(Found::Identity(id)) => id,
+            // Only here, not in the walk. A board that already claims one of these
+            // directories must still resolve, or the user cannot even read it to repair it.
+            None if is_above_every_project(&start, home.map(canonical).as_deref()) => {
+                return Err(Error::SharedDirectory { path: start.to_string_lossy().into_owned() });
+            }
             None => (format!("path:{}", start.to_string_lossy()), basename(&start), start.clone(), Resolution::Directory),
         };
 
@@ -229,6 +248,25 @@ fn read_marker(path: &Path) -> Option<String> {
         .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with('#'))?;
     Some(key.to_string())
+}
+
+/// A closed set derived from the environment, deliberately. A heuristic like "a directory
+/// that already contains boards" would also catch `~/Projects`, but it would make whether
+/// a directory can get a board depend on store state that changes over time.
+///
+/// The temp dirs go beyond the `$HOME` case that was actually reported, on the same
+/// mechanism: a board anchored at `/tmp` would absorb every scratch directory under it.
+///
+/// Degrades open: a home that cannot be canonicalized is compared as given, so at worst
+/// the guard misses and resolution behaves as it did before the guard existed.
+fn is_above_every_project(dir: &Path, home: Option<&Path>) -> bool {
+    // `Path::starts_with` compares whole components: `/Users/alice` is below `/Users`,
+    // not below `/Users/al`.
+    dir.parent().is_none()
+        || home.is_some_and(|h| h.starts_with(dir))
+        // Both, because they differ on macOS: `temp_dir()` is the per-user `$TMPDIR` under
+        // /var/folders, while `/tmp` is where a person actually types `cd`.
+        || [std::env::temp_dir(), PathBuf::from("/tmp")].iter().any(|t| canonical(t) == dir)
 }
 
 fn basename(p: &Path) -> String {

@@ -31,6 +31,12 @@ pub enum Error {
     #[error("could not determine a project directory")]
     NoProjectContext,
 
+    /// The walk found nothing, and the starting directory is one that sits above every
+    /// project -- `$HOME`, a directory above it, a filesystem root, the temp dir -- so it is
+    /// never a board by default.
+    #[error("{path} is not a project directory")]
+    SharedDirectory { path: String },
+
     /// Someone else changed the row between the caller reading it and writing it back.
     /// Carries both versions so the caller can say what happened rather than just refusing.
     #[error("#{id} changed since you read it (you had v{expected}, it is now v{actual})")]
