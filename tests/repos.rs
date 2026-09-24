@@ -241,22 +241,6 @@ fn task_show_gives_the_paths_or_says_to_ask() {
 }
 
 #[test]
-fn a_session_started_from_the_board_is_told_the_ticket_and_where_to_find_it() {
-    // The session starts in the ticket's first repo, whose home may be another board -- so the
-    // prompt names the board, or the agent's task_show would look on the wrong one.
-    let f = fixture();
-    let api = f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
-    let t = f.s.create_task(f.pid, TaskDraft {
-        repos: vec![api.id], external_ref: Some("1234".into()), body: "Autoplay stutters on Safari.".into(),
-        ..TaskDraft::new("Rework header slider")
-    }).unwrap();
-    let prompt = render::start_prompt(&f.s.task_detail(f.pid, t.id).unwrap());
-    for want in ["Rework header slider", "issue 1234", "Autoplay stutters", &canon(&f.api), "project \"eee\""] {
-        assert!(prompt.contains(want), "missing {want:?} in:\n{prompt}");
-    }
-}
-
-#[test]
 fn a_write_response_shows_the_repos_of_the_task_it_confirms() {
     // A filed backlog task is not in the write response's doing/blocked filter; it is spliced
     // in afterwards. The links were computed before the splice, so without recomputing them

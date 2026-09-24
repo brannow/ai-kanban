@@ -48,11 +48,6 @@ pub enum Error {
     #[error("#{id} changed since you read it (you had v{expected}, it is now v{actual})")]
     Conflict { id: i64, expected: i64, actual: i64 },
 
-    /// A request the server refuses whoever sends it -- today, starting a session from
-    /// anywhere but the board page itself.
-    #[error("{0}")]
-    Forbidden(String),
-
     #[error("{0}")]
     Other(String),
 }

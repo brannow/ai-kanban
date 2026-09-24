@@ -13,7 +13,6 @@ pub mod model;
 pub mod event;
 pub mod note;
 pub mod page;
-pub mod profile;
 pub mod project;
 pub mod recall;
 pub mod repo;

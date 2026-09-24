@@ -106,12 +106,6 @@ fn every_mutation_moves_the_change_cursor() {
     s.forget_repo(shared.id).unwrap();
     moved(&s, "forgetting a repo");
 
-    s.set_profile_allowed(pid, "claude-work", false, Actor::User).unwrap();
-    moved(&s, "refusing a session profile on a board");
-
-    s.set_profile_allowed(pid, "claude-work", true, Actor::User).unwrap();
-    moved(&s, "allowing it again");
-
     // The last one on purpose: it deletes the board's events, which is exactly what could
     // leave MAX(id) standing still or going backwards.
     s.forget_board(board.id).unwrap();

@@ -173,22 +173,6 @@ pub async fn projects(State(api): State<Api>) -> ApiResult<Json<serde_json::Valu
     })))
 }
 
-#[derive(Debug, Deserialize, Default)]
-pub struct BoardBody {
-    pub name: Option<String>,
-}
-
-/// Creates a board by name -- a tracker's project, a customer. A person's act, like adding
-/// repos: the agent reaches a board through its repos and never creates one by name, because
-/// a name an agent generates is how one project quietly becomes two.
-pub async fn create_board(
-    State(api): State<Api>, Json(b): Json<BoardBody>,
-) -> ApiResult<impl IntoResponse> {
-    let store = api.store();
-    let project = store.create_board(b.name.as_deref().unwrap_or_default())?;
-    Ok((StatusCode::CREATED, Json(json!({ "project": project }))))
-}
-
 pub async fn project(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<Json<serde_json::Value>> {
     let store = api.store();
     let project = resolve(&store, &p)?;
@@ -200,7 +184,6 @@ pub async fn project(State(api): State<Api>, Path(p): Path<String>) -> ApiResult
         // split wants the former.
         "paths": store.project_paths(project.id)?,
         "counts": store.status_counts(project.id)?,
-        "profiles": profiles_json(&store, project.id)?,
     })))
 }
 
@@ -415,7 +398,6 @@ pub async fn task(
         "notes": detail.notes,
         "events": detail.events,
         // Which "open in …" buttons the panel shows.
-        "profiles": profiles_json(&store, project.id)?,
         "project": detail.project,
         // Looked up rather than read off the task: `workstream_id` is kept out of
         // `TASK_COLS` (see migration 005), so no `Task` carries it. The panel needs the
@@ -532,152 +514,6 @@ pub async fn update_task(
     let task = store.update_task(project.id, t, patch)?;
     let version = task.version;
     Ok((etag(version), Json(json!({ "task": task }))))
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct MoveBody {
-    /// The board to move to, by id or key -- the same forms `{p}` accepts.
-    pub to: Option<serde_json::Value>,
-    pub log: Option<String>,
-}
-
-/// Moves a task to another board, keeping its id and history. An action of its own rather
-/// than a `PATCH` field, because it changes the URL the task lives at.
-///
-/// `If-Match` required, like any other write to a task: a form held open while an agent moves
-/// the same task is the lost update the guard exists for.
-pub async fn move_task(
-    State(api): State<Api>, Path((p, t)): Path<(String, i64)>, headers: HeaderMap,
-    Json(b): Json<MoveBody>,
-) -> ApiResult<impl IntoResponse> {
-    let expected = if_match(&headers)?;
-    let store = api.store();
-    let project = resolve(&store, &p)?;
-    let to = match &b.to {
-        Some(serde_json::Value::Number(n)) => n.to_string(),
-        Some(serde_json::Value::String(s)) => s.clone(),
-        _ => {
-            return Err(ApiError(Error::InvalidValue {
-                field: "to",
-                value: String::new(),
-                valid: "the id or key of the board to move to".into(),
-            }))
-        }
-    };
-    let target = resolve(&store, &to)?;
-    let task = store.move_task(project.id, t, target.id, Actor::User, b.log.as_deref(), Some(expected))?;
-    let version = task.version;
-    Ok((etag(version), Json(json!({ "task": task, "project": target }))))
-}
-
-/// Starts work on a ticket: Claude Code in a new Ghostty tab (a window when Ghostty is not
-/// open) in the ticket's first repo, with the others added, primed with the ticket
-/// (`render::start_prompt`).
-///
-/// A ticket with no repo is refused -- the session has to start in a checkout, and guessing
-/// one would start it in the wrong place. So is a profile the board does not allow. The launch
-/// is recorded on the ticket, which is also what lets a live page see it happened.
-pub async fn start_task(
-    State(api): State<Api>, Path((p, t)): Path<(String, i64)>, headers: HeaderMap,
-    Json(b): Json<StartBody>,
-) -> ApiResult<Json<serde_json::Value>> {
-    same_origin(&headers)?;
-    let profile = super::launch::Profile::parse(b.profile.as_deref())?;
-    let store = api.store();
-    let project = resolve(&store, &p)?;
-    if store.denied_profiles(project.id)?.iter().any(|d| d == profile.label()) {
-        return Err(ApiError(Error::Forbidden(format!(
-            "board {} does not allow {} sessions -- it can be allowed in the board's repos menu",
-            project.name, profile.label()
-        ))));
-    }
-    let detail = store.task_detail(project.id, t)?;
-    // Only work nobody has started. A ticket in doing already has a session on it, and one
-    // in blocked, done or archived is not ready to be picked up -- a second window on either
-    // is two agents on one ticket, or work on something finished.
-    if detail.task.status != Status::Backlog {
-        return Err(ApiError(Error::InvalidValue {
-            field: "status",
-            value: detail.task.status.to_string(),
-            valid: "backlog -- only a ticket nobody has started can be started".into(),
-        }));
-    }
-    let Some((first, rest)) = detail.repos.split_first() else {
-        return Err(ApiError(Error::InvalidValue {
-            field: "repos",
-            value: String::new(),
-            valid: "at least one repo on the ticket -- the session has to start in a checkout".into(),
-        }));
-    };
-    let add: Vec<String> = rest.iter().map(|r| r.path.clone()).collect();
-    let opened = super::launch::open_claude(profile, &first.path, &add, &crate::render::start_prompt(&detail))?;
-    store.log_on(project.id, Some(t), Actor::User,
-        &format!("started a {} session in {}", profile.label(), first.name))?;
-    Ok(Json(json!({ "started_in": first.path, "profile": profile.label(), "opened": opened.label() })))
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct StartBody {
-    /// `claude` (the default) or `claude-work` -- see `launch::Profile`.
-    pub profile: Option<String>,
-}
-
-/// Every launch profile and whether this board allows it, for the ticket panel's buttons and
-/// the board's setting.
-fn profiles_json(store: &Store, project_id: i64) -> Result<serde_json::Value, Error> {
-    let denied = store.denied_profiles(project_id)?;
-    Ok(json!(super::launch::Profile::ALL.iter().map(|p| json!({
-        "name": p.label(),
-        "allowed": !denied.iter().any(|d| d == p.label()),
-    })).collect::<Vec<_>>()))
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct ProfileBody {
-    pub allowed: Option<bool>,
-}
-
-/// Allows or refuses a session profile on one board -- e.g. `claude-work` only on the boards
-/// that are work. Locked to the board page like `start_task`: it is half of what decides
-/// which setup a session starts in.
-pub async fn set_profile(
-    State(api): State<Api>, Path((p, name)): Path<(String, String)>, headers: HeaderMap,
-    Json(b): Json<ProfileBody>,
-) -> ApiResult<Json<serde_json::Value>> {
-    same_origin(&headers)?;
-    // Validated here, not in core: the store keeps names, the launcher knows which exist.
-    let profile = super::launch::Profile::parse(Some(&name))?;
-    let Some(allowed) = b.allowed else {
-        return Err(ApiError(Error::InvalidValue {
-            field: "allowed",
-            value: String::new(),
-            valid: "true or false".into(),
-        }));
-    };
-    let store = api.store();
-    let project = resolve(&store, &p)?;
-    store.set_profile_allowed(project.id, profile.label(), allowed, Actor::User)?;
-    Ok(Json(json!({ "profiles": profiles_json(&store, project.id)? })))
-}
-
-/// The start endpoint launches a program, so unlike every other route it must not be callable
-/// by whatever page the browser has open. A cross-site POST carries that site's `Origin`; a
-/// DNS-rebinding page carries a `Host` that is not loopback. The JSON body the route requires
-/// also forces a CORS preflight on any cross-origin request, which this server never answers.
-/// A request with no `Origin` is a local program, which could run `claude` itself anyway.
-fn same_origin(headers: &HeaderMap) -> Result<(), ApiError> {
-    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let name = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
-    let loopback = name == "127.0.0.1" || name == "localhost";
-    let origin_ok = match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        None => true,
-        Some(o) => o == format!("http://{host}"),
-    };
-    if loopback && origin_ok {
-        Ok(())
-    } else {
-        Err(ApiError(Error::Forbidden("sessions can only be started from the board page itself".into())))
-    }
 }
 
 /// Permanent. See `src/core/forget.rs` -- this is the only surface it is reachable from, and
@@ -818,96 +654,6 @@ pub async fn repos(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
         "now": crate::core::now(),
         "repos": store.repo_summaries(project.id)?,
     })))
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct RepoBody {
-    /// The local checkout, absolute or starting with `~/`. Required when adding.
-    pub path: Option<String>,
-    /// Defaults to the directory's name when adding.
-    pub name: Option<String>,
-}
-
-pub async fn create_repo(
-    State(api): State<Api>, Path(p): Path<String>, Json(b): Json<RepoBody>,
-) -> ApiResult<impl IntoResponse> {
-    let store = api.store();
-    let project = resolve(&store, &p)?;
-    let raw = b.path.as_deref().map(str::trim).unwrap_or_default();
-    if raw.is_empty() {
-        return Err(ApiError(Error::InvalidValue {
-            field: "path",
-            value: String::new(),
-            valid: "the path of a local checkout".into(),
-        }));
-    }
-    let repo = store.add_repo(project.id, &crate::expand_home(raw), b.name.as_deref(), Actor::User)?;
-    Ok((StatusCode::CREATED, Json(json!({ "repo": repo }))))
-}
-
-/// Renames. The path is not editable: a different path is a different checkout, and it may
-/// belong to another board -- so moving a repo is a remove and an add, each of which says
-/// what it did and each of which runs its own checks.
-pub async fn update_repo(
-    State(api): State<Api>, Path((p, r)): Path<(String, i64)>, Json(b): Json<RepoBody>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let store = api.store();
-    let project = resolve(&store, &p)?;
-    if b.path.is_some() {
-        return Err(ApiError(Error::InvalidValue {
-            field: "path",
-            value: b.path.clone().unwrap_or_default(),
-            valid: "unchanged -- remove this repo and add the new path instead".into(),
-        }));
-    }
-    let repo = store.rename_repo(project.id, r, b.name.as_deref().unwrap_or_default(), Actor::User)?;
-    Ok(Json(json!({ "repo": repo })))
-}
-
-/// Makes this board the repo's home: its folder opens here from now on.
-pub async fn repo_home(
-    State(api): State<Api>, Path((p, r)): Path<(String, i64)>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let store = api.store();
-    let project = resolve(&store, &p)?;
-    let repo = store.set_repo_home(project.id, r, Actor::User)?;
-    Ok(Json(json!({ "repo": repo })))
-}
-
-/// Every repo in the store with the board its folder opens on -- what a board can attach.
-pub async fn all_repos(State(api): State<Api>) -> ApiResult<Json<serde_json::Value>> {
-    let store = api.store();
-    let names: std::collections::HashMap<i64, String> =
-        store.all_projects()?.into_iter().map(|p| (p.id, p.name)).collect();
-    let repos: Vec<serde_json::Value> = store.all_repos()?.into_iter()
-        .map(|r| json!({ "home_board": names.get(&r.home_project_id), "repo": r }))
-        .collect();
-    Ok(Json(json!({ "repos": repos })))
-}
-
-/// Takes the repo off this board and off this board's tickets. See `Store::remove_repo` for
-/// where its folder opens afterwards.
-pub async fn delete_repo(
-    State(api): State<Api>, Path((p, r)): Path<(String, i64)>,
-) -> ApiResult<StatusCode> {
-    let store = api.store();
-    let project = resolve(&store, &p)?;
-    store.remove_repo(project.id, r, Actor::User)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// The repo gone from every board, not just this one. Global because repos are: no one board
-/// scopes a question about all of them.
-pub async fn forget_repo(State(api): State<Api>, Path(r): Path<i64>) -> ApiResult<StatusCode> {
-    api.store().forget_repo(r)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-pub async fn forget_board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<StatusCode> {
-    let store = api.store();
-    let project = resolve(&store, &p)?;
-    store.forget_board(project.id)?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------

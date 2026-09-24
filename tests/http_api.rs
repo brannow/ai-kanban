@@ -49,20 +49,41 @@ fn json_req(method: &str, path: &str, body: Value, if_match: Option<&str>) -> Re
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_board_and_a_repo_can_be_forgotten() {
+async fn the_web_api_cannot_run_the_work() {
+    // The web UI is for looking at what the agent's board holds and correcting it -- editing
+    // or forgetting a task or note -- not for running the work. Creating or destroying boards
+    // and repos, moving tickets and starting sessions belong to the agent's tools or to
+    // `ai-kanban board|repo` in a terminal. Asserted route by route, so one added back later
+    // fails here rather than quietly turning the page into a second place to work from.
     let (api, pid) = api();
     let dir = tempfile::tempdir().unwrap();
-    let rid = api.store.lock().unwrap().add_repo(pid, dir.path(), None, Actor::User).unwrap().id;
-    let del = |path: String| Request::builder().method("DELETE").uri(path).body(Body::empty()).unwrap();
+    let rid = api.store().add_repo(pid, dir.path(), None, Actor::User).unwrap().id;
+    let tid = api.store().create_task(pid, TaskDraft::new("a task")).unwrap().id;
+    let req = |method: &str, path: String| Request::builder().method(method).uri(path)
+        .header("content-type", "application/json").header("if-match", "\"1\"")
+        .body(Body::from(r#"{"name":"x","path":"/tmp","to":1,"allowed":false}"#)).unwrap();
 
-    let (status, _, _) = call(&api, del(format!("/api/repos/{rid}"))).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    assert!(api.store.lock().unwrap().all_repos().unwrap().is_empty());
-
-    let (status, _, _) = call(&api, del(format!("/api/projects/{pid}"))).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    let (status, _, _) = call(&api, get(&format!("/api/projects/{pid}"))).await;
-    assert_ne!(status, StatusCode::OK, "the board is gone");
+    for (method, path) in [
+        ("POST", "/api/projects".to_string()),
+        ("DELETE", format!("/api/projects/{pid}")),
+        ("POST", format!("/api/projects/{pid}/repos")),
+        ("PATCH", format!("/api/projects/{pid}/repos/{rid}")),
+        ("DELETE", format!("/api/projects/{pid}/repos/{rid}")),
+        ("PUT", format!("/api/projects/{pid}/repos/{rid}/home")),
+        ("GET", "/api/repos".to_string()),
+        ("DELETE", format!("/api/repos/{rid}")),
+        ("POST", format!("/api/projects/{pid}/tasks/{tid}/move")),
+        ("POST", format!("/api/projects/{pid}/tasks/{tid}/start")),
+        ("PUT", format!("/api/projects/{pid}/profiles/claude")),
+    ] {
+        let (status, _, _) = call(&api, req(method, path.clone())).await;
+        assert!(status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {path} answered {status}");
+    }
+    let s = api.store();
+    assert_eq!(s.all_projects().unwrap().len(), 1, "no board created or forgotten");
+    assert_eq!(s.repos(pid).unwrap().len(), 1, "the repo is untouched");
+    assert!(s.task(pid, tid).is_ok(), "the task did not move");
 }
 
 #[tokio::test]
@@ -441,17 +462,12 @@ async fn paging_a_column_stays_inside_the_workstream_the_board_is_scoped_to() {
 }
 
 #[tokio::test]
-async fn repos_are_registered_linked_and_cleared_through_the_api() {
+async fn repos_are_linked_and_cleared_through_the_api() {
+    // Registering a repo is the agent's or the terminal's job; naming one on a ticket is a
+    // field edit like tags, which the page may correct.
     let (api, pid) = api();
     let checkout = tempfile::tempdir().unwrap();
-
-    let (status, body, _) = call(&api, json_req(
-        "POST", &format!("/api/projects/{pid}/repos"),
-        serde_json::json!({ "path": checkout.path(), "name": "EEE Web" }), None,
-    )).await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    assert_eq!(body["repo"]["name"], "eee-web");
-    let rid = body["repo"]["id"].as_i64().unwrap();
+    let rid = api.store().add_repo(pid, checkout.path(), Some("EEE Web"), Actor::User).unwrap().id;
 
     let (status, body, _) = call(&api, json_req(
         "POST", &format!("/api/projects/{pid}/tasks"),
@@ -467,7 +483,8 @@ async fn repos_are_registered_linked_and_cleared_through_the_api() {
     assert_eq!(links["external_ref"], "48213", "stored in its one spelling");
     assert_eq!(board["repos"][0]["total"], 1);
 
-    // `[]` and `0` clear -- `0` because a JSON null in an optional field reads as "absent".
+    // `[]` and `""` clear -- not null, because a JSON null in an optional field reads as
+    // "absent".
     let (_, detail, etag) = call(&api, get(&format!("/api/projects/{pid}/tasks/{tid}"))).await;
     assert_eq!(detail["repos"][0]["name"], "eee-web");
     let version = etag.unwrap().trim_matches('"').to_string();
@@ -479,48 +496,14 @@ async fn repos_are_registered_linked_and_cleared_through_the_api() {
     let (_, detail, _) = call(&api, get(&format!("/api/projects/{pid}/tasks/{tid}"))).await;
     assert_eq!(detail["repos"], serde_json::json!([]));
     assert!(detail["external_ref"].is_null());
-
-    // A folder another board already resolves is a 409 naming the owner, so the UI can say
-    // which board holds it and point at `merge`.
-    let elsewhere = tempfile::tempdir().unwrap();
-    let owner = api.store().resolve_project(elsewhere.path()).unwrap().project;
-    let (status, body, _) = call(&api, json_req(
-        "POST", &format!("/api/projects/{pid}/repos"),
-        serde_json::json!({ "path": elsewhere.path() }), None,
-    )).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["code"], "claimed");
-    assert_eq!(body["error"]["key"], owner.key);
-
-    let (status, _, _) = call(&api, json_req(
-        "DELETE", &format!("/api/projects/{pid}/repos/{rid}"), serde_json::json!({}), None,
-    )).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    let (_, list, _) = call(&api, get(&format!("/api/projects/{pid}/repos"))).await;
-    assert_eq!(list["repos"], serde_json::json!([]));
 }
 
 #[tokio::test]
-async fn boards_are_created_tickets_move_and_all_projects_shows_every_board() {
+async fn all_projects_shows_every_board() {
     let (api, pid) = api();
-
-    let (status, body, _) = call(&api, json_req("POST", "/api/projects", serde_json::json!({ "name": "BMUKN" }), None)).await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    let bid = body["project"]["id"].as_i64().unwrap();
-    let (status, _, _) = call(&api, json_req("POST", "/api/projects", serde_json::json!({ "name": "bmukn" }), None)).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "a name another board has is refused");
-
-    let tid = api.store().create_task(pid, TaskDraft::new("Rework header slider")).unwrap().id;
-    let (_, _, etag) = call(&api, get(&format!("/api/projects/{pid}/tasks/{tid}"))).await;
-    let version = etag.unwrap().trim_matches('"').to_string();
-    let (status, body, _) = call(&api, json_req(
-        "POST", &format!("/api/projects/{pid}/tasks/{tid}/move"),
-        serde_json::json!({ "to": bid, "log": "belongs to BMUKN" }), Some(&version),
-    )).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["project"]["name"], "BMUKN");
-    let (status, _, _) = call(&api, get(&format!("/api/projects/{pid}/tasks/{tid}"))).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "it left the old board");
+    let bid = api.store().create_board("BMUKN").unwrap().id;
+    let here = api.store().create_task(pid, TaskDraft::new("Rework header slider")).unwrap().id;
+    let there = api.store().create_task(bid, TaskDraft::new("Invoice rounding")).unwrap().id;
 
     let (status, all, _) = call(&api, get("/api/all/board")).await;
     assert_eq!(status, StatusCode::OK, "{all}");
@@ -529,63 +512,6 @@ async fn boards_are_created_tickets_move_and_all_projects_shows_every_board() {
     let listed: Vec<i64> = all["columns"].as_array().unwrap().iter()
         .flat_map(|c| c["tasks"].as_array().unwrap().iter().map(|t| t["id"].as_i64().unwrap()))
         .collect();
-    assert!(listed.contains(&tid), "every board's tickets: {all}");
-
-    // Sharing a repo leaves its home alone; moving the home is its own step.
-    let checkout = tempfile::tempdir().unwrap();
-    let (_, body, _) = call(&api, json_req("POST", &format!("/api/projects/{pid}/repos"),
-        serde_json::json!({ "path": checkout.path() }), None)).await;
-    let rid = body["repo"]["id"].as_i64().unwrap();
-    let (status, body, _) = call(&api, json_req("POST", &format!("/api/projects/{bid}/repos"),
-        serde_json::json!({ "path": checkout.path() }), None)).await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    assert_eq!(body["repo"]["home_project_id"], pid);
-    let (status, body, _) = call(&api, Request::builder().method("PUT")
-        .uri(format!("/api/projects/{bid}/repos/{rid}/home")).body(Body::empty()).unwrap()).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["repo"]["home_project_id"], bid);
-    let (_, repos, _) = call(&api, get("/api/repos")).await;
-    assert_eq!(repos["repos"][0]["home_board"], "BMUKN");
+    assert!(listed.contains(&here) && listed.contains(&there), "every board's tickets: {all}");
 }
 
-fn start_req(path: &str, origin: Option<&str>) -> Request<Body> {
-    let mut b = Request::builder().method("POST").uri(path)
-        .header("content-type", "application/json").header("host", "127.0.0.1:7373");
-    if let Some(o) = origin {
-        b = b.header("origin", o);
-    }
-    b.body(Body::from("{}")).unwrap()
-}
-
-#[tokio::test]
-async fn starting_a_session_is_refused_from_other_sites_and_without_a_repo() {
-    // Only the refusals are exercised: the success path opens a real terminal window. They
-    // are the half that matters -- an unauthenticated local endpoint that launches programs
-    // must not be reachable from whatever page the browser has open.
-    let (api, pid) = api();
-    let tid = api.store().create_task(pid, TaskDraft::new("Rework header slider")).unwrap().id;
-    let path = format!("/api/projects/{pid}/tasks/{tid}/start");
-
-    let (status, body, _) = call(&api, start_req(&path, Some("https://evil.example"))).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-
-    let (status, body, _) = call(&api, start_req(&path, Some("http://127.0.0.1:7373"))).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "a ticket with no repo has nowhere to start: {body}");
-    assert_eq!(body["error"]["field"], "repos");
-
-    // Only backlog work: a second session on a ticket in doing is two agents on one ticket.
-    api.store().update_task(pid, tid, ai_kanban::core::task::TaskPatch {
-        status: Some(Status::Doing), ..Default::default()
-    }).unwrap();
-    let (status, body, _) = call(&api, start_req(&path, Some("http://127.0.0.1:7373"))).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"]["field"], "status");
-
-    // Only the two known setups; anything else names them rather than guessing.
-    let req = Request::builder().method("POST").uri(&path)
-        .header("content-type", "application/json").header("host", "127.0.0.1:7373")
-        .body(Body::from(r#"{"profile":"claude-bmu"}"#)).unwrap();
-    let (status, body, _) = call(&api, req).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"]["field"], "profile");
-}

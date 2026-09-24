@@ -25,11 +25,11 @@
 //!
 //! # Who registers them
 //!
-//! A person, through the web UI's repos menu -- and an agent, through `repo_add` or
-//! `ai-kanban repo add`. Registering was the agent's business all along and was simply
-//! unreachable: it was told to name repos on tickets, on a board where the first repo could
-//! only be created in a UI it cannot open, so the honest move -- hand-written SQL past the
-//! name normalizer -- was worse than the thing being prevented.
+//! An agent, through `repo_add`, or a person in a terminal, `ai-kanban repo add`. Never the web
+//! UI, which only lists them: it is for looking at what the agent recorded, not for running the
+//! work. Registering was the agent's business all along. When the first repo could only be
+//! created in a UI the agent cannot open, the honest move -- hand-written SQL past the name
+//! normalizer -- was worse than the thing being prevented.
 //!
 //! What made it look dangerous is that registering changes which board a directory resolves
 //! to. It cannot do that behind anyone's back: a path another board already claims is
@@ -449,6 +449,26 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// One repo anywhere in the store, by name or path, matched the way `resolve_repos`
+    /// matches on one board. For the CLI's store-wide commands (`repo home`, `repo forget`),
+    /// which name a repo without standing on a board that has it. Names are unique store-wide
+    /// since 008, so this cannot be ambiguous.
+    pub fn find_repo(&self, raw: &str) -> Result<Repo> {
+        let raw = raw.trim();
+        let name = normalize_name(raw);
+        let path = std::fs::canonicalize(raw).ok().map(|p| p.to_string_lossy().into_owned());
+        let all = self.all_repos()?;
+        if let Some(r) = all.iter().find(|r| r.name == name || path.as_deref() == Some(r.path.as_str())) {
+            return Ok(r.clone());
+        }
+        let names: Vec<String> = all.into_iter().map(|r| r.name).collect();
+        Err(Error::InvalidValue {
+            field: "repo",
+            value: raw.to_string(),
+            valid: if names.is_empty() { "a registered repo -- there are none yet".into() } else { names.join(", ") },
+        })
     }
 
     /// Every id must be a repo on this board -- the same-board guard `blocked_by` and

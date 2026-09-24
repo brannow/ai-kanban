@@ -40,8 +40,10 @@ fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
 /// piece of work is history a cold agent benefits from ("we began the contact-form work"),
 /// whereas switching which slice you are looking at is navigation, not news.
 ///
-/// `profile_allowed` / `profile_denied` are which buttons the board page offers a person, and
-/// say nothing about the work.
+/// `profile_allowed` / `profile_denied` are no longer written. They recorded which "start a
+/// session" buttons the `mb-fork` branch's board page offered, a feature taken out again
+/// (`docs/data-model.md`, `board_denied_profiles`). Stores from that branch still hold them,
+/// and they say nothing about the work, so they stay filtered.
 pub(crate) const HOUSEKEEPING_KINDS: &[&str] =
     &["path_learned", "workstream_entered", "profile_allowed", "profile_denied"];
 

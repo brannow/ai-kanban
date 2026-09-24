@@ -298,34 +298,6 @@ pub fn task_detail(d: &TaskDetail) -> String {
     out
 }
 
-/// The first message of a Claude session started from the board.
-///
-/// Names the board explicitly and tells the agent to pass it: the session starts in the
-/// ticket's first repo, whose home can be a different board, and a bare `task_show` there
-/// would look for the ticket on the wrong one.
-pub fn start_prompt(d: &TaskDetail) -> String {
-    let t = &d.task;
-    let mut out = format!("Work on ticket #{} from the ai-kanban board \"{}\": {}\n", t.id, d.project.name, t.title);
-    // Which tracker the ref lives in is the person's setup, not the store's, so the prompt
-    // names the ref and leaves finding it to whatever tools the session has.
-    if let Some(r) = &d.external_ref {
-        out.push_str(&format!("\nIt tracks issue {r} in an outside tracker; if you have tools for it, read it there for the full requirements.\n"));
-    }
-    if !t.body.is_empty() {
-        out.push_str(&format!("\n{}\n", t.body));
-    }
-    out.push_str("\nRepos:\n");
-    for r in &d.repos {
-        out.push_str(&format!("  {}  {}\n", r.name, r.path));
-    }
-    out.push_str(&format!(
-        "\nStart with task_show (task {}, project \"{}\"), move it to doing with task_update when \
-         you begin, and record what you learn as you go.\n",
-        t.id, d.project.name
-    ));
-    out
-}
-
 /// Recall. Each hit states its kind, its age and its project, and carries a snippet --
 /// a list of titles is a search result; a list of snippets is an answer.
 pub fn recall(r: &RecallResult, cross_project: bool, missing: &MissingSubjects) -> String {

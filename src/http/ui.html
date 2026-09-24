@@ -137,7 +137,6 @@
 <header>
   <h1>ai-kanban</h1>
   <select id="project"></select>
-  <button id="newboard" title="a board for a project, e.g. a tracker project or a customer">+ board</button>
   <button id="repobtn" title="the local checkouts this board's tickets live in">repos</button>
   <label class="ws">working in <select id="workstream"></select></label>
   <span id="live">connecting</span>
@@ -191,7 +190,7 @@ let BOARDS = [];
 let ES = null;
 // The board the repos menu is showing, and its rows. Its own state rather than BOARD's: in
 // All Projects there is no one board on screen, so the menu picks one.
-let REPO_BOARD = null, REPO_LIST = [];
+let REPO_BOARD = null;
 function tasksUrl() { return isAll() ? '/api/all/tasks' : `/api/projects/${PROJECT}/tasks`; }
 
 // ---- helpers ---------------------------------------------------------------
@@ -581,15 +580,6 @@ async function openTask(id, pid) {
         <a id="xreflink" class="xref" target="_blank" rel="noopener" title="open in its tracker" hidden>↗</a>
         <span id="repopick" class="row"></span>
       </div>
-      <div class="row" style="margin-top:7px">
-        <select id="moveto"></select>
-        <button id="move">move to board</button>
-      </div>
-      <div class="row" style="margin-top:7px">
-        <button data-start="claude" title="a new Ghostty tab (a window if Ghostty is closed) running claude in this ticket's repo, primed with the ticket">open in claude</button>
-        <button data-start="claude-work" title="the same, with your claude-work setup (~/.claude-work)">open in claude-work</button>
-        <span id="startnote" class="dim2" style="font-size:11px"></span>
-      </div>
     </section>
 
     ${body.repos && body.repos.length ? `<section><h3>repos</h3>${body.repos.map(r => `
@@ -640,27 +630,9 @@ async function openTask(id, pid) {
   $('#repopick').innerHTML = repoPicker((body.repos || []).map(r => r.id), boardRepos);
   // Workstreams are slices of ONE board; All Projects has none to offer.
   $('#ws').hidden = isAll();
-  const others = BOARDS.filter(b => b.id !== pid);
-  $('#moveto').innerHTML = '<option value="">move to…</option>'
-    + others.map(b => `<option value="${b.id}">${esc(b.name)}</option>`).join('');
-  $('#move').hidden = $('#moveto').hidden = !others.length;
   $('#panel').hidden = false;
   $('#close').onclick = closePanel;
   $('#save').onclick = () => saveTask(id);
-  $('#move').onclick = () => moveTask(id);
-  // Only backlog work can be started -- the server refuses the rest too. Judged on the saved
-  // status, not the select: an unsaved change has not moved the ticket anywhere yet.
-  const startable = t.status === 'backlog';
-  // Profiles this board refuses are not offered at all -- set in the board's repos menu.
-  const allowed = new Set((body.profiles || []).filter(p => p.allowed).map(p => p.name));
-  $('#panel').querySelectorAll('[data-start]').forEach(b => {
-    b.hidden = !allowed.has(b.dataset.start);
-    b.disabled = !startable;
-    b.onclick = () => startTask(id, b.dataset.start);
-  });
-  $('#startnote').textContent = !allowed.size ? 'this board allows no sessions (see its repos menu)'
-    : !startable ? 'only backlog tickets can be started'
-    : !(body.repos || []).length ? 'needs a repo first' : '';
   // The link follows the field as it is typed, so it always opens the number shown.
   const syncRefLink = () => {
     const url = refUrl($('#xref').value);
@@ -713,39 +685,6 @@ async function saveTask(id) {
     fail(e.message);
     if (e.code === 'conflict') { await loadBoard(); await openTask(id, pid); }
   }
-}
-
-// Moves the ticket, history and all. The reason typed into "why" goes with it.
-async function moveTask(id) {
-  const to = Number($('#moveto').value);
-  if (!to) return;
-  const pid = OPEN_TASK.pid;
-  try {
-    await api(`/api/projects/${pid}/tasks/${id}/move`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'if-match': `"${OPEN_TASK.version}"` },
-      body: JSON.stringify({ to, log: $('#log').value || null }),
-    });
-    await refreshProjects();
-    await loadBoard();
-    // In one board's view the ticket has just left the screen; in All Projects it is still
-    // there, now under its new board.
-    if (isAll()) { await openTask(id, to); } else { $('#panel').hidden = true; OPEN_TASK = null; }
-  } catch (e) {
-    fail(e.message);
-    if (e.code === 'conflict') { await loadBoard(); await openTask(id, pid); }
-  }
-}
-
-async function startTask(id, profile) {
-  try {
-    const { body } = await api(`/api/projects/${OPEN_TASK.pid}/tasks/${id}/start`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ profile }),
-    });
-    $('#startnote').textContent = `${body.profile} opened in a new Ghostty ${body.opened} in ${body.started_in}`;
-  } catch (e) { fail(e.message); }
 }
 
 async function forgetTask(id, title) {
@@ -833,26 +772,16 @@ async function openHit(h) {
 
 // ---- repos -----------------------------------------------------------------
 
-// The only place repos are registered. The agent names repos on tickets but never adds one:
-// registering changes which board a directory resolves to, which is a person's decision.
+// Read-only, like the rest of this page: repos are registered and managed by the agent
+// (`repo_add`) or from a terminal (`ai-kanban repo ...`), never from here. This page is for
+// looking at what the agent's board holds, not for running the work.
 async function openRepos(pid) {
   REPOS_OPEN = true;
   OPEN_TASK = null;
   REPO_BOARD = pid;
   let list = [];
   try { list = (await api(`/api/projects/${pid}/repos`)).body.repos; } catch (e) { fail(e.message); }
-  REPO_LIST = list;
   const title = (BOARDS.find(b => b.id === pid) || {}).name || `board ${pid}`;
-  // Repos on other boards, which this one can share. Asked for each time the menu opens:
-  // another board may have added one since.
-  let shareable = [];
-  try {
-    const { body } = await api('/api/repos');
-    const here = new Set(list.map(r => r.repo.id));
-    shareable = body.repos.filter(x => !here.has(x.repo.id));
-  } catch (e) { fail(e.message); }
-  let profiles = [];
-  try { profiles = (await api(`/api/projects/${pid}`)).body.profiles || []; } catch (e) { fail(e.message); }
   const me = pid;
   $('#panel').innerHTML = `
     <div class="row" style="justify-content:space-between">
@@ -872,152 +801,17 @@ async function openRepos(pid) {
         <span class="p">${esc(r.repo.path)}<br>${home ? 'opens here' : `opens on ${esc(r.home_board)}`}${
           r.other_boards.length ? ` · also on ${r.other_boards.map(esc).join(', ')}` : ''}</span>
         <span class="dim2">${r.open} open / ${r.total} tickets</span>
-        ${home ? '' : `<button data-home="${r.repo.id}" title="open this folder on this board from now on">make home</button>`}
-        <button data-rename="${r.repo.id}">rename</button>
-        <button class="danger" data-remove="${r.repo.id}">remove</button>
       </div>`;
     }).join('') || '<div class="empty">none yet</div>'}
     </section>
-    ${shareable.length ? `<section><h3>share one from another board</h3>
-      <div class="row">
-        <select id="rshare" class="grow">${shareable.map(x =>
-          `<option value="${esc(x.repo.path)}">${esc(x.repo.name)} (opens on ${esc(x.home_board)})</option>`).join('')}</select>
-        <button id="rshareadd">add</button>
-      </div>
-    </section>` : ''}
-    <section><h3>add a checkout</h3>
-      <div class="row">
-        <input id="rpath" class="grow" placeholder="~/work/eee-web or an absolute path">
-        <input id="rname" size="14" placeholder="name (optional)">
-        <button id="radd" class="primary">add</button>
-      </div>
-    </section>
-    <section><h3>sessions</h3>
-      <div class="row">${profiles.map(p => `
-        <label><input type="checkbox" data-profile="${esc(p.name)}"${p.allowed ? ' checked' : ''}> open in ${esc(p.name)}</label>`).join('')}
-      </div>
-      <div class="dim2" style="font-size:11px">
-        Which Claude Code setups this board's tickets can be opened in.
-      </div>
-    </section>
-    <section><h3>danger</h3>
-      ${list.length ? `<div class="row">
-        <select id="rforget" class="grow">${list.map(r =>
-          `<option value="${r.repo.id}">${esc(r.repo.name)}</option>`).join('')}</select>
-        <button id="rforgetgo" class="danger">forget repo permanently</button>
-      </div>` : ''}
-      <div class="row" style="margin-top:8px">
-        <button id="bforget" class="danger">forget board “${esc(title)}” permanently</button>
-      </div>
-      <div class="dim2" style="font-size:11px">
-        Forgetting a repo takes it off every board and every ticket; its folder keeps opening
-        where it does now. Forgetting the board deletes its tasks, notes and history; repos it
-        shares pass to another board, and its folders start a fresh board next time.
-        Neither can be undone.
-      </div>
-    </section>`;
+    <div class="dim2" style="font-size:11px">
+      Changed by the agent, or in a terminal: <code>ai-kanban repo add|rm|rename|home|forget</code>,
+      <code>ai-kanban board add|forget</code>.
+    </div>`;
   $('#panel').hidden = false;
   $('#close').onclick = closePanel;
   $('#panel').oninput = $('#panel').onchange = null;
   if ($('#rboard')) $('#rboard').onchange = e => openRepos(Number(e.target.value));
-  $('#radd').onclick = addRepo;
-  $('#rpath').onkeydown = e => { if (e.key === 'Enter') addRepo(); };
-  if ($('#rshareadd')) $('#rshareadd').onclick = () => postRepo($('#rshare').value, null);
-  $('#panel').querySelectorAll('[data-home]').forEach(b =>
-    b.onclick = () => makeHome(Number(b.dataset.home)));
-  $('#panel').querySelectorAll('[data-rename]').forEach(b =>
-    b.onclick = () => renameRepo(Number(b.dataset.rename)));
-  $('#panel').querySelectorAll('[data-remove]').forEach(b =>
-    b.onclick = () => removeRepo(Number(b.dataset.remove)));
-  if ($('#rforgetgo')) $('#rforgetgo').onclick = () => forgetRepo(Number($('#rforget').value));
-  $('#panel').querySelectorAll('[data-profile]').forEach(c =>
-    c.onchange = () => repoWrite(`/api/projects/${me}/profiles/${encodeURIComponent(c.dataset.profile)}`, {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ allowed: c.checked }),
-    }));
-  $('#bforget').onclick = () => forgetBoard(me, title);
-}
-
-function forgetRepo(id) {
-  const r = REPO_LIST.find(x => x.repo.id === id);
-  const boards = r ? 1 + r.other_boards.length : 1;
-  if (!confirm(`Permanently forget repo "${r ? r.repo.name : id}"?\n\n`
-    + `It comes off ${boards} board${boards === 1 ? '' : 's'} and every ticket naming it. `
-    + `Its folder keeps opening where it does now.\n\nThis cannot be undone.`)) return;
-  return repoWrite(`/api/repos/${id}`, { method: 'DELETE' });
-}
-
-// Typing the name, not a yes/no: this is the one click that can take a whole project's
-// memory, and a confirm() is answered by reflex.
-async function forgetBoard(pid, name) {
-  const typed = prompt(`Permanently forget board "${name}", with every task, note and all of its history?\n\n`
-    + `This cannot be undone. Type the board's name to confirm.`);
-  if (typed === null) return;
-  if (typed.trim() !== name) { fail('The name did not match, so nothing was forgotten.'); return; }
-  try {
-    await api(`/api/projects/${pid}`, { method: 'DELETE' });
-    // A fresh boot rather than patching state: the board on screen, the picker and the live
-    // stream all named the board that is now gone.
-    location.assign('/');
-  } catch (e) { fail(e.message); }
-}
-
-async function repoWrite(path, opts) {
-  try {
-    await api(path, opts);
-    await loadBoard();
-    await openRepos(REPO_BOARD);
-  } catch (e) { fail(e.message); }
-}
-
-// A path that is already a repo somewhere is shared rather than refused: it joins this
-// board, and its folder keeps opening where it did.
-function postRepo(path, name) {
-  return repoWrite(`/api/projects/${REPO_BOARD}/repos`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ path, name }),
-  });
-}
-
-function addRepo() {
-  const path = $('#rpath').value.trim();
-  if (!path) return;
-  return postRepo(path, $('#rname').value.trim() || null);
-}
-
-function makeHome(id) {
-  const r = REPO_LIST.find(x => x.repo.id === id);
-  if (!confirm(`Open "${r ? r.repo.name : id}" on this board from now on?\n\n`
-    + `An agent opening that folder will land here instead of on ${r ? r.home_board : 'its current board'}. `
-    + `History already written stays where it is.`)) return;
-  return repoWrite(`/api/projects/${REPO_BOARD}/repos/${id}/home`, { method: 'PUT' });
-}
-
-function renameRepo(id) {
-  const r = REPO_LIST.find(x => x.repo.id === id);
-  const name = prompt('New name', r ? r.repo.name : '');
-  if (!name || !name.trim()) return;
-  return repoWrite(`/api/projects/${REPO_BOARD}/repos/${id}`, {
-    method: 'PATCH',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name }),
-  });
-}
-
-function removeRepo(id) {
-  const r = REPO_LIST.find(x => x.repo.id === id);
-  const n = r ? r.total : 0;
-  const home = r && r.repo.home_project_id === REPO_BOARD;
-  // Says what happens to the folder, because that is the surprising half: it never ends up
-  // opening on a new empty board.
-  const folder = !home ? `Its folder keeps opening on ${r ? r.home_board : 'its home'}.`
-    : r.other_boards.length ? 'Its folder will open on one of its other boards instead.'
-    : 'The folder keeps resolving to this board.';
-  if (!confirm(`Remove repo "${r ? r.repo.name : id}" from this board?\n\n`
-    + `It comes off ${n} ticket${n === 1 ? '' : 's'} here. ${folder}`)) return;
-  return repoWrite(`/api/projects/${REPO_BOARD}/repos/${id}`, { method: 'DELETE' });
 }
 
 // In All Projects the menu opens on the board it showed last, else the most recently active.
@@ -1041,7 +835,7 @@ async function fillNewRepos(pid) {
 }
 
 $('#new').onclick = async () => {
-  if (!BOARDS.length) { fail('Create a board first with “+ board”.'); return; }
+  if (!BOARDS.length) { fail('No board yet: an agent working in a repo creates one, or run `ai-kanban board add <name>`.'); return; }
   const f = $('#newdlg form');
   f.reset();
   fillSelect(f.type, META.types, 'task');
@@ -1092,24 +886,6 @@ $('#newdlg').addEventListener('close', async () => {
     await loadBoard();
   } catch (e) { fail(e.message); }
 });
-
-// ---- boards ----------------------------------------------------------------
-
-// A board for a project that is not one folder -- a tracker's project, a customer. The repos
-// added to it in the repos menu are how agents reach it.
-$('#newboard').onclick = async () => {
-  const name = prompt('New board name (for example the project or customer)');
-  if (!name || !name.trim()) return;
-  try {
-    const { body } = await api('/api/projects', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: name.trim() }),
-    });
-    await refreshProjects(body.project.id);
-    await onProjectChange();
-  } catch (e) { fail(e.message); }
-};
 
 // ---- live updates ----------------------------------------------------------
 

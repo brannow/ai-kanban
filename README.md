@@ -93,15 +93,24 @@ For yourself, there is a web UI:
 ai-kanban serve                 # http://127.0.0.1:7373
 ```
 
-It shows which workstream the board is in, lets you switch it, and states which one a new
-task will join — so nothing lands somewhere you could not see.
+It is a window onto what the agents recorded, for checking status and correcting mistakes —
+not a place to run the work from. It shows which workstream the board is in, lets you switch
+it, and states which one a new task will join — so nothing lands somewhere you could not see.
 
 ### Boards, repos and tracker issues
 
 A board is a project. One appears automatically for any repo an agent works in; for a project
-that spans several repositories — a tracker's project, a customer — press **+ board** in the web
-UI and name it (`BMUKN`). Then press **repos** and add each checkout's path. From then on an
-agent opening any of them lands on that board, and tickets say which repos they touch:
+that spans several repositories — a tracker's project, a customer — create one by name and give
+it each checkout, or ask the agent to register the repos (`repo_add`):
+
+```sh
+ai-kanban board add BMUKN
+ai-kanban repo add ~/work/eee-api --board BMUKN
+ai-kanban repo add ~/work/eee-web --board BMUKN
+```
+
+From then on an agent opening any of them lands on that board, and tickets say which repos they
+touch:
 
 ```
 #4    Fix invoice rounding      (user) [eee-api, eee-web] ref 48213
@@ -113,9 +122,11 @@ shows `no repo set` — a flag, not a block — and `task_show` tells the agent 
 starting. Boards with no repos are unaffected.
 
 A repo can be on several boards — a shared library, say. Its folder still opens on exactly one
-of them, its *home*; **make home** in the repos menu moves that. A ticket on the wrong board
-moves with **move to board** in its panel (or `task_update(move_to: …)`), history and all.
-**All projects**, at the top of the board picker, shows every board's tickets in one view.
+of them, its *home*; `ai-kanban repo home <repo> <board>` moves that. A ticket on the wrong
+board is moved by the agent (`task_update(move_to: …)`), history and all. `ai-kanban repo
+rename|rm|forget` and `ai-kanban board forget` cover the rest; both forgets are a dry run until
+you add `--yes`. In the web UI, **All projects**, at the top of the board picker, shows every
+board's tickets in one view, and **repos** lists a board's checkouts.
 
 `ref` is the issue in an outside tracker a task mirrors — `48213`, `PROJ-123` — and `recall 48213`
 finds it. Which tracker is yours to say, with `AI_KANBAN_REF_URL` below.

@@ -384,13 +384,14 @@ restriction, it is a bug with a rationale.
   has comes back unchanged, one another board homes is attached without moving its home, and a
   path another board claims is refused with `merge` as the repair. Those three cases are what
   makes it safe to hand to an agent; the consequential act — moving a repo's home — is still
-  only the person's, in the UI.
+  only the person's, with `ai-kanban repo home`.
 - `repo_list` — the board's repos with their paths, or `project: "all"` for every repo in the
   store with the board its folder opens on.
 - `repo_remove` — off this board and this board's tickets. Nothing is deleted but the link.
 
 `ai-kanban repo add|list|rm` is the same three from a terminal, over the same `Store` calls, so
-neither surface can grow its own idea of what a repo name means.
+neither surface can grow its own idea of what a repo name means. The terminal also has what
+the agent does not get: `rename`, `home` and `forget`.
 
 They **are on the board line**, unlike tags:
 
@@ -414,4 +415,4 @@ and any repo the new board lacks stay behind, and the history says which.
 
 Boards themselves are not created by the agent. A board named by a model is how one project
 quietly becomes two (`ai-kanban` today, `ai_kanban` tomorrow), so a person creates named boards
-in the web UI, and the agent reaches them through their repos.
+with `ai-kanban board add`, and the agent reaches them through their repos.

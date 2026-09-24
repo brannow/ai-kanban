@@ -10,6 +10,14 @@ Everything it depended on landed first: schema migrations (#9), the row-version 
 guard (#10), delete semantics (#11), project resolution over HTTP (#12) and the rule that
 every mutation writes an event (#13).
 
+**What the page is for.** The board is the agent's. The page exists so the person can see what
+the agent recorded and correct it: read the board, search, edit or forget a task or note, file
+a task. It is not a place to run the work from. Creating, sharing and destroying boards and
+repos, moving tickets and starting sessions are the agent's tools or `ai-kanban board|repo` in
+a terminal. `tests/http_api.rs` (`the_web_api_cannot_run_the_work`) asserts those routes do
+not exist, so one added back fails there. The `mb-fork` branch built them all into the page;
+they were taken out again for this reason.
+
 ## What makes this consumer different
 
 Every difference below follows from one fact: **the human is a second writer, and the server
@@ -79,14 +87,7 @@ POST   /api/projects/{p}/notes                -> 201, Note
 GET    /api/projects/{p}/notes/{n}            ETag
 PATCH  /api/projects/{p}/notes/{n}            If-Match required
 GET    /api/projects/{p}/events               ?cursor= &limit=   the history
-GET    /api/projects/{p}/repos                the repos menu: repos + ticket counts
-POST   /api/projects/{p}/repos                {path, name?} -> 201, Repo
-PATCH  /api/projects/{p}/repos/{r}            {name} -- rename only
-DELETE /api/projects/{p}/repos/{r}            off this board and this board's tickets
-PUT    /api/projects/{p}/repos/{r}/home       its folder opens on this board from now on
-POST   /api/projects                          {name} -> 201, a board created by name
-POST   /api/projects/{p}/tasks/{t}/move       {to, log} -- If-Match required
-GET    /api/repos                             every repo, with the board its folder opens on
+GET    /api/projects/{p}/repos                the repos list: repos + ticket counts (read-only)
 GET    /api/all/board                         All Projects: every board's tickets, one set of columns
 GET    /api/all/tasks                         ?status= &cursor= -- paging an All Projects column
 GET    /api/recall                            ?q= &project= &limit=
@@ -276,9 +277,13 @@ after forgetting something that genuinely must not persist, search `recall` for 
 operation is precise, not exhaustive.
 
 ```
-DELETE /api/projects/{p}      a whole board
-DELETE /api/repos/{r}         a repo, off every board and ticket
+ai-kanban board forget <board> [--yes]    a whole board
+ai-kanban repo forget <repo> [--yes]      a repo, off every board and ticket
 ```
+
+Not HTTP routes: forgetting a whole board or repo is rare and deliberate, so it is a terminal
+command, like `merge`. Without `--yes` either one prints what it would delete and exits
+non-zero.
 
 Forgetting a **board** deletes its tasks, notes, workstreams, history and path aliases, so the
 next session opened in one of its folders starts a fresh board. Repos it was home to pass to
@@ -286,13 +291,10 @@ the earliest other board sharing them; repos only it had go. With no board left 
 tombstone, it advances the events sequence instead, which `change_cursor` reads alongside
 `MAX(events.id)` — otherwise the delete would be invisible to every live page.
 
-Forgetting a **repo** differs from `DELETE /projects/{p}/repos/{r}` (off one board): it
+Forgetting a **repo** differs from `ai-kanban repo rm` (off one board): it
 leaves the store, off every board and every ticket. Its folder's path aliases stay, because
 they belong to a board whose history is still there. The tombstone is `repo #3`, on each
 board that had it.
-
-The web UI puts both in the repos panel's danger zone, and forgetting a board asks for its
-name typed out.
 
 Core: `Store::forget_task` / `forget_note` / `forget_repo` / `forget_board`, `src/core/forget.rs`.
 
@@ -469,81 +471,43 @@ worth reopening that decision for.
 ## Repos
 
 Migration 007 (see `docs/data-model.md`). A board owns the local checkouts its tickets live
-in, and the web UI's **repos** button is the only place they are registered.
+in. They are registered by the agent (`repo_add`) or in a terminal (`ai-kanban repo add <path>
+[--board <b>]`), never from the page. The page's **repos** button only lists them: path, home
+board, the other boards sharing them, and ticket counts.
 
-- `POST /repos` takes `{"path": "~/work/eee-web", "name": "eee-web"}`. `~/` is expanded here,
-  because that is how a person types a path. The name defaults to the folder's, is normalized,
-  and is unique across the store. A path that is already a repo — on another board — is
-  **shared**: attached here, its home unchanged. A *new* checkout in a directory another board
-  already claims — at the path or below it — is a **409 `claimed`** carrying that board's
-  `board` and `key`, because the repair is `ai-kanban merge`.
-- `PUT /repos/{r}/home` makes this board the repo's home: its folder, and every subdirectory
-  the old home had learned, opens here from now on.
-- `PATCH /repos/{r}` renames. The path is not editable: a different path is a different
-  checkout, and may belong to another board, so moving one is a remove and an add.
-- `DELETE /repos/{r}` takes it off this board and this board's tickets. If this was its home
-  and other boards have it, the home passes to the earliest of them; from its last board, the
-  repo goes and the folder keeps resolving here.
-- **No `If-Match` on repo writes.** The guard is for a form held open while an agent writes the
-  same row, and no agent writes repos.
+Everything that changes a repo lives in `ai-kanban repo`: `add`, `rm`, `rename`, `home <repo>
+<board>` (its folder, and every subdirectory the old home had learned, opens on that board from
+now on) and `forget`. A path that is already a repo on another board is **shared**: attached,
+home unchanged. A new checkout in a directory another board already claims is refused, naming
+that board, because the repair is `ai-kanban merge`.
 
-On tasks: `POST`/`PATCH /tasks` take `repos` (ids; `[]` clears) and `external_ref` (`""` clears —
+On tasks, naming repos is a field edit like tags, so the page may correct it: `POST`/`PATCH
+/tasks` take `repos` (ids of this board's repos; `[]` clears) and `external_ref` (`""` clears —
 a JSON `null` in an optional field deserializes as "absent", so it cannot mean "clear"). `GET
 /tasks/{t}` returns `repos`, with paths, and `external_ref`. `GET /board` and `GET /tasks` return
 `task_links` keyed by task id like `task_tags` — `{"repos": ["eee-web"], "external_ref": "48213"}` —
 and `/board` also returns `repos`, every repo with `open` and `total` ticket counts, so the
-cards, the pickers and the menu all come from one read.
-
-## Boards by name, moving tickets, All Projects
-
-`POST /api/projects` with `{"name": "BMUKN"}` creates a board for a project that is not one
-folder (key `board:bmukn`). A name another board has is refused. Agents reach such a board
-through the repos it is home to.
-
-`POST /projects/{p}/tasks/{t}/move` with `{"to": <board id or key>, "log": "..."}` moves a
-ticket, `If-Match` required. It is an action rather than a `PATCH` field because it changes the
-URL the task lives at. The response carries the task and the board it landed on.
-
-`GET /api/all/board` is the **All Projects** view: every board's tickets in one set of columns,
-the same shape as `/board` plus `projects` (so a card can name its board) and
-`boards_with_repos` (so "no repo set" follows each card's own board). No workstream — that is a
-slice of one board. `GET /api/all/tasks` pages its columns. This is the person's view only: the
-agent's cross-board view stays `board(project: "all")`, a per-board summary, because for a
-reader paying per token every open task across every project is a pile, not a board.
-
-## Starting work from the board
-
-`POST /projects/{p}/tasks/{t}/start` (body `{"profile": "claude" | "claude-work"}`, default
-`claude`) runs Claude Code in the ticket's first repo: in a new tab of the front Ghostty window
-when Ghostty is running (through its AppleScript, 1.3+), otherwise — or when that fails, e.g.
-AppleScript access was refused — in a new Ghostty window. The response's `opened` says which
-(`tab` | `window`). The `claude-work` profile is the same binary with
-`CLAUDE_CONFIG_DIR=~/.claude-work`, set through `/usr/bin/env` because neither a tab nor a
-window started this way runs the user's shell, so neither sees shell aliases. It
-starts with its other repos passed as `--add-dir`, and the ticket as
-the first prompt (`render::start_prompt`). The prompt names the board, because the first
-repo's home can be a different board. Only a **backlog** ticket can be started — one in doing
-already has a session, and one blocked or finished is not ready — and a ticket with no repo is
-a `400` too: the session has to start in a checkout.
-
-Each board decides which profiles it allows: `PUT /projects/{p}/profiles/{name}` with
-`{"allowed": bool}`, set from the "sessions" section of the board's repos menu. Every profile
-is allowed until a board refuses it (migration 009 keeps a deny list), a refused profile is a
-`403` from `start`, and the panel does not offer its button. `GET /projects/{p}` and the task
-detail carry `profiles: [{name, allowed}]`.
+cards, the pickers and the list all come from one read.
 
 `/api/meta` carries `ref_url` from `AI_KANBAN_REF_URL`, a template such as
-`https://frs.plan.io/issues/{ref}`, and the UI links each ref by replacing `{ref}` (or appending
-it, when the template has none). A setting rather than a constant: the store knows refs, not
-which tracker they are in. Unset, refs show without a link. The launch is logged on the ticket.
+`https://frs.plan.io/issues/{ref}`, and the page links each ref by replacing `{ref}` (or
+appending it, when the template has none). A setting rather than a constant: the store knows
+refs, not which tracker they are in. Unset, refs show without a link.
 
-It is the one route that starts a process, so it is the one route locked to the board page:
-`Host` must be loopback and `Origin`, when sent, must be this server — a cross-site `POST` or a
-DNS-rebinding page gets a `403`. The required JSON body also forces a CORS preflight that this
-server never answers. No text in a ticket can become a command: a window gets the prompt as one
-argv entry, and a tab — which Ghostty only takes as a command line — gets a line made of
-variable names alone, with every argument passed as a variable's value. This is a convenience for the person at the board; nothing in
-the agent path depends on it, which keeps `serve` on the right side of the no-daemon line.
+## Boards by name and All Projects
+
+`ai-kanban board add <name>` creates a board for a project that is not one folder (key
+`board:<name>`); a name another board has is refused. Agents reach such a board through the
+repos it is home to. A ticket on the wrong board is moved by the agent, `task_update(move_to:
+...)`, which keeps its id, history and notes.
+
+`GET /api/all/board` is the **All Projects** view, where the page opens: every board's tickets
+in one set of columns, the same shape as `/board` plus `projects` (so a card can name its
+board) and `boards_with_repos` (so "no repo set" follows each card's own board). No workstream
+— that is a slice of one board. `GET /api/all/tasks` pages its columns. This is the person's
+view only: the agent's cross-board view stays `board(project: "all")`, a per-board summary,
+because for a reader paying per token every open task across every project is a pile, not a
+board.
 
 ## Explicitly not in v1
 

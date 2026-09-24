@@ -264,11 +264,12 @@ acts on; which checkouts a ticket lives in and which ticket it is are what an ag
 pick the work up at all. Measured at its worst — two repos and a ref on every listed row — in
 `tests/budget.rs`.
 
-**Repos are registered from any surface**: the web UI's repos menu, `repo_add`, or
-`ai-kanban repo add`. All three call `Store::add_repo`, which is where the name is normalized
+**Repos are registered by the agent (`repo_add`) or in a terminal (`ai-kanban repo add`)**,
+never from the web UI, which only lists them. Both call `Store::add_repo`, which is where the name is normalized
 and where a path another board already claims is refused — the guard that makes it safe for an
 agent to register one. What stays the person's call is *moving* a repo's home
-(`set_repo_home`), since that is what changes where an existing folder resolves.
+(`set_repo_home`, `ai-kanban repo home`), since that is what changes where an existing folder
+resolves.
 
 ### `tasks`
 
@@ -522,3 +523,13 @@ those stores at version 11 and silently skip whatever took its place. Dropping t
 later migration would delete the to-do items people wrote on that branch. Empty tables cost
 nothing, and an opt-in would start from them. If the feature is ever declared dead for good,
 drop them in a new migration -- never by editing 011.
+
+## `board_denied_profiles`: a dormant table
+
+Migration 009 creates it and nothing reads or writes it. It held, per board, which Claude Code
+setups the web UI's "start a session" button could open. That button came with the `mb-fork`
+branch and was taken out again before it reached main: the web UI is for looking at what the
+agent recorded, not for running the work (`docs/http-api.md`). The table stays for the reason
+`todos` does -- 009 has already run on the stores the branch shipped to, and migrations are
+append-only. `forget_board` still clears its rows, which cost nothing and leave nothing behind
+from those stores.
