@@ -18,7 +18,6 @@ pub mod project;
 pub mod recall;
 pub mod repo;
 pub mod task;
-pub mod todo;
 pub mod staleness;
 pub mod store;
 pub mod transfer;

@@ -48,14 +48,6 @@ const POLL: Duration = Duration::from_millis(400);
 pub struct Change {
     pub cursor: i64,
     pub projects: Vec<i64>,
-    /// The to-do list's revision. It rides on the same change frame rather than getting a
-    /// stream of its own: a second SSE endpoint would mean a second connection and a second
-    /// reconnect protocol for one integer.
-    pub todos: i64,
-    /// Whether *this* frame carries a to-do change. A client watching one board filters on
-    /// `projects`, and the to-do list belongs to no project -- without this flag it would
-    /// filter out the only frame that was about its list.
-    pub todos_changed: bool,
 }
 
 /// Watches the store and fans changes out to every connected client.
@@ -72,7 +64,6 @@ pub struct Change {
 pub fn spawn_poller(tx: broadcast::Sender<Change>) {
     tokio::spawn(async move {
         let mut last: Option<i64> = None;
-        let mut last_todos: Option<i64> = None;
         loop {
             tokio::time::sleep(POLL).await;
             // Reopened per tick, deliberately: the store may not exist yet, may be replaced,
@@ -80,19 +71,11 @@ pub fn spawn_poller(tx: broadcast::Sender<Change>) {
             // a SQLite connection is cheap; a dead poller is not recoverable without a restart.
             let Ok(Some(store)) = Store::open_existing() else { continue };
             let Ok(cursor) = store.change_cursor() else { continue };
-            // The to-do list writes no events, so it is invisible to `change_cursor` by
-            // design -- see `migrations/011_todos.sql`. Its own counter is polled beside it.
-            let todos = store.todo_rev().unwrap_or(0);
 
-            let (Some(previous), Some(previous_todos)) = (last, last_todos) else {
+            let Some(previous) = last else {
                 last = Some(cursor);
-                last_todos = Some(todos);
                 continue;
             };
-
-            let todos_changed = todos != previous_todos;
-            last_todos = Some(todos);
-
             if cursor <= previous {
                 // A cursor that went *down* means a different store (the file was replaced, or
                 // AI_KANBAN_DB was repointed). Adopt it rather than waiting for it to climb
@@ -100,18 +83,13 @@ pub fn spawn_poller(tx: broadcast::Sender<Change>) {
                 if cursor < previous {
                     last = Some(cursor);
                 }
-                // A to-do change is a real change even when no task moved, so it is sent on
-                // its own rather than waiting for the board to do something.
-                if todos_changed {
-                    let _ = tx.send(Change { cursor, projects: vec![], todos, todos_changed });
-                }
                 continue;
             }
 
             let projects = store.projects_changed_since(previous).unwrap_or_default();
             last = Some(cursor);
             // Err means nobody is listening, which is the normal state of an open server.
-            let _ = tx.send(Change { cursor, projects, todos, todos_changed });
+            let _ = tx.send(Change { cursor, projects });
         }
     });
 }
@@ -134,10 +112,7 @@ pub async fn sse(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<i64>().ok());
 
-    let (current, todos) = {
-        let store = api.store();
-        (store.change_cursor().unwrap_or(0), store.todo_rev().unwrap_or(0))
-    };
+    let current = api.store().change_cursor().unwrap_or(0);
 
     let stream = async_stream::stream! {
         // The first event tells the client where the store actually is, so it can compare
@@ -152,7 +127,7 @@ pub async fn sse(
             SseEvent::default()
                 .id(current.to_string())
                 .event(if reset { "reset" } else { "change" })
-                .json_data(serde_json::json!({ "cursor": current, "todos": todos, "reset": reset }))
+                .json_data(serde_json::json!({ "cursor": current, "reset": reset }))
                 .unwrap_or_else(|_| SseEvent::default().comment("bad payload")),
         );
 
@@ -162,9 +137,7 @@ pub async fn sse(
                     // Only wake a client whose board actually changed. A watcher of every
                     // board wakes on everything.
                     if let Some(pid) = watching {
-                        // The to-do list belongs to no board, so a frame carrying a to-do
-                        // change is for every client whatever it is watching.
-                        if !change.todos_changed && !change.projects.contains(&pid) {
+                        if !change.projects.contains(&pid) {
                             continue;
                         }
                     }
@@ -174,7 +147,6 @@ pub async fn sse(
                         .json_data(serde_json::json!({
                             "cursor": change.cursor,
                             "projects": change.projects,
-                            "todos": change.todos,
                             "reset": false,
                         }))
                         .unwrap_or_else(|_| SseEvent::default().comment("bad payload")));

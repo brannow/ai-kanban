@@ -13,7 +13,7 @@ use ai_kanban::core::Store;
 use ai_kanban::http::{router, Api};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
@@ -588,75 +588,4 @@ async fn starting_a_session_is_refused_from_other_sites_and_without_a_repo() {
     let (status, body, _) = call(&api, req).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["field"], "profile");
-}
-
-// ---------------------------------------------------------------------------
-// The person's to-do list
-// ---------------------------------------------------------------------------
-
-/// A write from the board page itself. `json_req` leaves `Host` off, which the same-origin
-/// check treats as a request from nowhere -- correct for it, useless for exercising the route.
-fn todo_req(method: &str, path: &str, body: Value) -> Request<Body> {
-    Request::builder()
-        .method(method).uri(path)
-        .header("content-type", "application/json")
-        .header("host", "127.0.0.1:7373")
-        .body(Body::from(body.to_string())).unwrap()
-}
-
-/// The to-do routes take no project: one list, reachable the same way from every board.
-#[tokio::test]
-async fn the_to_do_list_is_global_and_lives_outside_every_board() {
-    let (api, _pid) = api();
-
-    let (status, body, _) = call(&api, todo_req("POST", "/api/todos", json!({ "text": "renew the domain" }))).await;
-    assert_eq!(status, StatusCode::CREATED);
-    let id = body["id"].as_i64().unwrap();
-
-    let (status, body, _) = call(&api, get("/api/todos")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["todos"][0]["text"], "renew the domain");
-    assert_eq!(body["open"], 1, "the header badge counts unchecked items");
-    let rev = body["rev"].as_i64().unwrap();
-
-    let (status, body, _) = call(&api, todo_req("PATCH", &format!("/api/todos/{id}"), json!({ "done": true }))).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(body["done_at"].is_i64());
-
-    let (_, body, _) = call(&api, get("/api/todos")).await;
-    assert_eq!(body["open"], 0, "a checked item is not outstanding work");
-    assert!(body["rev"].as_i64().unwrap() > rev, "the revision moved, so an open page refetches");
-
-    let del = Request::builder().method("DELETE").uri(format!("/api/todos/{id}"))
-        .header("host", "127.0.0.1:7373").body(Body::empty()).unwrap();
-    assert_eq!(call(&api, del).await.0, StatusCode::NO_CONTENT);
-    let (_, body, _) = call(&api, get("/api/todos")).await;
-    assert_eq!(body["todos"].as_array().unwrap().len(), 0);
-}
-
-#[tokio::test]
-async fn a_to_do_write_from_another_site_is_refused() {
-    // Loopback with no auth: without this check, any page open in the browser could add to
-    // or empty the person's list. The same rule the session-start route follows.
-    let (api, _pid) = api();
-    let req = Request::builder()
-        .method("POST").uri("/api/todos")
-        .header("content-type", "application/json")
-        .header("host", "127.0.0.1:7373")
-        .header("origin", "http://evil.example")
-        .body(Body::from(json!({ "text": "not yours to write" }).to_string())).unwrap();
-
-    assert_eq!(call(&api, req).await.0, StatusCode::FORBIDDEN);
-    let (_, body, _) = call(&api, get("/api/todos")).await;
-    assert_eq!(body["todos"].as_array().unwrap().len(), 0);
-}
-
-#[tokio::test]
-async fn a_blank_to_do_comes_back_as_a_bad_request_and_a_missing_one_as_not_found() {
-    let (api, _pid) = api();
-    let (status, _, _) = call(&api, todo_req("POST", "/api/todos", json!({ "text": "   " }))).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-
-    let (status, _, _) = call(&api, todo_req("PATCH", "/api/todos/999", json!({ "done": true }))).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
 }

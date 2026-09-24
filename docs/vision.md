@@ -76,14 +76,6 @@ ecosystems, to solve "remember what happened last week".
 The test for any proposed feature: does an agent starting cold work better because of it? If
 the honest answer is "it would look more complete", it does not belong.
 
-**The to-do list is the one thing here that does not pass that test, and is in anyway.** It
-is the person's own list, added because they asked for it, and it makes no agent work better.
-What keeps it consistent with the rest rather than a hole in it: it costs the agent *nothing*
-— no tool, no tokens on the board, no line in the history it reads, no status it has to
-understand. It is quarantined in `core::todo`, reachable only from the web UI, and every
-agent-facing surface is asserted blind to it in `tests/todos.rs`. A second feature bought
-against this precedent would need the same quarantine, and most would not survive it.
-
 ## Consumers, in priority order
 
 1. **The agent**, over MCP. This is what exists.

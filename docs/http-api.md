@@ -90,10 +90,6 @@ GET    /api/repos                             every repo, with the board its fol
 GET    /api/all/board                         All Projects: every board's tickets, one set of columns
 GET    /api/all/tasks                         ?status= &cursor= -- paging an All Projects column
 GET    /api/recall                            ?q= &project= &limit=
-GET    /api/todos                             the person's list + its revision
-POST   /api/todos                             {text} -> 201, Todo
-PATCH  /api/todos/{id}                        {text?, done?}
-DELETE /api/todos/{id}                        -> 204
 GET    /api/stream                            SSE, live updates
 ```
 
@@ -566,39 +562,3 @@ MCP and both hooks — must keep working with the server never started, as it do
 server is a viewer the user launches when they want to look, not infrastructure the system
 runs on. The moment something requires `serve` to be running, this project has become the
 platform it exists in reaction to.
-
-## `/api/todos` — the human's own list
-
-The only resource here with no `{p}` in its path, and the only one with no counterpart on the
-agent's surface. One global list, the same from every board. `docs/data-model.md` has the
-reasoning; what matters for this document is how it differs from every other endpoint:
-
-**No `If-Match`.** Every other write here carries a version because a browser form sits open
-while an agent writes the same row from another process. No agent writes this table, so that
-race does not exist, and a version on a checkbox would be ceremony.
-
-**Writes require a same-origin request**, like `/start`. This is a loopback server with no
-auth: without the check, any page open in the browser could add to or empty the list.
-
-**The read carries `rev`, not a cursor.** The list writes no events, so `MAX(events.id)` — the
-change cursor everything else rides on — does not move when it changes. `rev` is its own
-counter, and the SSE frame carries it beside `cursor`:
-
-```
-data: {"cursor":415,"projects":[12],"todos":9,"reset":false}
-```
-
-A page compares `todos` against what its last `/api/todos` returned, exactly as it compares
-`cursor` against its last board fetch. Two consequences worth stating, because both look like
-bugs from the outside:
-
-* A to-do change emits a frame whose `cursor` has not moved. A client keyed only on the
-  cursor would ignore it.
-* That frame reaches **every** client, including one watching a single board, because the list
-  belongs to no board. The per-project filter is skipped when the frame carries a to-do
-  change.
-
-`GET /api/todos` also returns `open`, the count of unchecked items, so the header badge and
-the list agree on what is outstanding without the page deriving it twice. Reading the list is
-what runs the sweep of checked items older than a day, so a read can legitimately change the
-store — the only `GET` here that can.

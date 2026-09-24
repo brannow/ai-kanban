@@ -18,11 +18,6 @@ pub enum Error {
     #[error("no note #{id}")]
     NoteNotFound { id: i64, project: String },
 
-    /// No `existing` list: the to-do list is the person's own and short, and they are
-    /// looking at it. Echoing it back in an error would be telling them what they can see.
-    #[error("no to-do #{id}")]
-    TodoNotFound { id: i64 },
-
     #[error("no project matching {query:?}")]
     ProjectNotFound { query: String, existing: Vec<String> },
 
