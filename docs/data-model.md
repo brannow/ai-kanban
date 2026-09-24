@@ -65,6 +65,21 @@ else the repo root path. Normalization collapses `git@github.com:me/repo.git` an
 `https://github.com/me/repo` to one key, because cloning over SSH on one machine and HTTPS
 on another is the least obvious route to a split board.
 
+That key is **not** fixed over a repo's life. A repo with no remote keys on its root path.
+Once it gets a remote, a fresh derivation yields `git:<remote>`, which no board has. So
+**a linked worktree resolves as its main checkout**, not as a repo of its own: its `.git`
+file leads through `commondir` to the main `.git`, and the walk continues from there.
+Deriving from the worktree's own root forked the board in two ways. With no remote, the two
+checkouts were `path:` on two different directories. When the board predated the remote,
+they were `path:` versus `git:`. Worktrees are how Claude Code isolates work, so the fork
+landed on an agent with no reason to suspect the board it read was empty. A submodule also
+has a `.git` file, but no `commondir`; it is a separate repository and keeps its own board.
+
+What is still open: a **separate clone** of a repo whose board was keyed before the remote
+existed derives `git:` and starts a new board. The obvious repair, re-keying `path:` to
+`git:` on resolve, changes the stable identity that `import` matches on. So it is a
+decision of its own, not a side effect of the worktree fix.
+
 Resolution (`src/core/project.rs`) is **one upward walk**, in two passes:
 
 1. **Markers, all the way up.** The deepest `.ai-kanban` wins. This is a pass of its own,
@@ -76,7 +91,18 @@ Resolution (`src/core/project.rs`) is **one upward walk**, in two passes:
 2. **Then, per level:** a known path in `project_paths`, else a `.git` directory (keyed on
    the normalized remote if present, else the root path).
 
-If the walk finds nothing, the starting directory becomes its own project.
+If the walk finds nothing, the starting directory becomes its own project — **except** `$HOME`,
+any directory above it, a filesystem root, or the temp dir, where resolution fails with a
+message naming the ways out. Those directories sit above every project. Once one of them is
+a board, it is a known path that step 2 matches for every non-git directory beneath it, so
+unrelated projects silently merge into one board named after the user. That happened on a
+real store: a Rust toolchain and a Swift app shared one board named after the user. The refusal
+is only for this fallback. A marker or a `.git` in `$HOME` still resolves, and a board that
+already claims one of these directories still resolves, so it can be read and repaired.
+
+The set is closed on purpose. "Any directory that already contains boards" would also catch
+`~/Projects`, but then whether a directory can get a board would depend on store state that
+changes over time.
 
 Checking learned aliases at **every** level, not just the starting directory, is what stops
 a subdirectory of a **non-git** project from becoming its own board. With no `.git` to mark

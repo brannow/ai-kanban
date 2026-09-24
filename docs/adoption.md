@@ -216,6 +216,14 @@ so if the binary is later moved, the hooks go quiet rather than erroring.
 that dies in silence is a board that is mysteriously absent, which is harder to diagnose
 than a startup error.
 
+The same risk arrives by a second route that is easy to miss, because nothing breaks. The
+plugin loader accepts exactly four top-level keys in `hooks.json` — `description`, `hooks`,
+`modules`, `surface` — and warns on every session start about anything else. We shipped a
+`"_comment"` key and warned for weeks. The hooks ran fine; the plugin was merely noisy, and
+noisy is what gets uninstalled. `claude plugin validate` does **not** catch it, so the guard
+is an allowlist assertion in `tests/plugin_install.rs`. See note #94 and `plugin/README.md`,
+which holds the full reasoning.
+
 ### Testing it
 
 Note #15's rule survives the redesign, because the reason for it does: *any test of the

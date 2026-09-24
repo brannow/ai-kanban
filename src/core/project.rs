@@ -15,32 +15,39 @@
 //!
 //! # Order
 //!
-//! Resolution is a single walk upward from the caller's directory. At **each** level, in
-//! this order:
+//! Resolution is a single walk upward from the caller's directory, in two passes:
 //!
-//! 1. `.ai-kanban` marker file. Explicit beats inferred -- the escape hatch for monorepo
-//!    packages and non-git directories.
+//! 1. `.ai-kanban` marker file, all the way up first. Explicit beats inferred -- the escape
+//!    hatch for monorepo packages and non-git directories.
+//!
+//! Then, at **each** level:
+//!
 //! 2. A known path in `project_paths`. A board already claimed this directory.
 //! 3. A `.git` directory. Keyed on the normalized remote URL if there is one, else the root
 //!    path.
 //!
-//! If the walk finds nothing, the starting directory becomes its own project.
+//! If the walk finds nothing, the starting directory becomes its own project -- unless it is
+//! `$HOME`, a directory above it, a filesystem root or the temp dir, which is refused. Those
+//! sit above every project, and a board anchored there becomes a known path that rule 2
+//! matches for *every* non-git directory beneath it: distinct projects silently merge into
+//! one board named after the user. A marker or a `.git` there still resolves normally --
+//! the refusal is only for the fallback, where nothing says the directory was meant.
 //!
-//! The checks are interleaved per level rather than run as three separate passes, and that
-//! ordering carries real weight:
+//! That ordering carries real weight:
 //!
 //! * Checking learned aliases at every level (not just the starting directory) is what
 //!   stops a subdirectory of a **non-git** project from becoming its own board. Without it
 //!   `~/notes` and `~/notes/drafts` are two separate memories, because with no `.git` to
 //!   mark a root the walk has nothing else to anchor on.
-//! * Checking the marker *before* the alias at each level is what keeps a monorepo package
-//!   from being swallowed by the repo-wide board sitting above it.
+//! * Giving markers a pass of their own, before any alias, is what keeps a monorepo package
+//!   from being swallowed by the repo-wide board above it -- including when the package
+//!   already learned an alias before the marker was added (see `walk`).
 //!
 //! Note what is absent: `roots/list`. SEP-2577 (Final) deprecates it, and names environment
 //! variables as a replacement, so the caller's path comes from `CLAUDE_PROJECT_DIR` first
 //! and cwd second. Roots may be consulted opportunistically by the adapter, never here.
 
-use crate::core::error::Result;
+use crate::core::error::{Error, Result};
 use crate::core::model::Project;
 use crate::core::store::{now, Store};
 use rusqlite::OptionalExtension;
@@ -77,6 +84,13 @@ impl Store {
     /// alias either way. Recording on every call is what makes the second clone join the
     /// first one's board.
     pub fn resolve_project(&self, start: &Path) -> Result<Resolved> {
+        self.resolve_project_from(start, dirs::home_dir().as_deref())
+    }
+
+    /// `resolve_project` with the home directory passed in rather than read from the
+    /// environment. Tests need a fake `$HOME`, and setting `HOME` for real is process-wide
+    /// under a multithreaded test runner.
+    pub fn resolve_project_from(&self, start: &Path, home: Option<&Path>) -> Result<Resolved> {
         let start = canonical(start);
 
         let (key, name, root, how) = match self.walk(&start)? {
@@ -88,6 +102,11 @@ impl Store {
                 return Ok(Resolved { project, how: Resolution::KnownPath, created: false });
             }
             Some(Found::Identity(id)) => id,
+            // Only here, not in the walk. A board that already claims one of these
+            // directories must still resolve, or the user cannot even read it to repair it.
+            None if is_above_every_project(&start, home.map(canonical).as_deref()) => {
+                return Err(Error::SharedDirectory { path: start.to_string_lossy().into_owned() });
+            }
             None => (format!("path:{}", start.to_string_lossy()), basename(&start), start.clone(), Resolution::Directory),
         };
 
@@ -256,6 +275,25 @@ fn read_marker(path: &Path) -> Option<String> {
     Some(key.to_string())
 }
 
+/// A closed set derived from the environment, deliberately. A heuristic like "a directory
+/// that already contains boards" would also catch `~/Projects`, but it would make whether
+/// a directory can get a board depend on store state that changes over time.
+///
+/// The temp dirs go beyond the `$HOME` case that was actually reported, on the same
+/// mechanism: a board anchored at `/tmp` would absorb every scratch directory under it.
+///
+/// Degrades open: a home that cannot be canonicalized is compared as given, so at worst
+/// the guard misses and resolution behaves as it did before the guard existed.
+fn is_above_every_project(dir: &Path, home: Option<&Path>) -> bool {
+    // `Path::starts_with` compares whole components: `/Users/alice` is below `/Users`,
+    // not below `/Users/al`.
+    dir.parent().is_none()
+        || home.is_some_and(|h| h.starts_with(dir))
+        // Both, because they differ on macOS: `temp_dir()` is the per-user `$TMPDIR` under
+        // /var/folders, while `/tmp` is where a person actually types `cd`.
+        || [std::env::temp_dir(), PathBuf::from("/tmp")].iter().any(|t| canonical(t) == dir)
+}
+
 fn basename(p: &Path) -> String {
     p.file_name().map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.to_string_lossy().into_owned())
@@ -266,34 +304,58 @@ fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// Where a checkout's git data lives.
+struct GitDir {
+    /// The directory holding the shared config.
+    common: PathBuf,
+    /// A linked worktree: `.git` is a *file* pointing at `<main>/.git/worktrees/<name>`,
+    /// whose `commondir` leads back to the main repo's `.git`.
+    linked: bool,
+}
+
+fn git_dir(repo_root: &Path) -> Option<GitDir> {
+    let dot_git = repo_root.join(".git");
+    if dot_git.is_dir() {
+        return Some(GitDir { common: dot_git, linked: false });
+    }
+    let contents = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = PathBuf::from(contents.strip_prefix("gitdir:")?.trim());
+    let gitdir = if gitdir.is_absolute() { gitdir } else { repo_root.join(gitdir) };
+    match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(c) => {
+            let common = PathBuf::from(c.trim());
+            let common = if common.is_absolute() { common } else { gitdir.join(common) };
+            Some(GitDir { common, linked: true })
+        }
+        // A `.git` file with no `commondir` is a submodule: its git data is its own, and
+        // there is no main checkout for it to belong to.
+        Err(_) => Some(GitDir { common: gitdir, linked: false }),
+    }
+}
+
+/// The main checkout a linked worktree belongs to.
+///
+/// `None` for a main checkout, a submodule, and a worktree of a bare repo -- whose common
+/// dir is not a `.git` inside any checkout, so there is no directory to answer as.
+fn main_checkout(repo_root: &Path) -> Option<PathBuf> {
+    let git = git_dir(repo_root)?;
+    if !git.linked {
+        return None;
+    }
+    // `commondir` is usually relative (`../..`), so the path has to be normalized before
+    // its parent means anything. A main checkout that has since moved fails here, and the
+    // worktree falls back to standing on its own.
+    let common = std::fs::canonicalize(&git.common).ok()?;
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    common.parent().map(Path::to_path_buf)
+}
+
 /// Reads `remote.origin.url` from git's config by hand rather than shelling out to `git`:
 /// no subprocess per resolution, and no dependency on git being installed.
-///
-/// Handles the worktree case, where `.git` is a *file* pointing at
-/// `<main>/.git/worktrees/<name>`. Getting this wrong is precisely how a worktree forks
-/// into its own board -- the failure `project_paths` exists to prevent.
 fn git_remote(repo_root: &Path) -> Option<String> {
-    let dot_git = repo_root.join(".git");
-    let config_path = if dot_git.is_dir() {
-        dot_git.join("config")
-    } else {
-        let contents = std::fs::read_to_string(&dot_git).ok()?;
-        let gitdir = contents.strip_prefix("gitdir:")?.trim();
-        let gitdir = PathBuf::from(gitdir);
-        let gitdir = if gitdir.is_absolute() { gitdir } else { repo_root.join(gitdir) };
-        // `commondir` points back at the main repo's .git, which owns the shared config.
-        match std::fs::read_to_string(gitdir.join("commondir")) {
-            Ok(c) => {
-                let c = c.trim();
-                let common = PathBuf::from(c);
-                let common = if common.is_absolute() { common } else { gitdir.join(common) };
-                common.join("config")
-            }
-            Err(_) => gitdir.join("config"),
-        }
-    };
-
-    let text = std::fs::read_to_string(config_path).ok()?;
+    let text = std::fs::read_to_string(git_dir(repo_root)?.common.join("config")).ok()?;
     let mut in_origin = false;
     for line in text.lines() {
         let t = line.trim();
@@ -394,6 +456,28 @@ impl Store {
                 return Ok(Some(Found::Known(p)));
             }
             if dir.join(".git").exists() {
+                // A linked worktree is its main checkout, checked out somewhere else, so it
+                // resolves exactly as the main checkout does. Deriving an identity from the
+                // worktree's own root instead forks the board whenever the two keys differ:
+                // always with no remote (each is `path:` on its own directory), and when the
+                // board was keyed before the repo had a remote (`path:` vs `git:`). Claude
+                // Code isolates work in worktrees, so that fork lands on the agent that is
+                // least likely to notice it is reading an empty board.
+                //
+                // It continues from the *same place* in the main checkout, not from its root:
+                // a marker that exists only there (untracked, so never copied into the
+                // worktree) must still claim `<worktree>/packages/api` as it claims
+                // `<main>/packages/api`. The main checkout's `.git` is a directory, so the
+                // walk from there ends at the main checkout at the latest.
+                if let Some(main) = main_checkout(dir) {
+                    // Not `main.join("")`: that yields `<main>/`, whose string form matches no
+                    // stored path and derives a different `path:` key.
+                    let same_place = match start.strip_prefix(dir) {
+                        Ok(below) if !below.as_os_str().is_empty() => main.join(below),
+                        _ => main,
+                    };
+                    return self.walk(&same_place);
+                }
                 let name = basename(dir);
                 return Ok(Some(Found::Identity(match git_remote(dir) {
                     Some(url) => (format!("git:{}", normalize_remote(&url)), name, dir.to_path_buf(), Resolution::GitRemote),

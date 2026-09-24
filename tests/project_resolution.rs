@@ -6,7 +6,7 @@
 //! resolver does.
 
 use ai_kanban::core::project::{normalize_remote, Resolution};
-use ai_kanban::core::Store;
+use ai_kanban::core::{Error, Store};
 use std::fs;
 use std::path::Path;
 
@@ -257,4 +257,262 @@ fn a_marker_added_after_the_fact_still_takes_effect() {
     assert_eq!(after.how, Resolution::Marker);
     assert_eq!(after.project.key, "monorepo/api");
     assert_ne!(after.project.id, before.project.id);
+}
+
+fn refused(r: ai_kanban::core::Result<ai_kanban::core::project::Resolved>) -> bool {
+    matches!(r, Err(Error::SharedDirectory { .. }))
+}
+
+#[test]
+fn the_home_directory_never_becomes_a_board_by_default() {
+    // The failure seen on a real store: a session started in $HOME made it a board, and
+    // since a known path is matched at every level of the walk, every non-git directory
+    // beneath it then joined that one board.
+    let home = tempfile::tempdir().unwrap();
+    let s = store();
+
+    let r = s.resolve_project_from(home.path(), Some(home.path()));
+    let err = r.expect_err("$HOME must be refused");
+    assert!(matches!(err, Error::SharedDirectory { .. }), "got {err:?}");
+    assert!(s.all_projects().unwrap().is_empty(), "a refused resolve must not create a board");
+
+    // The way out the message offers has to be one that actually works -- see the marker test.
+    assert!(ai_kanban::render::error(&err).contains(".ai-kanban"));
+}
+
+#[test]
+fn directories_above_home_are_refused_too() {
+    let parent = tempfile::tempdir().unwrap();
+    let home = parent.path().join("alice");
+    fs::create_dir_all(&home).unwrap();
+    let s = store();
+
+    assert!(refused(s.resolve_project_from(parent.path(), Some(&home))));
+    assert!(refused(s.resolve_project_from(Path::new("/"), Some(&home))));
+    assert!(s.all_projects().unwrap().is_empty());
+}
+
+#[test]
+fn projects_under_home_each_keep_their_own_board() {
+    // The damage replayed. A session in $HOME comes first; two unrelated non-git projects
+    // beneath it follow. They must end up on two boards, not on one named after the user.
+    let home = tempfile::tempdir().unwrap();
+    let docs = home.path().join("Documents").join("wow-docs");
+    let app = home.path().join("Documents").join("md2pdf");
+    fs::create_dir_all(&docs).unwrap();
+    fs::create_dir_all(&app).unwrap();
+    let s = store();
+
+    assert!(refused(s.resolve_project_from(home.path(), Some(home.path()))));
+    let a = s.resolve_project_from(&docs, Some(home.path())).unwrap();
+    let b = s.resolve_project_from(&app, Some(home.path())).unwrap();
+
+    assert_eq!(a.how, Resolution::Directory);
+    assert_eq!(a.project.name, "wow-docs");
+    assert_eq!(b.project.name, "md2pdf");
+    assert_ne!(a.project.id, b.project.id);
+}
+
+#[test]
+fn a_sibling_that_only_shares_a_prefix_with_home_is_not_refused() {
+    // `/Users/alice-old` is not above `/Users/alice`. Paths compare by component, not by string.
+    let parent = tempfile::tempdir().unwrap();
+    let home = parent.path().join("alice");
+    let sibling = parent.path().join("alice-old");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&sibling).unwrap();
+    let s = store();
+
+    assert!(s.resolve_project_from(&sibling, Some(&home)).unwrap().created);
+}
+
+#[test]
+fn a_marker_in_home_still_makes_it_a_board() {
+    // The escape hatch the refusal names. Only the fallback is refused; an explicit marker
+    // says the directory was meant.
+    let home = tempfile::tempdir().unwrap();
+    fs::write(home.path().join(".ai-kanban"), "dotfiles\n").unwrap();
+    let s = store();
+
+    let r = s.resolve_project_from(home.path(), Some(home.path())).unwrap();
+    assert_eq!(r.how, Resolution::Marker);
+    assert_eq!(r.project.key, "dotfiles");
+}
+
+#[test]
+fn a_git_repo_in_home_still_makes_it_a_board() {
+    // A dotfiles checkout in $HOME is a real project with a real anchor.
+    let home = tempfile::tempdir().unwrap();
+    fake_repo(home.path(), Some("git@github.com:me/dotfiles.git"));
+    let s = store();
+
+    let r = s.resolve_project_from(home.path(), Some(home.path())).unwrap();
+    assert_eq!(r.how, Resolution::GitRemote);
+}
+
+#[test]
+fn a_board_that_already_claims_home_still_resolves() {
+    // Stores from before the refusal can already have one. Refusing it too would leave
+    // that board unreadable from the place it lives, which is where someone repairs it.
+    let home = tempfile::tempdir().unwrap();
+    let elsewhere = home.path().join("legacy");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let s = store();
+    let pid = s.resolve_project_from(&elsewhere, Some(home.path())).unwrap().project.id;
+    s.add_path_alias(pid, &fs::canonicalize(home.path()).unwrap()).unwrap();
+
+    let r = s.resolve_project_from(home.path(), Some(home.path())).unwrap();
+    assert_eq!(r.how, Resolution::KnownPath);
+    assert_eq!(r.project.id, pid);
+}
+
+#[test]
+fn the_temp_directory_itself_is_refused_but_directories_in_it_are_not() {
+    let s = store();
+    assert!(refused(s.resolve_project_from(&std::env::temp_dir(), None)));
+
+    // Every other test in this suite resolves a tempdir inside it.
+    let inside = tempfile::tempdir().unwrap();
+    assert!(s.resolve_project_from(inside.path(), None).is_ok());
+}
+
+#[test]
+fn a_directory_that_becomes_a_git_repo_later_keeps_its_board() {
+    // Pinned on purpose, because it looks like a bug worth fixing. A plain directory gets a
+    // board, then `git init` runs in it. The learned alias still answers first, so the
+    // directory stays on its board. Letting the new `.git` win would re-key the directory
+    // out from under every task already filed there.
+    let tmp = tempfile::tempdir().unwrap();
+    let s = store();
+
+    let before = s.resolve_project(tmp.path()).unwrap();
+    assert_eq!(before.how, Resolution::Directory);
+
+    fake_repo(tmp.path(), Some("git@github.com:me/later.git"));
+    let after = s.resolve_project(tmp.path()).unwrap();
+
+    assert_eq!(after.how, Resolution::KnownPath);
+    assert_eq!(after.project.id, before.project.id);
+}
+
+/// A linked worktree of `main` at `wt`, laid out the way `git worktree add` leaves it: a
+/// `.git` file pointing at `<main>/.git/worktrees/<name>`, whose `commondir` leads back.
+fn fake_worktree(main: &Path, wt: &Path, name: &str) {
+    let gitdir = main.join(".git").join("worktrees").join(name);
+    fs::create_dir_all(&gitdir).unwrap();
+    fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+    fs::create_dir_all(wt).unwrap();
+    fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+}
+
+#[test]
+fn a_worktree_of_a_repo_without_a_remote_joins_the_main_board() {
+    // With no remote, both sides used to key on their own directory -- `path:<main>` and
+    // `path:<worktree>` -- so every worktree started an empty board.
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("repo");
+    let wt = tmp.path().join("repo-feature");
+    fs::create_dir_all(&main).unwrap();
+    fake_repo(&main, None);
+    fake_worktree(&main, &wt, "repo-feature");
+    let s = store();
+
+    let m = s.resolve_project(&main).unwrap();
+    let w = s.resolve_project(&wt).unwrap();
+
+    assert_eq!(w.project.id, m.project.id, "worktree must not fork the board");
+    assert_eq!(w.how, Resolution::KnownPath);
+    assert!(!w.created);
+}
+
+#[test]
+fn a_worktree_used_before_its_main_checkout_still_lands_on_the_same_board() {
+    // Order must not matter. The worktree derives its identity from the main checkout's
+    // root, so a later session in the main checkout arrives at the same key.
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("repo");
+    let wt = tmp.path().join("elsewhere").join("feature");
+    fs::create_dir_all(&main).unwrap();
+    fake_repo(&main, None);
+    fake_worktree(&main, &wt, "feature");
+    let s = store();
+
+    let w = s.resolve_project(&wt).unwrap();
+    assert!(w.created);
+    assert_eq!(w.project.name, "repo", "named after the repo, not the worktree directory");
+    assert_eq!(w.project.key, format!("path:{}", fs::canonicalize(&main).unwrap().display()));
+
+    let m = s.resolve_project(&main).unwrap();
+    assert_eq!(m.project.id, w.project.id);
+    assert!(!m.created);
+}
+
+#[test]
+fn a_worktree_joins_a_board_keyed_before_the_repo_had_a_remote() {
+    // ai-kanban's own situation: its board was created as `path:` while the repo had no
+    // remote. Once `origin` exists, a worktree derives `git:<remote>` -- a key no board
+    // has -- unless it resolves as the main checkout, whose path the board already claims.
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("repo");
+    let wt = tmp.path().join("repo-wt");
+    fs::create_dir_all(&main).unwrap();
+    fake_repo(&main, None);
+    let s = store();
+    let before = s.resolve_project(&main).unwrap();
+    assert_eq!(before.how, Resolution::GitRoot);
+
+    fake_repo(&main, Some("git@github.com:me/repo.git"));
+    fake_worktree(&main, &wt, "repo-wt");
+    let w = s.resolve_project(&wt).unwrap();
+
+    assert_eq!(w.project.id, before.project.id, "a remote added later must not fork worktrees off");
+    assert_eq!(s.find_project(&wt).unwrap().unwrap().id, before.project.id, "the read-only lookup must agree");
+}
+
+#[test]
+fn a_submodule_keeps_its_own_board() {
+    // A submodule's `.git` is also a file, but its gitdir has no `commondir` (verified with
+    // a real `git submodule add`): it is a separate repository, not another checkout of the
+    // superproject.
+    let tmp = tempfile::tempdir().unwrap();
+    let sup = tmp.path().join("super");
+    fs::create_dir_all(&sup).unwrap();
+    fake_repo(&sup, Some("git@github.com:me/super.git"));
+    let modgit = sup.join(".git").join("modules").join("lib");
+    fs::create_dir_all(&modgit).unwrap();
+    fs::write(modgit.join("config"), "[remote \"origin\"]\n\turl = git@github.com:me/lib.git\n").unwrap();
+    let sub = sup.join("lib");
+    fs::create_dir_all(&sub).unwrap();
+    // Relative, as `git submodule add` writes it (checked against git 2.55).
+    fs::write(sub.join(".git"), "gitdir: ../.git/modules/lib\n").unwrap();
+    let s = store();
+
+    let parent = s.resolve_project(&sup).unwrap();
+    let child = s.resolve_project(&sub).unwrap();
+
+    assert_ne!(child.project.id, parent.project.id);
+    assert_eq!(child.project.key, "git:github.com/me/lib");
+}
+
+#[test]
+fn a_worktree_honours_a_marker_that_exists_only_in_the_main_checkout() {
+    // An untracked `.ai-kanban` is never copied into a worktree. The worktree has to continue
+    // its walk from the same place in the main checkout, not from its root, or the package
+    // lands on the repo-wide board in the worktree and on its own board in the main checkout.
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("monorepo");
+    let wt = tmp.path().join("monorepo-wt");
+    fs::create_dir_all(main.join("packages").join("api")).unwrap();
+    fake_repo(&main, Some("git@github.com:me/monorepo.git"));
+    fs::write(main.join("packages").join("api").join(".ai-kanban"), "monorepo/api\n").unwrap();
+    fake_worktree(&main, &wt, "monorepo-wt");
+    let deep = wt.join("packages").join("api").join("src");
+    fs::create_dir_all(&deep).unwrap();
+    let s = store();
+
+    let in_main = s.resolve_project(&main.join("packages").join("api")).unwrap();
+    let in_wt = s.resolve_project(&deep).unwrap();
+
+    assert_eq!(in_main.project.key, "monorepo/api");
+    assert_eq!(in_wt.project.id, in_main.project.id);
 }

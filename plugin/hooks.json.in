@@ -1,4 +1,5 @@
 {
+  "description": "ai-kanban board memory: a briefing at session start, and recorded notes for the files a tool touches.",
   "hooks": {
     "SessionStart": [
       {

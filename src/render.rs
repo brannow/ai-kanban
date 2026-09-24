@@ -565,6 +565,16 @@ pub fn error(e: &crate::core::Error) -> String {
             "Could not tell which project this is.\n\nPass project explicitly, or run the server \
              with a working directory inside the project.\n".to_string()
         }
+        E::SharedDirectory { path } => format!(
+            "No board started for {path}: it is the home directory, a directory above it, or \
+             the temp directory. A board here would absorb every project beneath it that is \
+             not a git repo.\n\n\
+             Do one of:\n  \
+             - start the session inside the project's directory\n  \
+             - pass `project` to use an existing board (board with project \"all\" lists them)\n  \
+             - if this directory really is the project, put a .ai-kanban file in it containing \
+             the board's name\n"
+        ),
         other => format!("{other}\n"),
     }
 }
