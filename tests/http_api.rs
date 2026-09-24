@@ -422,3 +422,76 @@ async fn paging_a_column_stays_inside_the_workstream_the_board_is_scoped_to() {
     assert_eq!(titles.len(), 6, "every scoped task, across both pages: {titles:?}");
     assert!(!titles.contains(&"elsewhere"), "another workstream leaked into a page: {titles:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Which pages may talk to this server (#453)
+
+fn with_headers(method: &str, path: &str, host: Option<&str>, origin: Option<&str>, body: Option<Value>) -> Request<Body> {
+    let mut b = Request::builder().method(method).uri(path);
+    if let Some(h) = host {
+        b = b.header("host", h);
+    }
+    if let Some(o) = origin {
+        b = b.header("origin", o);
+    }
+    match body {
+        Some(v) => b.header("content-type", "application/json").body(Body::from(v.to_string())).unwrap(),
+        None => b.body(Body::empty()).unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn a_rebinding_page_cannot_read_the_store() {
+    // DNS rebinding makes this server the attacker page's own origin, so the browser lets it
+    // read responses. The Host header still carries the attacker's name, and that is the one
+    // thing it cannot forge -- so reads are refused on it too, the live stream included.
+    let (api, pid) = api();
+    api.store().create_task(pid, TaskDraft::new("a secret worth stealing")).unwrap();
+    for host in ["evil.example:7373", "localhost.evil.example:7373", "127.0.0.1.nip.io:7373", "localhost:7373@evil"] {
+        for path in ["/api/projects".to_string(), format!("/api/projects/{pid}/board"), "/api/recall?q=secret".into(), "/".into()] {
+            let (status, body, _) = call(&api, with_headers("GET", &path, Some(host), None, None)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "GET {path} with Host {host}");
+            assert!(!body.to_string().contains("secret"), "{body}");
+        }
+    }
+    let (status, _, _) = call(&api, with_headers("GET", "/api/stream", Some("evil.example:7373"), None, None)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "the live stream is a read too");
+}
+
+#[tokio::test]
+async fn the_board_page_itself_is_let_through() {
+    let (api, pid) = api();
+    for host in ["127.0.0.1:7373", "localhost:7373", "LOCALHOST:7373", "[::1]:7373", "localhost", "127.0.0.1"] {
+        let (status, _, _) = call(&api, with_headers("GET", &format!("/api/projects/{pid}/board"), Some(host), None, None)).await;
+        assert_eq!(status, StatusCode::OK, "Host {host}");
+    }
+    let (status, body, _) = call(&api, with_headers(
+        "POST", &format!("/api/projects/{pid}/notes"), Some("127.0.0.1:7373"), Some("http://127.0.0.1:7373"),
+        Some(serde_json::json!({ "title": "from the page" })),
+    )).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn another_site_cannot_write() {
+    // A cross-site form or fetch carries its own Origin. Refused before the handler runs, so
+    // nothing is written whatever the route's own checks would have said.
+    let (api, pid) = api();
+    let t = api.store().create_task(pid, TaskDraft::new("leave me alone")).unwrap();
+    let host = Some("127.0.0.1:7373");
+    for origin in ["https://evil.example", "http://127.0.0.1:9999", "null"] {
+        let (status, _, _) = call(&api, with_headers(
+            "DELETE", &format!("/api/projects/{pid}/tasks/{}", t.id), host, Some(origin), None,
+        )).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "Origin {origin}");
+        let (status, _, _) = call(&api, with_headers(
+            "POST", &format!("/api/projects/{pid}/notes"), host, Some(origin),
+            Some(serde_json::json!({ "title": "planted" })),
+        )).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "Origin {origin}");
+    }
+    assert!(api.store().task(pid, t.id).is_ok(), "the task survived");
+    assert!(api.store().notes_for_task(pid, t.id).unwrap().is_empty());
+    let (_, notes, _) = call(&api, get(&format!("/api/projects/{pid}/notes"))).await;
+    assert!(!notes.to_string().contains("planted"), "{notes}");
+}
