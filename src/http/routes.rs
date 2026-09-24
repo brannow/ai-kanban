@@ -146,11 +146,12 @@ pub async fn meta(State(api): State<Api>) -> ApiResult<Json<serde_json::Value>> 
         "priorities": priorities.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
         "types": TaskType::ALL.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
         "actors": Actor::ALL.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-        // Where a Planio number links to, e.g. https://frs.plan.io. A setting rather than a
-        // constant: the tool knows Planio numbers, not whose Planio they are. Unset, the UI
-        // shows the number without a link.
-        "planio_url": std::env::var("AI_KANBAN_PLANIO_URL").ok()
-            .map(|u| u.trim().trim_end_matches('/').to_string())
+        // Where an external ref links to: a template whose `{ref}` the UI fills in, e.g.
+        // `https://frs.plan.io/issues/{ref}` or `https://acme.atlassian.net/browse/{ref}`.
+        // A setting rather than a constant: the store knows refs, not which tracker they
+        // are in. Unset, the UI shows the ref without a link.
+        "ref_url": std::env::var("AI_KANBAN_REF_URL").ok()
+            .map(|u| u.trim().to_string())
             .filter(|u| !u.is_empty()),
     })))
 }
@@ -177,7 +178,7 @@ pub struct BoardBody {
     pub name: Option<String>,
 }
 
-/// Creates a board by name -- a Planio project, a customer. A person's act, like adding
+/// Creates a board by name -- a tracker's project, a customer. A person's act, like adding
 /// repos: the agent reaches a board through its repos and never creates one by name, because
 /// a name an agent generates is how one project quietly becomes two.
 pub async fn create_board(
@@ -271,8 +272,8 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
         // actually have tags appear here.
         "task_tags": tags.iter().map(|(id, t)| (id.to_string(), json!(t)))
             .collect::<serde_json::Map<String, serde_json::Value>>(),
-        // Same shape and the same reason as `task_tags`: neither the repo links nor `planio`
-        // is in `TASK_COLS` (migration 007).
+        // Same shape and the same reason as `task_tags`: neither the repo links nor
+        // `external_ref` is in `TASK_COLS` (migrations 007, 012).
         "task_links": links_json(&links),
         // Every repo on the board, so the cards, the pickers and the repos menu all come
         // from this one read.
@@ -408,7 +409,7 @@ pub async fn task(
         // Same reason as `workstream` below: out of `TASK_COLS`, so no `Task` carries it.
         "tags": detail.tags,
         "repos": detail.repos,
-        "planio": detail.planio,
+        "external_ref": detail.external_ref,
         "blocker": detail.blocker,
         "blocking": detail.blocking,
         "notes": detail.notes,
@@ -441,9 +442,10 @@ pub struct TaskBody {
     /// Repo ids on this board. Replaces the whole set on update; `[]` clears; omitted leaves
     /// it alone.
     pub repos: Option<Vec<i64>>,
-    /// Planio issue number. `0` clears it on update -- the same sentinel the agent uses,
-    /// because a JSON `null` in an optional field reads as "absent" once deserialized.
-    pub planio: Option<i64>,
+    /// The issue in an outside tracker. `""` clears it on update -- the same spelling the
+    /// agent uses, because a JSON `null` in an optional field reads as "absent" once
+    /// deserialized.
+    pub external_ref: Option<String>,
     /// The *why*. Recorded as the event body -- the field that makes history worth reading.
     pub log: Option<String>,
     /// Which **existing** workstream this task joins, by name. Omitted means "inherit the
@@ -480,7 +482,7 @@ pub async fn create_task(
         blocked_by: b.blocked_by.flatten(),
         tags: b.tags.clone().unwrap_or_default(),
         repos: b.repos.clone().unwrap_or_default(),
-        planio: b.planio.filter(|n| *n != 0),
+        external_ref: b.external_ref.clone(),
     };
     let task = match b.workstream.as_ref().map(|w| w.trim()) {
         // Absent: inherit whatever the board is scoped to, exactly as `task_add` does.
@@ -522,7 +524,7 @@ pub async fn update_task(
         workstream,
         tags: b.tags.clone(),
         repos: b.repos.clone(),
-        planio: b.planio.map(|n| if n == 0 { None } else { Some(n) }),
+        external_ref: b.external_ref.clone().map(Some),
         log: b.log.clone(),
         actor: Actor::User,
         expected_version: Some(expected),
@@ -791,10 +793,10 @@ pub async fn all_tasks(
     })))
 }
 
-/// Task links keyed by task id, like `task_tags`. Only tasks with a repo or a Planio ref appear.
+/// Task links keyed by task id, like `task_tags`. Only tasks with a repo or an external ref appear.
 fn links_json(links: &[TaskLinks]) -> serde_json::Map<String, serde_json::Value> {
     links.iter()
-        .map(|l| (l.task_id.to_string(), json!({ "repos": l.repos, "planio": l.planio })))
+        .map(|l| (l.task_id.to_string(), json!({ "repos": l.repos, "external_ref": l.external_ref })))
         .collect()
 }
 

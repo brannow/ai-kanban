@@ -129,10 +129,26 @@ pub struct TaskExport {
     /// Repo names. `serde(default)` on both of these for the reason `tags` has it.
     #[serde(default)]
     pub repos: Vec<String>,
-    #[serde(default)]
-    pub planio: Option<i64>,
+    /// Also read under its old name: exports written before 012 carry `"planio": 48213`,
+    /// a number, which a plain alias would refuse to read into a string.
+    #[serde(default, alias = "planio", deserialize_with = "external_ref_compat")]
+    pub external_ref: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// `external_ref` as either a string or the number a pre-012 `planio` export wrote.
+fn external_ref_compat<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Number(i64),
+        Text(String),
+    }
+    Ok(Option::<Raw>::deserialize(d)?.map(|r| match r {
+        Raw::Number(n) => n.to_string(),
+        Raw::Text(s) => s,
+    }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,7 +323,7 @@ impl Store {
         // nobody can diff, which is half the reason the JSON format exists at all.
         let mut st = self.conn.prepare(
             "SELECT t.id, t.title, t.body, t.status, t.type, t.origin, t.priority, t.blocked_by,
-                    t.created_at, t.updated_at, w.name, t.tags, t.planio
+                    t.created_at, t.updated_at, w.name, t.tags, t.external_ref
                FROM tasks t LEFT JOIN workstreams w ON w.id = t.workstream_id
               WHERE t.project_id = ?1 ORDER BY t.id",
         )?;
@@ -327,7 +343,7 @@ impl Store {
                     workstream: r.get(10)?,
                     tags: crate::core::note::split_tags(&r.get::<_, String>(11)?),
                     repos: Vec::new(),
-                    planio: r.get(12)?,
+                    external_ref: r.get(12)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -521,10 +537,10 @@ impl Store {
             // while inventing a workstream would put the task in one that never existed.
             let ws = t.workstream.as_ref().and_then(|n| workstream_ids.get(n));
             self.conn.execute(
-                "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, workstream_id, tags, planio, created_at, updated_at)
+                "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, workstream_id, tags, external_ref, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?11, ?12, ?9, ?10)",
                 params![pid, t.title, t.body, t.status, t.r#type, t.origin, t.priority, ws, t.created_at, t.updated_at,
-                        crate::core::note::join_tags(&t.tags), t.planio],
+                        crate::core::note::join_tags(&t.tags), t.external_ref],
             )?;
             let tid = self.conn.last_insert_rowid();
             task_ids.insert(t.id, tid);

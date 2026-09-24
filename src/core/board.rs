@@ -143,7 +143,7 @@ impl Store {
                 sort_board(&mut snap.tasks);
                 // Both describe the listed rows, and the listed rows just changed. Left as
                 // computed, the task this response exists to confirm would be the one row
-                // missing its repos, its Planio ref and its blocker's status.
+                // missing its repos, its external ref and its blocker's status.
                 snap.links = self.links_for(project_id, &snap.tasks)?;
                 snap.blocker_status = self.blocker_status(project_id, &snap.tasks)?;
                 // The swap changed what is shown, so the "and N more" figures have to be

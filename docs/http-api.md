@@ -491,10 +491,10 @@ in, and the web UI's **repos** button is the only place they are registered.
 - **No `If-Match` on repo writes.** The guard is for a form held open while an agent writes the
   same row, and no agent writes repos.
 
-On tasks: `POST`/`PATCH /tasks` take `repos` (ids; `[]` clears) and `planio` (`0` clears — a
-JSON `null` in an optional field deserializes as "absent", so it cannot mean "clear"). `GET
-/tasks/{t}` returns `repos`, with paths, and `planio`. `GET /board` and `GET /tasks` return
-`task_links` keyed by task id like `task_tags` — `{"repos": ["eee-web"], "planio": 48213}` —
+On tasks: `POST`/`PATCH /tasks` take `repos` (ids; `[]` clears) and `external_ref` (`""` clears —
+a JSON `null` in an optional field deserializes as "absent", so it cannot mean "clear"). `GET
+/tasks/{t}` returns `repos`, with paths, and `external_ref`. `GET /board` and `GET /tasks` return
+`task_links` keyed by task id like `task_tags` — `{"repos": ["eee-web"], "external_ref": "48213"}` —
 and `/board` also returns `repos`, every repo with `open` and `total` ticket counts, so the
 cards, the pickers and the menu all come from one read.
 
@@ -536,9 +536,10 @@ is allowed until a board refuses it (migration 009 keeps a deny list), a refused
 `403` from `start`, and the panel does not offer its button. `GET /projects/{p}` and the task
 detail carry `profiles: [{name, allowed}]`.
 
-`/api/meta` carries `planio_url` from `AI_KANBAN_PLANIO_URL` (e.g. `https://frs.plan.io`), and
-the UI links each Planio number to `<planio_url>/issues/<n>`. A setting rather than a constant:
-the tool knows Planio numbers, not whose Planio they are. Unset, numbers show without a link. The launch is logged on the ticket.
+`/api/meta` carries `ref_url` from `AI_KANBAN_REF_URL`, a template such as
+`https://frs.plan.io/issues/{ref}`, and the UI links each ref by replacing `{ref}` (or appending
+it, when the template has none). A setting rather than a constant: the store knows refs, not
+which tracker they are in. Unset, refs show without a link. The launch is logged on the ticket.
 
 It is the one route that starts a process, so it is the one route locked to the board page:
 `Host` must be loopback and `Origin`, when sent, must be this server — a cross-site `POST` or a

@@ -2,7 +2,7 @@
 //!
 //! # Boards own repos, and a repo can serve several boards
 //!
-//! A board is a body of work -- a customer, a product, a Planio project -- and it usually
+//! A board is a body of work -- a customer, a product, a tracker's project -- and it usually
 //! spans several repositories. A repository can serve more than one of them, too: a shared
 //! library, a monorepo two projects deploy from. So repos are global and tied to boards
 //! through `board_repos`, many-to-many, and a ticket can name any repo its board has.
@@ -490,36 +490,42 @@ impl Store {
         })())
     }
 
-    /// A task's Planio ticket. A lookup of its own because `planio` is out of `TASK_COLS`.
-    pub fn task_planio(&self, project_id: i64, task_id: i64) -> Result<Option<i64>> {
+    /// A task's external ref. A lookup of its own because `external_ref` is out of `TASK_COLS`.
+    pub fn task_external_ref(&self, project_id: i64, task_id: i64) -> Result<Option<String>> {
         tolerant(self.conn.query_row(
-            "SELECT planio FROM tasks WHERE id = ?1 AND project_id = ?2",
+            "SELECT external_ref FROM tasks WHERE id = ?1 AND project_id = ?2",
             params![task_id, project_id],
-            |r| r.get::<_, Option<i64>>(0),
+            |r| r.get::<_, Option<String>>(0),
         ).optional().map(Option::flatten))
     }
 
-    /// Repos and Planio refs for a set of listed tasks on one board, in two queries however
+    /// Repos and external refs for a set of listed tasks on one board, in two queries however
     /// many rows.
     ///
     /// Only tasks that have either appear. Batched for the reason `tags_for` is: the board
     /// lists a few dozen rows, and a per-row lookup is the kind of thing that stops being free
     /// the moment someone raises the cap. Names no column 008 added, so an agent's board keeps
     /// its repos on a store the hook finds between the two migrations.
+    ///
+    /// The two lookups are tolerant separately. `external_ref` arrived in 012 and the repo
+    /// tables in 007, so a store between the two -- one the hook reads before the MCP server
+    /// has migrated it -- must lose only the refs, not the repos with them.
     pub fn links_for(&self, project_id: i64, tasks: &[Task]) -> Result<Vec<TaskLinks>> {
         if tasks.is_empty() {
             return Ok(vec![]);
         }
         let holes = tasks.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let ids: Vec<i64> = std::iter::once(project_id).chain(tasks.iter().map(|t| t.id)).collect();
-        type Found = (HashMap<i64, i64>, HashMap<i64, Vec<String>>);
-        let found = (|| -> rusqlite::Result<Found> {
+        let refs = tolerant((|| -> rusqlite::Result<HashMap<i64, String>> {
             let mut st = self.conn.prepare(&format!(
-                "SELECT id, planio FROM tasks WHERE project_id = ? AND id IN ({holes}) AND planio IS NOT NULL"
+                "SELECT id, external_ref FROM tasks WHERE project_id = ? AND id IN ({holes}) AND external_ref IS NOT NULL"
             ))?;
-            let planio = st
-                .query_map(rusqlite::params_from_iter(&ids), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
-                .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+            let rows = st
+                .query_map(rusqlite::params_from_iter(&ids), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .collect();
+            rows
+        })())?;
+        let mut repos = tolerant((|| -> rusqlite::Result<HashMap<i64, Vec<String>>> {
             let mut st = self.conn.prepare(&format!(
                 "SELECT tr.task_id, r.name FROM task_repos tr
                    JOIN repos r ON r.id = tr.repo_id
@@ -532,13 +538,12 @@ impl Store {
                 let (task, name) = row?;
                 repos.entry(task).or_default().push(name);
             }
-            Ok((planio, repos))
-        })();
-        let (planio, mut repos) = tolerant(found)?;
+            Ok(repos)
+        })())?;
         Ok(tasks.iter().filter_map(|t| {
             let r = repos.remove(&t.id).unwrap_or_default();
-            let p = planio.get(&t.id).copied();
-            (!r.is_empty() || p.is_some()).then(|| TaskLinks { task_id: t.id, repos: r, planio: p })
+            let e = refs.get(&t.id).cloned();
+            (!r.is_empty() || e.is_some()).then(|| TaskLinks { task_id: t.id, repos: r, external_ref: e })
         }).collect())
     }
 }

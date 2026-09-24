@@ -455,7 +455,7 @@ async fn repos_are_registered_linked_and_cleared_through_the_api() {
 
     let (status, body, _) = call(&api, json_req(
         "POST", &format!("/api/projects/{pid}/tasks"),
-        serde_json::json!({ "title": "invoice rounding", "repos": [rid], "planio": 48213 }), None,
+        serde_json::json!({ "title": "invoice rounding", "repos": [rid], "external_ref": "#48213" }), None,
     )).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let tid = body["task"]["id"].as_i64().unwrap();
@@ -464,7 +464,7 @@ async fn repos_are_registered_linked_and_cleared_through_the_api() {
     let (_, board, _) = call(&api, get(&format!("/api/projects/{pid}/board"))).await;
     let links = &board["task_links"][tid.to_string()];
     assert_eq!(links["repos"], serde_json::json!(["eee-web"]), "{board}");
-    assert_eq!(links["planio"], 48213);
+    assert_eq!(links["external_ref"], "48213", "stored in its one spelling");
     assert_eq!(board["repos"][0]["total"], 1);
 
     // `[]` and `0` clear -- `0` because a JSON null in an optional field reads as "absent".
@@ -473,12 +473,12 @@ async fn repos_are_registered_linked_and_cleared_through_the_api() {
     let version = etag.unwrap().trim_matches('"').to_string();
     let (status, body, _) = call(&api, json_req(
         "PATCH", &format!("/api/projects/{pid}/tasks/{tid}"),
-        serde_json::json!({ "repos": [], "planio": 0 }), Some(&version),
+        serde_json::json!({ "repos": [], "external_ref": "" }), Some(&version),
     )).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (_, detail, _) = call(&api, get(&format!("/api/projects/{pid}/tasks/{tid}"))).await;
     assert_eq!(detail["repos"], serde_json::json!([]));
-    assert!(detail["planio"].is_null());
+    assert!(detail["external_ref"].is_null());
 
     // A folder another board already resolves is a 409 naming the owner, so the UI can say
     // which board holds it and point at `merge`.

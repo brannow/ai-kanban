@@ -184,8 +184,8 @@ pub struct TaskAddParams {
     /// Repos this touches, by name as the board lists them, comma separated. On a board that
     /// tracks repos, a task without any shows "no repo set".
     pub repos: Option<String>,
-    /// The Planio ticket this tracks, e.g. 48213.
-    pub planio: Option<i64>,
+    /// The issue in an outside tracker this task mirrors, e.g. 48213 or PROJ-123.
+    pub external_ref: Option<String>,
     pub project: Option<String>,
 }
 
@@ -213,8 +213,9 @@ pub struct TaskUpdateParams {
     pub tags: Option<String>,
     /// Replaces the repos this touches, by name, comma separated. Pass "" to clear them.
     pub repos: Option<String>,
-    /// The Planio ticket this tracks. Pass 0 to clear it.
-    pub planio: Option<i64>,
+    /// The issue in an outside tracker this task mirrors, e.g. 48213 or PROJ-123. Pass ""
+    /// to clear it.
+    pub external_ref: Option<String>,
     /// Move it to another board, by name as `board(project: "all")` lists them. Its history
     /// and notes go with it; `log` says why.
     pub move_to: Option<String>,
@@ -404,9 +405,8 @@ impl AiKanban {
             blocked_by: p.blocked_by.filter(|b| *b > 0),
             tags: csv(&p.tags).unwrap_or_default(),
             repos,
-            // 0 means "none" here as it does on task_update; anything else, including a
-            // negative number, goes to core so the error can say what is valid.
-            planio: p.planio.filter(|n| *n != 0),
+            // Blank means none; core normalizes the rest, so the error can say what is valid.
+            external_ref: p.external_ref.clone(),
         };
         let task = store.create_task(resolved.project.id, draft).map_err(fail)?;
         let snap = store.board_after_mutation(resolved.project.id, task.id).map_err(fail)?;
@@ -449,8 +449,8 @@ impl AiKanban {
             tags: p.tags.as_deref().map(|t| csv(&Some(t.to_string())).unwrap_or_default()),
             // Same three-way reading again: absent leaves them, "" clears, names replace.
             repos: repo_ids(&store, resolved.project.id, &p.repos)?,
-            // 0 clears, as it does for `blocked_by`.
-            planio: p.planio.map(|n| if n == 0 { None } else { Some(n) }),
+            // Absent leaves it, "" clears -- core reads a blank ref as none.
+            external_ref: p.external_ref.clone().map(Some),
             // With a move, the reason goes on the move's event instead: one reason, one
             // entry, rather than the same sentence twice in the history.
             log: if target.is_some() { None } else { p.log.clone() },

@@ -277,7 +277,7 @@ pub struct RepoSummary {
     pub other_boards: Vec<String>,
 }
 
-/// What a listed task links to: the repos it touches and the Planio ticket it tracks.
+/// What a listed task links to: the repos it touches and the outside issue it tracks.
 ///
 /// Carried beside the rows rather than on `Task` for the reason tags are: neither is in
 /// `TASK_COLS` (migration 007), because widening that list would raise
@@ -286,7 +286,7 @@ pub struct RepoSummary {
 pub struct TaskLinks {
     pub task_id: i64,
     pub repos: Vec<String>,
-    pub planio: Option<i64>,
+    pub external_ref: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -378,7 +378,7 @@ pub struct BoardSnapshot {
     /// The annotation then reads as "do not pick this up" forever, and it is the cold-start
     /// view that says it, which is the reader least able to check.
     pub blocker_status: Vec<(i64, Status)>,
-    /// Repos and Planio ref for the listed tasks that have either. Must describe `tasks` as
+    /// Repos and external ref for the listed tasks that have either. Must describe `tasks` as
     /// finally listed -- `board_after_mutation` recomputes it after splicing a row in.
     pub links: Vec<TaskLinks>,
     /// How many repos the board owns. Zero means the board does not track repos at all, and
@@ -420,7 +420,7 @@ pub struct TaskDetail {
     /// With their paths: task_show is where an agent commits to the work, so it is where it
     /// learns which checkouts that work is in.
     pub repos: Vec<Repo>,
-    pub planio: Option<i64>,
+    pub external_ref: Option<String>,
     /// Whether the board tracks repos at all, so an empty `repos` can be told apart from a
     /// board where the question does not arise.
     pub board_has_repos: bool,

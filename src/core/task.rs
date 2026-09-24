@@ -27,8 +27,9 @@ pub struct TaskDraft {
     /// Repo ids on this board. Adapters resolve names to ids with `resolve_repos`; core
     /// checks each belongs to the board, so a raw id from elsewhere cannot slip through.
     pub repos: Vec<i64>,
-    /// The Planio ticket this task tracks.
-    pub planio: Option<i64>,
+    /// The issue in an outside tracker this task tracks -- `48213`, `PROJ-123`. Which
+    /// tracker is the person's setting, not the store's.
+    pub external_ref: Option<String>,
 }
 
 impl TaskDraft {
@@ -38,7 +39,7 @@ impl TaskDraft {
             body: String::new(),
             tags: vec![],
             repos: vec![],
-            planio: None,
+            external_ref: None,
             task_type: TaskType::default(),
             origin: Origin::default(),
             priority: Priority::default(),
@@ -70,8 +71,8 @@ pub struct TaskPatch {
     pub tags: Option<Vec<String>>,
     /// Replaces the whole set of repo ids, like `tags`. `Some(vec![])` clears them.
     pub repos: Option<Vec<i64>>,
-    /// Nested like `blocked_by`: `Some(None)` clears the Planio ref.
-    pub planio: Option<Option<i64>>,
+    /// Nested like `blocked_by`: `Some(None)` clears the external ref.
+    pub external_ref: Option<Option<String>>,
     /// The *why*. Recorded as the event body -- this is the field that makes the history
     /// worth reading six months later.
     pub log: Option<String>,
@@ -105,7 +106,7 @@ impl TaskPatch {
             && self.workstream.is_none()
             && self.tags.is_none()
             && self.repos.is_none()
-            && self.planio.is_none()
+            && self.external_ref.is_none()
             && self.log.is_none()
     }
 }
@@ -149,15 +150,15 @@ impl Store {
     /// filling in a form can see the field and choose, including choosing "none".
     pub fn create_task_in(&self, project_id: i64, draft: TaskDraft, workstream: Option<i64>) -> Result<Task> {
         self.check_repos(project_id, &draft.repos)?;
-        check_planio(draft.planio)?;
+        let external_ref = check_external_ref(draft.external_ref)?;
         let ts = now();
         self.conn.execute(
-            "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, blocked_by, workstream_id, tags, planio, created_at, updated_at)
+            "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, blocked_by, workstream_id, tags, external_ref, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?11, ?12, ?10, ?10)",
             params![
                 project_id, draft.title, draft.body, draft.status, draft.task_type,
                 draft.origin, draft.priority, draft.blocked_by, workstream, ts,
-                crate::core::note::join_tags(&draft.tags), draft.planio
+                crate::core::note::join_tags(&draft.tags), external_ref
             ],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -290,11 +291,13 @@ impl Store {
         if let Some(ids) = &patch.repos {
             self.check_repos(project_id, ids)?;
         }
-        // Read separately for the same reason as tags: `planio` and the repo links are out of
-        // `TASK_COLS` (migration 007), so `before` carries neither.
-        let before_planio = self.task_planio(project_id, id)?;
-        let planio = match patch.planio { Some(v) => v, None => before_planio };
-        check_planio(planio)?;
+        // Read separately for the same reason as tags: `external_ref` and the repo links are
+        // out of `TASK_COLS` (migrations 007, 012), so `before` carries neither.
+        let before_ref = self.task_external_ref(project_id, id)?;
+        let external_ref = match patch.external_ref.clone() {
+            Some(v) => check_external_ref(v)?,
+            None => before_ref.clone(),
+        };
         let before_repos: Vec<i64> = self.task_repos(project_id, id)?.into_iter().map(|r| r.id).collect();
 
         // A patch that changes nothing writes nothing -- no version bump, no "no change" line
@@ -314,7 +317,7 @@ impl Store {
         let unchanged = title == before.title && body == before.body && status == before.status
             && priority == before.priority && task_type == before.task_type
             && blocked_by == before.blocked_by && workstream == before_ws && tags == before_tags
-            && planio == before_planio && repos_same;
+            && external_ref == before_ref && repos_same;
         if unchanged && patch.log.as_deref().map(str::trim).unwrap_or("").is_empty() {
             return Ok(before);
         }
@@ -324,9 +327,9 @@ impl Store {
         // gets the plain update. Two statements would be two chances to fix a bug once.
         let changed = self.conn.execute(
             "UPDATE tasks SET title=?2, body=?3, status=?4, type=?5, priority=?6, blocked_by=?7, updated_at=?8,
-                    workstream_id=?10, tags=?11, planio=?12, version = version + 1
+                    workstream_id=?10, tags=?11, external_ref=?12, version = version + 1
               WHERE id=?1 AND (?9 IS NULL OR version = ?9)",
-            params![id, title, body, status, task_type, priority, blocked_by, ts, patch.expected_version, workstream, tags, planio],
+            params![id, title, body, status, task_type, priority, blocked_by, ts, patch.expected_version, workstream, tags, external_ref],
         )?;
         if changed == 0 {
             // The row exists -- `self.task()` above proved it is here and on this board --
@@ -369,10 +372,10 @@ impl Store {
                 lead.push(if names.is_empty() { "repos cleared".to_string() } else { format!("repos: {}", names.join(", ")) });
             }
         }
-        if planio != before_planio {
-            lead.push(match planio {
-                Some(n) => format!("planio #{n}"),
-                None => "planio ref cleared".to_string(),
+        if external_ref != before_ref {
+            lead.push(match &external_ref {
+                Some(r) => format!("ref {r}"),
+                None => "ref cleared".to_string(),
             });
         }
         let summary = patch.log.clone()
@@ -495,7 +498,7 @@ impl Store {
         Ok(TaskDetail {
             tags: self.task_tags(project_id, id)?,
             repos: self.task_repos(project_id, id)?,
-            planio: self.task_planio(project_id, id)?,
+            external_ref: self.task_external_ref(project_id, id)?,
             board_has_repos: self.repo_count(project_id)? > 0,
             blocking: self.tasks_blocked_by(project_id, id)?,
             events: self.task_events(id)?,
@@ -508,17 +511,29 @@ impl Store {
     }
 }
 
-/// A Planio issue number is positive. Checked in core so both adapters refuse the same
-/// values; each maps its own "clear it" spelling to `None` before this sees it.
-fn check_planio(planio: Option<i64>) -> Result<()> {
-    match planio {
-        Some(n) if n <= 0 => Err(Error::InvalidValue {
-            field: "planio",
-            value: n.to_string(),
-            valid: "a Planio issue number, e.g. 48213".into(),
-        }),
-        _ => Ok(()),
+/// The longest external ref accepted. Tracker keys are short (`PROJ-12345`); anything near
+/// this is a pasted sentence, and it would be printed on every board line it is on.
+const MAX_EXTERNAL_REF: usize = 64;
+
+/// One spelling per ticket, and the only one stored. Checked in core so both adapters store
+/// the same value: blank clears, a leading `#` is dropped so `#48213` and `48213` are one
+/// ticket, and whitespace or a URL is refused -- a URL is the one spelling a person pastes
+/// that the link template (`AI_KANBAN_REF_URL`) would then wrap in a second URL.
+pub fn check_external_ref(raw: Option<String>) -> Result<Option<String>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let r = raw.trim();
+    let r = r.strip_prefix('#').unwrap_or(r).trim();
+    if r.is_empty() {
+        return Ok(None);
     }
+    if r.len() > MAX_EXTERNAL_REF || r.contains(char::is_whitespace) || r.contains("://") {
+        return Err(Error::InvalidValue {
+            field: "external_ref",
+            value: raw.clone(),
+            valid: "an issue id from your tracker, e.g. 48213 or PROJ-123 -- not its URL".into(),
+        });
+    }
+    Ok(Some(r.to_string()))
 }
 
 /// Fallback event text when the caller gave no reason. States what changed, so the history
@@ -528,8 +543,8 @@ fn describe_change(
     before: &Task, title: &str, body: &str, status: Status, priority: Priority,
     blocked_by: Option<i64>, lead: Vec<String>,
 ) -> String {
-    // First: changes resolved to names by the caller -- a workstream move, new repos, a
-    // Planio ref. They are the most significant things that can happen to a task without its
+    // First: changes resolved to names by the caller -- a workstream move, new repos, an
+    // external ref. They are the most significant things that can happen to a task without its
     // status changing, and the ones a reader is least able to reconstruct later.
     let mut parts = lead;
     if status != before.status { parts.push(format!("{} -> {}", before.status, status)); }

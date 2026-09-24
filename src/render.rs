@@ -160,7 +160,7 @@ fn header(snap: &BoardSnapshot) -> String {
 /// the columns -- origin is always shown because it is the instrumentation for whether the
 /// agent files work unprompted, and that question needs to stay visible.
 ///
-/// Repos and the Planio ref follow the parenthetical, and unlike tags they are on the line:
+/// Repos and the external ref follow the parenthetical, and unlike tags they are on the line:
 /// which checkouts a ticket lives in and which ticket it is are what an agent needs to pick
 /// work up at all. Neither costs anything on a board that has none.
 ///
@@ -192,8 +192,8 @@ fn task_line(
         None if flag_missing && t.status.is_open() => tail.push_str(" no repo set"),
         None => {}
     }
-    if let Some(n) = links.and_then(|l| l.planio) {
-        tail.push_str(&format!(" planio {n}"));
+    if let Some(r) = links.and_then(|l| l.external_ref.as_deref()) {
+        tail.push_str(&format!(" ref {r}"));
     }
     format!("{mark} #{:<4} {:<40} ({}){tail}\n", t.id, truncate(&t.title, 40), meta.join(", "))
 }
@@ -241,7 +241,7 @@ pub fn task_detail(d: &TaskDetail) -> String {
     let t = &d.task;
     let mut out = format!("Board: {}\n\n#{} {}\n", d.project.name, t.id, t.title);
     let mut meta = vec![t.status.to_string(), t.task_type.to_string(), format!("{} priority", t.priority), t.origin.to_string()];
-    if let Some(n) = d.planio { meta.push(format!("planio #{n}")); }
+    if let Some(r) = &d.external_ref { meta.push(format!("tracks issue {r}")); }
     meta.push(format!("filed {}", since(d.now, t.created_at)));
     out.push_str(&format!("  {}\n", meta.join(", ")));
 
@@ -306,8 +306,10 @@ pub fn task_detail(d: &TaskDetail) -> String {
 pub fn start_prompt(d: &TaskDetail) -> String {
     let t = &d.task;
     let mut out = format!("Work on ticket #{} from the ai-kanban board \"{}\": {}\n", t.id, d.project.name, t.title);
-    if let Some(n) = d.planio {
-        out.push_str(&format!("\nIt tracks Planio issue #{n}; read it with the Planio tools for the full requirements.\n"));
+    // Which tracker the ref lives in is the person's setup, not the store's, so the prompt
+    // names the ref and leaves finding it to whatever tools the session has.
+    if let Some(r) = &d.external_ref {
+        out.push_str(&format!("\nIt tracks issue {r} in an outside tracker; if you have tools for it, read it there for the full requirements.\n"));
     }
     if !t.body.is_empty() {
         out.push_str(&format!("\n{}\n", t.body));

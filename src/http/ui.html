@@ -123,7 +123,7 @@
 .wsfield { margin-top:10px; }
   .repo { color: var(--chore); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; }
   .norepo { color: var(--high); }
-  .planio { color: var(--accent); }
+  .xref { color: var(--accent); }
   .pick { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; font-size: 12px; }
   .pick input, dialog .pick input { width: auto; margin: 0; }
   .reporow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 7px 0; border-bottom: 1px solid var(--line); }
@@ -145,7 +145,7 @@
 <header>
   <h1>ai-kanban</h1>
   <select id="project"></select>
-  <button id="newboard" title="a board for a project, e.g. a Planio project">+ board</button>
+  <button id="newboard" title="a board for a project, e.g. a tracker project or a customer">+ board</button>
   <button id="repobtn" title="the local checkouts this board's tickets live in">repos</button>
   <button id="todobtn" title="your own list, the same from every board — no agent can see or change it">to-dos</button>
   <label class="ws">working in <select id="workstream"></select></label>
@@ -172,7 +172,7 @@
     </div>
     <label class="ws wsfield" id="newboardfield" hidden>on board <select name="board"></select></label>
     <label class="ws wsfield" id="newwsfield">joins workstream <select name="workstream"></select></label>
-    <input name="planio" placeholder="planio ticket # (optional)" style="margin-top:10px">
+    <input name="xref" placeholder="tracker issue, e.g. 48213 or PROJ-123 (optional)" style="margin-top:10px">
     <div class="dim2" style="font-size:11px">repos this touches</div>
     <div id="newrepos" class="row" style="margin-top:4px"></div>
     <div class="row" style="margin-top:10px; justify-content:flex-end">
@@ -342,11 +342,11 @@ let TAGS = {};
 function mergeTags(map) { Object.assign(TAGS, map || {}); }
 function tagsOf(id) { return TAGS[String(id)] || []; }
 
-// Repos and the Planio ref ride beside the rows for the reason tags do -- neither is in
+// Repos and the external ref ride beside the rows for the reason tags do -- neither is in
 // TASK_COLS server-side -- and are merged rather than replaced for the same reason too.
 let LINKS = {};
 function mergeLinks(map) { Object.assign(LINKS, map || {}); }
-function linksOf(id) { return LINKS[String(id)] || { repos: [], planio: null }; }
+function linksOf(id) { return LINKS[String(id)] || { repos: [], external_ref: null }; }
 // Whether the repos menu is what the side panel shows, so a live tick can redraw it.
 let REPOS_OPEN = false;
 
@@ -369,25 +369,23 @@ function repoChips(t) {
   if (!l.repos.length && tracksRepos(t) && META.open_statuses.includes(t.status)) {
     out += '<span class="norepo">no repo set</span>';
   }
-  if (l.planio) out += `<span class="planio">planio ${l.planio}${planioLink(l.planio)}</span>`;
+  if (l.external_ref) out += `<span class="xref">ref ${esc(l.external_ref)}${refLink(l.external_ref)}</span>`;
   return out;
 }
 
-// A ↗ to the issue in Planio, when the server knows whose Planio it is. stopPropagation:
-// it sits on a card, and a click on the card opens the ticket.
-function planioUrl(n) { return META.planio_url && n ? `${META.planio_url}/issues/${n}` : null; }
-function planioLink(n) {
-  const url = planioUrl(n);
-  return url ? ` <a class="planio" href="${esc(url)}" target="_blank" rel="noopener" title="open #${n} in Planio" onclick="event.stopPropagation()">↗</a>` : '';
+// A ↗ to the issue in its tracker, when the server was given a link template (`{ref}` is
+// replaced; without one the ref is appended). stopPropagation: it sits on a card, and a
+// click on the card opens the ticket.
+function refUrl(raw) {
+  const r = String(raw || '').trim().replace(/^#/, '').trim();
+  const tpl = META.ref_url;
+  if (!tpl || !r) return null;
+  const enc = encodeURIComponent(r);
+  return tpl.includes('{ref}') ? tpl.split('{ref}').join(enc) : tpl + enc;
 }
-
-// Accepts what a person pastes: 48213, #48213, or an issue URL ending in the number.
-// Returns 0 for "none" -- the API's clear sentinel -- and null for something unreadable.
-function parsePlanio(raw) {
-  const s = String(raw || '').trim();
-  if (!s) return 0;
-  const m = s.match(/(\d+)\/?$/);
-  return m ? Number(m[1]) : null;
+function refLink(r) {
+  const url = refUrl(r);
+  return url ? ` <a class="xref" href="${esc(url)}" target="_blank" rel="noopener" title="open ${esc(r)} in its tracker" onclick="event.stopPropagation()">↗</a>` : '';
 }
 
 // Checkboxes rather than a free-text field: a ticket can only name repos this board owns,
@@ -512,7 +510,7 @@ $('#workstream').onchange = e => setWorkstream(e.target.value);
 // compared on every input: equal means there is nothing to save and nothing to lose.
 function taskFormState() {
   return JSON.stringify([$('#st').value, $('#pr').value, $('#ws').value, $('#tags').value.trim(),
-    $('#planio').value.trim(), pickedRepos($('#repopick')), $('#log').value.trim()]);
+    $('#xref').value.trim(), pickedRepos($('#repopick')), $('#log').value.trim()]);
 }
 
 function panelDirty() {
@@ -592,8 +590,8 @@ async function openTask(id, pid) {
         <input id="tags" class="grow" placeholder="tags, comma separated (in review, waiting-on-vendor)">
       </div>
       <div class="row" style="margin-top:7px">
-        <input id="planio" size="16" placeholder="planio ticket #">
-        <a id="planiolink" class="planio" target="_blank" rel="noopener" title="open in Planio" hidden>↗</a>
+        <input id="xref" size="16" placeholder="tracker issue">
+        <a id="xreflink" class="xref" target="_blank" rel="noopener" title="open in its tracker" hidden>↗</a>
         <span id="repopick" class="row"></span>
       </div>
       <div class="row" style="margin-top:7px">
@@ -651,7 +649,7 @@ async function openTask(id, pid) {
   $('#ws').innerHTML = workstreamOptions('no workstream',
     body.workstream ? body.workstream.name : '');
   $('#tags').value = (body.tags || []).join(', ');
-  $('#planio').value = body.planio || '';
+  $('#xref').value = body.external_ref || '';
   $('#repopick').innerHTML = repoPicker((body.repos || []).map(r => r.id), boardRepos);
   // Workstreams are slices of ONE board; All Projects has none to offer.
   $('#ws').hidden = isAll();
@@ -677,13 +675,13 @@ async function openTask(id, pid) {
     : !startable ? 'only backlog tickets can be started'
     : !(body.repos || []).length ? 'needs a repo first' : '';
   // The link follows the field as it is typed, so it always opens the number shown.
-  const syncPlanioLink = () => {
-    const url = planioUrl(parsePlanio($('#planio').value));
-    $('#planiolink').hidden = !url;
-    if (url) $('#planiolink').href = url;
+  const syncRefLink = () => {
+    const url = refUrl($('#xref').value);
+    $('#xreflink').hidden = !url;
+    if (url) $('#xreflink').href = url;
   };
-  $('#planio').addEventListener('input', syncPlanioLink);
-  syncPlanioLink();
+  $('#xref').addEventListener('input', syncRefLink);
+  syncRefLink();
   $('#forget').onclick = () => forgetTask(id, t.title);
   $('#panel').querySelectorAll('.card').forEach(c =>
     c.onclick = () => confirmLeave() && openTask(Number(c.dataset.id)));
@@ -697,8 +695,6 @@ async function openTask(id, pid) {
 }
 
 async function saveTask(id) {
-  const planio = parsePlanio($('#planio').value);
-  if (planio === null) { fail('planio: expected a ticket number, e.g. 48213'); return; }
   const pid = OPEN_TASK.pid;
   try {
     await api(`/api/projects/${pid}/tasks/${id}`, {
@@ -717,9 +713,10 @@ async function saveTask(id) {
         // and leaving it alone are both explicit rather than one being an omission.
         tags: $('#tags').value.split(',').map(t => t.trim()).filter(Boolean),
         // Always sent, like tags: the controls show the current values, so clearing and
-        // leaving alone are both explicit. 0 is the API's "no Planio ref".
+        // leaving alone are both explicit. "" is the API's "no external ref"; the server
+        // normalizes the rest and says what it refused.
         repos: pickedRepos($('#repopick')),
-        planio,
+        external_ref: $('#xref').value.trim(),
         log: $('#log').value || null,
       }),
     });
@@ -1206,8 +1203,6 @@ $('#newdlg').addEventListener('close', async () => {
   if (d.returnValue !== 'ok') return;
   const f = d.querySelector('form');
   if (!f.title.value.trim()) return;
-  const planio = parsePlanio(f.planio.value);
-  if (planio === null) { fail('planio: expected a ticket number, e.g. 48213'); return; }
   const pid = isAll() ? Number(f.board.value) : PROJECT;
   try {
     await api(`/api/projects/${pid}/tasks`, {
@@ -1221,7 +1216,7 @@ $('#newdlg').addEventListener('close', async () => {
         // there is no field and the board's current workstream is inherited.
         workstream: isAll() ? undefined : f.workstream.value,
         repos: pickedRepos($('#newrepos')),
-        planio,
+        external_ref: f.xref.value.trim(),
       }),
     });
     await refreshProjects();
@@ -1231,10 +1226,10 @@ $('#newdlg').addEventListener('close', async () => {
 
 // ---- boards ----------------------------------------------------------------
 
-// A board for a project that is not one folder -- a Planio project, a customer. The repos
+// A board for a project that is not one folder -- a tracker's project, a customer. The repos
 // added to it in the repos menu are how agents reach it.
 $('#newboard').onclick = async () => {
-  const name = prompt('New board name (for example the Planio project)');
+  const name = prompt('New board name (for example the project or customer)');
   if (!name || !name.trim()) return;
   try {
     const { body } = await api('/api/projects', {

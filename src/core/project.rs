@@ -167,7 +167,7 @@ impl Store {
         }
     }
 
-    /// A board a person creates by name -- a Planio project, a customer -- rather than one
+    /// A board a person creates by name -- a tracker's project, a customer -- rather than one
     /// derived from a directory.
     ///
     /// It has no directory of its own. Agents reach it through the repos whose home it is:

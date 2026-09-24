@@ -1,4 +1,4 @@
-//! Repos per ticket, and the Planio ref.
+//! Repos per ticket, and the external ref.
 //!
 //! Note #17's lesson again (see `tests/tags.rs`): a new field on a task has several homes,
 //! and most of them fail SILENTLY with a green suite, because every existing test predates
@@ -14,7 +14,7 @@ use ai_kanban::core::{Error, Store};
 use ai_kanban::render;
 use std::path::PathBuf;
 
-/// A board at `<root>/eee` and two sibling checkouts, `eee-api` and `eee-web`, as a Planio
+/// A board at `<root>/eee` and two sibling checkouts, `eee-api` and `eee-web`, as a tracker's
 /// project with two repositories would look on disk.
 struct Fixture {
     s: Store,
@@ -124,7 +124,7 @@ fn a_ticket_touches_many_repos_and_a_repo_carries_many_tickets() {
 }
 
 #[test]
-fn repos_and_planio_survive_patches_about_only_them_and_patches_about_something_else() {
+fn repos_and_external_ref_survive_patches_about_only_them_and_patches_about_something_else() {
     // `TaskPatch::is_empty` lists every field by hand and `update_task` returns early on it.
     // A field missing there makes a patch changing only that field a silent no-op -- it has
     // shipped broken that way once already (`workstream`).
@@ -134,26 +134,33 @@ fn repos_and_planio_survive_patches_about_only_them_and_patches_about_something_
 
     f.s.update_task(f.pid, t.id, TaskPatch { repos: Some(vec![api.id]), ..Default::default() }).unwrap();
     assert_eq!(names(&f.s.task_repos(f.pid, t.id).unwrap()), ["eee-api"]);
-    f.s.update_task(f.pid, t.id, TaskPatch { planio: Some(Some(48213)), ..Default::default() }).unwrap();
-    assert_eq!(f.s.task_planio(f.pid, t.id).unwrap(), Some(48213));
+    f.s.update_task(f.pid, t.id, TaskPatch { external_ref: Some(Some("48213".into())), ..Default::default() }).unwrap();
+    assert_eq!(f.s.task_external_ref(f.pid, t.id).unwrap().as_deref(), Some("48213"));
 
     // The update rewrites every column, so anything read back wrong would be wiped by an
     // unrelated status change.
     f.s.update_task(f.pid, t.id, TaskPatch { status: Some(Status::Doing), ..Default::default() }).unwrap();
     assert_eq!(names(&f.s.task_repos(f.pid, t.id).unwrap()), ["eee-api"]);
-    assert_eq!(f.s.task_planio(f.pid, t.id).unwrap(), Some(48213));
+    assert_eq!(f.s.task_external_ref(f.pid, t.id).unwrap().as_deref(), Some("48213"));
 
     // With no `log`, the history names what changed, by name.
     let history: Vec<String> = f.s.task_events(t.id).unwrap().into_iter().map(|e| e.body).collect();
     assert!(history.iter().any(|b| b.contains("repos: eee-api")), "{history:?}");
-    assert!(history.iter().any(|b| b.contains("planio #48213")), "{history:?}");
+    assert!(history.iter().any(|b| b.contains("ref 48213")), "{history:?}");
 
-    f.s.update_task(f.pid, t.id, TaskPatch { repos: Some(vec![]), planio: Some(None), ..Default::default() }).unwrap();
+    f.s.update_task(f.pid, t.id, TaskPatch { repos: Some(vec![]), external_ref: Some(None), ..Default::default() }).unwrap();
     assert!(f.s.task_repos(f.pid, t.id).unwrap().is_empty());
-    assert_eq!(f.s.task_planio(f.pid, t.id).unwrap(), None);
+    assert_eq!(f.s.task_external_ref(f.pid, t.id).unwrap(), None);
 
-    assert!(f.s.update_task(f.pid, t.id, TaskPatch { planio: Some(Some(-4)), ..Default::default() }).is_err(),
-        "a Planio number is positive");
+    for bad in ["https://frs.plan.io/issues/48213", "48 213"] {
+        assert!(f.s.update_task(f.pid, t.id, TaskPatch { external_ref: Some(Some(bad.into())), ..Default::default() }).is_err(),
+            "{bad} is not a ref");
+    }
+    // One spelling per ticket: `#48213` and ` 48213 ` are stored as `48213`, and blank clears.
+    f.s.update_task(f.pid, t.id, TaskPatch { external_ref: Some(Some(" #PROJ-7 ".into())), ..Default::default() }).unwrap();
+    assert_eq!(f.s.task_external_ref(f.pid, t.id).unwrap().as_deref(), Some("PROJ-7"));
+    f.s.update_task(f.pid, t.id, TaskPatch { external_ref: Some(Some("  ".into())), ..Default::default() }).unwrap();
+    assert_eq!(f.s.task_external_ref(f.pid, t.id).unwrap(), None);
 }
 
 #[test]
@@ -187,17 +194,17 @@ fn an_unknown_repo_lists_the_ones_that_exist_or_says_where_they_come_from() {
 }
 
 #[test]
-fn the_board_line_names_repos_and_planio_and_flags_open_tickets_with_none() {
+fn the_board_line_names_repos_and_the_ref_and_flags_open_tickets_with_none() {
     let f = fixture();
     let api = f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
-    let linked = f.s.create_task(f.pid, TaskDraft { repos: vec![api.id], planio: Some(48213), ..TaskDraft::new("invoice rounding") }).unwrap();
+    let linked = f.s.create_task(f.pid, TaskDraft { repos: vec![api.id], external_ref: Some("48213".into()), ..TaskDraft::new("invoice rounding") }).unwrap();
     let bare = f.s.create_task(f.pid, TaskDraft::new("contact form spam")).unwrap();
     let finished = f.s.create_task(f.pid, TaskDraft { status: Status::Doing, ..TaskDraft::new("old work") }).unwrap();
     f.s.update_task(f.pid, finished.id, TaskPatch { status: Some(Status::Done), ..Default::default() }).unwrap();
 
     let text = render::board(&f.s.board(f.pid, &BoardQuery::board()).unwrap());
     let l = line_for(&text, linked.id);
-    assert!(l.contains("[eee-api]") && l.contains("planio 48213"), "{l}");
+    assert!(l.contains("[eee-api]") && l.contains("ref 48213"), "{l}");
     assert!(line_for(&text, bare.id).contains("no repo set"), "{text}");
 
     // Finished work is not asked for repos -- nobody is about to start it.
@@ -223,10 +230,10 @@ fn task_show_gives_the_paths_or_says_to_ask() {
     // work is -- the name alone does not say which checkout to open.
     let f = fixture();
     let api = f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
-    let t = f.s.create_task(f.pid, TaskDraft { repos: vec![api.id], planio: Some(48213), ..TaskDraft::new("invoice rounding") }).unwrap();
+    let t = f.s.create_task(f.pid, TaskDraft { repos: vec![api.id], external_ref: Some("48213".into()), ..TaskDraft::new("invoice rounding") }).unwrap();
     let shown = render::task_detail(&f.s.task_detail(f.pid, t.id).unwrap());
     assert!(shown.contains(&canon(&f.api)), "{shown}");
-    assert!(shown.contains("planio #48213"), "{shown}");
+    assert!(shown.contains("tracks issue 48213"), "{shown}");
 
     let bare = f.s.create_task(f.pid, TaskDraft::new("contact form spam")).unwrap();
     let shown = render::task_detail(&f.s.task_detail(f.pid, bare.id).unwrap());
@@ -240,11 +247,11 @@ fn a_session_started_from_the_board_is_told_the_ticket_and_where_to_find_it() {
     let f = fixture();
     let api = f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
     let t = f.s.create_task(f.pid, TaskDraft {
-        repos: vec![api.id], planio: Some(1234), body: "Autoplay stutters on Safari.".into(),
+        repos: vec![api.id], external_ref: Some("1234".into()), body: "Autoplay stutters on Safari.".into(),
         ..TaskDraft::new("Rework header slider")
     }).unwrap();
     let prompt = render::start_prompt(&f.s.task_detail(f.pid, t.id).unwrap());
-    for want in ["Rework header slider", "Planio issue #1234", "Autoplay stutters", &canon(&f.api), "project \"eee\""] {
+    for want in ["Rework header slider", "issue 1234", "Autoplay stutters", &canon(&f.api), "project \"eee\""] {
         assert!(prompt.contains(want), "missing {want:?} in:\n{prompt}");
     }
 }
@@ -257,36 +264,36 @@ fn a_write_response_shows_the_repos_of_the_task_it_confirms() {
     let f = fixture();
     let api = f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
     f.s.create_task(f.pid, TaskDraft { status: Status::Doing, ..TaskDraft::new("in flight") }).unwrap();
-    let t = f.s.create_task(f.pid, TaskDraft { repos: vec![api.id], planio: Some(7), ..TaskDraft::new("side quest") }).unwrap();
+    let t = f.s.create_task(f.pid, TaskDraft { repos: vec![api.id], external_ref: Some("7".into()), ..TaskDraft::new("side quest") }).unwrap();
 
     let text = render::board(&f.s.board_after_mutation(f.pid, t.id).unwrap());
     let l = line_for(&text, t.id);
-    assert!(l.contains("[eee-api]") && l.contains("planio 7"), "{text}");
+    assert!(l.contains("[eee-api]") && l.contains("ref 7"), "{text}");
 }
 
 #[test]
-fn a_planio_number_is_findable_by_recall() {
+fn an_external_ref_is_findable_by_recall() {
     // tasks_fts was rebuilt to index it. An empty or stale FTS index returns no rows rather
     // than an error, so only a search proves the rebuild and the triggers are right.
     let f = fixture();
-    let t = f.s.create_task(f.pid, TaskDraft { planio: Some(48213), ..TaskDraft::new("invoice rounding") }).unwrap();
+    let t = f.s.create_task(f.pid, TaskDraft { external_ref: Some("48213".into()), ..TaskDraft::new("invoice rounding") }).unwrap();
     let hits = |s: &Store, q: &str| s.recall(&RecallQuery { text: q, project_id: Some(f.pid), limit: DEFAULT_LIMIT }).unwrap().hits;
 
     let h = hits(&f.s, "48213");
     assert_eq!(h.len(), 1, "{h:?}");
     assert_eq!(h[0].id, t.id);
 
-    f.s.update_task(f.pid, t.id, TaskPatch { planio: Some(None), ..Default::default() }).unwrap();
+    f.s.update_task(f.pid, t.id, TaskPatch { external_ref: Some(None), ..Default::default() }).unwrap();
     assert!(hits(&f.s, "48213").is_empty(), "the index must forget a cleared ref");
     assert_eq!(hits(&f.s, "rounding").len(), 1, "the rebuild kept the columns that already worked");
 }
 
 #[test]
-fn repos_planio_and_links_survive_export_and_import() {
+fn repos_refs_and_links_survive_export_and_import() {
     let f = fixture();
     let api = f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
     f.s.add_repo(f.pid, &f.web, None, Actor::User).unwrap();
-    f.s.create_task(f.pid, TaskDraft { repos: vec![api.id], planio: Some(48213), ..TaskDraft::new("invoice rounding") }).unwrap();
+    f.s.create_task(f.pid, TaskDraft { repos: vec![api.id], external_ref: Some("48213".into()), ..TaskDraft::new("invoice rounding") }).unwrap();
     let dump = f.s.export(&[]).unwrap();
 
     let target = Store::open_in_memory().unwrap();
@@ -296,7 +303,7 @@ fn repos_planio_and_links_survive_export_and_import() {
         "a repo no ticket names yet is still registered");
     let task = &target.board(tpid, &BoardQuery::board()).unwrap().tasks[0];
     assert_eq!(names(&target.task_repos(tpid, task.id).unwrap()), ["eee-api"]);
-    assert_eq!(target.task_planio(tpid, task.id).unwrap(), Some(48213));
+    assert_eq!(target.task_external_ref(tpid, task.id).unwrap().as_deref(), Some("48213"));
 }
 
 #[test]
@@ -373,19 +380,19 @@ fn removing_a_repo_unlinks_it_but_the_folder_stays_on_the_board() {
 #[test]
 fn a_store_from_before_repos_still_renders_its_board_and_its_hook() {
     // The SessionStart hook opens the store READ-ONLY and never migrates it. Against a store
-    // older than 007 the repo tables and `tasks.planio` do not exist; every hook path is
+    // older than 007 the repo tables and `tasks.external_ref` do not exist; every hook path is
     // `.ok()?`, so a query naming them would not error anywhere visible -- it would silently
     // cost the agent its cold-start board. Dropping them reproduces that store.
     let f = fixture();
     f.s.create_task(f.pid, TaskDraft::new("work from before repos")).unwrap();
     f.s.conn.execute_batch(
-        // The FTS table and its triggers name `planio`, so they go before the column can.
+        // The FTS table and its triggers name `external_ref`, so they go before the column can.
         "DROP TRIGGER tasks_ai; DROP TRIGGER tasks_ad; DROP TRIGGER tasks_au;
          DROP TABLE tasks_fts;
          DROP TABLE board_repos;
          DROP TABLE task_repos;
          DROP TABLE repos;
-         ALTER TABLE tasks DROP COLUMN planio;",
+         ALTER TABLE tasks DROP COLUMN external_ref;",
     ).unwrap();
 
     assert_eq!(f.s.repo_count(f.pid).unwrap(), 0);
@@ -409,6 +416,44 @@ fn a_store_between_the_two_repo_migrations_still_renders_its_board_and_its_hook(
     let text = render::board(&f.s.board(f.pid, &BoardQuery::board()).unwrap());
     assert!(text.contains("invoice rounding") && !text.contains("no repo set"), "{text}");
     assert!(ai_kanban::hook::context_for(&f.s, &f.board_dir).is_some());
+}
+
+#[test]
+fn a_store_from_before_the_external_ref_keeps_its_repos_on_the_board_line() {
+    // The hook reads a store read-only, so it meets stores the MCP server has not migrated
+    // to 012 yet. The ref lookup fails there; the repos, read by a separate query, must not
+    // go down with it.
+    let f = fixture();
+    let api = f.s.add_repo(f.pid, &f.api, None, Actor::User).unwrap();
+    f.s.create_task(f.pid, TaskDraft { repos: vec![api.id], external_ref: Some("48213".into()), ..TaskDraft::new("invoice rounding") }).unwrap();
+    f.s.conn.execute_batch(
+        "DROP TRIGGER tasks_ai; DROP TRIGGER tasks_ad; DROP TRIGGER tasks_au;
+         DROP TABLE tasks_fts;
+         ALTER TABLE tasks DROP COLUMN external_ref;",
+    ).unwrap();
+
+    let text = render::board(&f.s.board(f.pid, &BoardQuery::board()).unwrap());
+    assert!(text.contains("[eee-api]") && !text.contains("ref 48213"), "{text}");
+    let hook = ai_kanban::hook::context_for(&f.s, &f.board_dir).expect("the hook must still produce output");
+    assert!(hook.contains("[eee-api]"), "{hook}");
+}
+
+#[test]
+fn an_export_from_before_the_external_ref_still_imports_its_planio_number() {
+    // Exports are meant to outlive the binary that wrote them. One written before 012 has
+    // `"planio": 48213` -- a number, under the old name.
+    let f = fixture();
+    f.s.create_task(f.pid, TaskDraft { external_ref: Some("48213".into()), ..TaskDraft::new("invoice rounding") }).unwrap();
+    let mut json = serde_json::to_value(f.s.export(&[]).unwrap()).unwrap();
+    let task = json["projects"][0]["tasks"][0].as_object_mut().unwrap();
+    task.remove("external_ref").unwrap();
+    task.insert("planio".into(), serde_json::json!(48213));
+
+    let target = Store::open_in_memory().unwrap();
+    target.import(&serde_json::from_value(json).unwrap()).unwrap();
+    let tpid = target.all_projects().unwrap()[0].id;
+    let t = &target.board(tpid, &BoardQuery::board()).unwrap().tasks[0];
+    assert_eq!(target.task_external_ref(tpid, t.id).unwrap().as_deref(), Some("48213"));
 }
 
 fn board(f: &Fixture, name: &str) -> i64 {
@@ -504,7 +549,7 @@ fn moving_a_ticket_keeps_its_history_and_says_what_it_left_behind() {
 
     let blocker = f.s.create_task(f.pid, TaskDraft::new("pick a slider library")).unwrap();
     let t = f.s.create_task(f.pid, TaskDraft {
-        repos: vec![shared.id, local.id], blocked_by: Some(blocker.id), planio: Some(1234),
+        repos: vec![shared.id, local.id], blocked_by: Some(blocker.id), external_ref: Some("1234".into()),
         ..TaskDraft::new("Rework header slider")
     }).unwrap();
     let dependent = f.s.create_task(f.pid, TaskDraft { blocked_by: Some(t.id), ..TaskDraft::new("hero copy") }).unwrap();
@@ -515,7 +560,7 @@ fn moving_a_ticket_keeps_its_history_and_says_what_it_left_behind() {
     assert_eq!((moved.id, moved.project_id, moved.blocked_by), (t.id, other, None));
     assert!(f.s.task_opt(f.pid, t.id).unwrap().is_none(), "it is gone from the old board");
     assert_eq!(names(&f.s.task_repos(other, t.id).unwrap()), ["eee-api"], "a repo the new board lacks stays behind");
-    assert_eq!(f.s.task_planio(other, t.id).unwrap(), Some(1234));
+    assert_eq!(f.s.task_external_ref(other, t.id).unwrap().as_deref(), Some("1234"));
     assert_eq!(f.s.task_workstream(other, t.id).unwrap(), None);
     assert_eq!(f.s.task(f.pid, dependent.id).unwrap().blocked_by, None,
         "a blocker on another board would render as an id nobody here can look up");

@@ -8,6 +8,7 @@
 
 use ai_kanban::core::migrate::{migration_versions, BASELINE_VERSION, MIN_READABLE_VERSION, SCHEMA_VERSION};
 use ai_kanban::core::model::*;
+use ai_kanban::core::recall::{RecallQuery, DEFAULT_LIMIT};
 use ai_kanban::core::task::{TaskDraft, TaskPatch};
 use ai_kanban::core::Store;
 
@@ -149,12 +150,15 @@ fn min_readable_version_keeps_up_with_what_reads_require() {
 /// constraint, so the migration under test would have nothing to prove.
 fn pre_testing_status_store(path: &std::path::Path) {
     let conn = rusqlite::Connection::open(path).unwrap();
+    // Undo 012 too, or migrating from 9 re-adds a column this store already has. A rename
+    // is enough: SQLite rewrites the triggers with it, and 012 drops the FTS table anyway.
     conn.execute_batch(
         "PRAGMA writable_schema = ON;
          UPDATE sqlite_schema
             SET sql = replace(sql, ',''testing''', '')
           WHERE type = 'table' AND name = 'tasks';
          PRAGMA writable_schema = RESET;
+         ALTER TABLE tasks RENAME COLUMN external_ref TO planio;
          PRAGMA user_version = 9;",
     ).unwrap();
     assert!(
@@ -228,4 +232,53 @@ fn a_store_behind_the_binary_is_reported_as_unreadable_not_broken() {
         BASELINE_VERSION < MIN_READABLE_VERSION,
         "migration 002 made the baseline unreadable, so MIN_READABLE_VERSION must be above it"
     );
+}
+
+/// A store as the fork left it at 11: the ref lives in `tasks.planio` and 012 has not run.
+/// A rename is the whole difference -- SQLite rewrites the FTS triggers with it -- apart from
+/// the column's affinity, which does not matter to a `CAST(... AS TEXT)`.
+fn pre_external_ref_store(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE tasks RENAME COLUMN external_ref TO planio;
+         UPDATE tasks SET planio = CAST(planio AS INTEGER) WHERE planio IS NOT NULL;
+         PRAGMA user_version = 11;",
+    ).unwrap();
+}
+
+#[test]
+fn a_planio_number_becomes_an_external_ref_without_touching_the_rest_of_the_row() {
+    // 012 drops a column, which rewrites `tasks`. What must come through: the ref under its
+    // new name, the repo link and blocker that a table rebuild would have cascaded away, and
+    // a recall index rebuilt over the new column rather than left empty.
+    let (_d, path) = on_disk();
+    let dir = tempfile::tempdir().unwrap();
+    let checkout = dir.path().join("web");
+    std::fs::create_dir_all(&checkout).unwrap();
+
+    let (pid, blocker, task) = {
+        let s = Store::open(&path).unwrap();
+        let pid = s.resolve_project(dir.path()).unwrap().project.id;
+        let repo = s.add_repo(pid, &checkout, Some("web"), Actor::User).unwrap();
+        let blocker = s.create_task(pid, TaskDraft::new("first")).unwrap();
+        let mut draft = TaskDraft::new("invoice rounding");
+        draft.blocked_by = Some(blocker.id);
+        draft.repos = vec![repo.id];
+        draft.external_ref = Some("48213".into());
+        let task = s.create_task(pid, draft).unwrap();
+        (pid, blocker.id, task.id)
+    };
+
+    pre_external_ref_store(&path);
+
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(s.task_external_ref(pid, task).unwrap().as_deref(), Some("48213"));
+    let after = s.task(pid, task).unwrap();
+    assert_eq!(after.blocked_by, Some(blocker), "the blocker must survive the column drop");
+    let links = s.links_for(pid, std::slice::from_ref(&after)).unwrap();
+    assert_eq!(links[0].repos, ["web"], "the repo link must survive the column drop");
+    let hits = s.recall(&RecallQuery { text: "48213", project_id: Some(pid), limit: DEFAULT_LIMIT }).unwrap().hits;
+    assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), [task], "recall must index the migrated ref");
+    assert!(s.conn.prepare("SELECT planio FROM tasks").is_err(), "the vendor column is gone");
 }

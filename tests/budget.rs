@@ -150,7 +150,7 @@ fn a_mutation_response_still_shows_what_is_in_flight() {
 }
 
 #[test]
-fn repos_and_a_planio_ref_on_every_line_stay_affordable() {
+fn repos_and_an_external_ref_on_every_line_stay_affordable() {
     // The one change to the board LINE since these ceilings were set, and unlike tags it is
     // rendered there: which checkouts a ticket lives in and which ticket it is are what an
     // agent needs to pick work up. So it is measured at its worst -- two repos and a ref on
@@ -167,14 +167,14 @@ fn repos_and_a_planio_ref_on_every_line_stay_affordable() {
     for (i, t) in open.iter().enumerate() {
         s.update_task(pid, t.id, TaskPatch {
             repos: Some(vec![ra.id, rb.id]),
-            planio: Some(Some(48000 + i as i64)),
+            external_ref: Some(Some((48000 + i).to_string())),
             ..Default::default()
         }).unwrap();
     }
 
     let text = render::board(&s.board(pid, &BoardQuery::board()).unwrap());
-    eprintln!("\n=== board() with repos + planio on every line -- ~{} tokens ===\n{}", tokens(&text), text);
-    assert!(text.contains("[eee-api, eee-web] planio"), "the fixture must actually render them");
+    eprintln!("\n=== board() with repos + ref on every line -- ~{} tokens ===\n{}", tokens(&text), text);
+    assert!(text.contains("[eee-api, eee-web] ref"), "the fixture must actually render them");
     assert!(tokens(&text) < 1100, "board with repos cost {} tokens", tokens(&text));
 
     let t = s.create_task(pid, TaskDraft { repos: vec![ra.id], ..TaskDraft::new("side quest found in the api") }).unwrap();

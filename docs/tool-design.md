@@ -300,8 +300,8 @@ One canonical format per domain, and every one of them is valid input somewhere 
 | `backlog\|doing\|blocked\|done\|archived` | Status | `status` |
 | `low\|normal\|high\|urgent` | Priority | `priority` |
 | `"all"` | Every board | `project` |
-| `0` | Clear `blocked_by` / `planio` | `blocked_by`, `planio` |
-| `""` | Clear `tags` / `repos` / `workstream` | `tags`, `repos`, `workstream` |
+| `0` | Clear `blocked_by` | `blocked_by` |
+| `""` | Clear `tags` / `repos` / `workstream` / `external_ref` | `tags`, `repos`, `workstream`, `external_ref` |
 
 That last one is a compromise worth naming: JSON has no way to say "set this to null" that
 survives an optional field, and inventing a magic string would be worse than a documented
@@ -361,12 +361,13 @@ have to interpret, which is what keeps the status set fixed.
 They are indexed by `recall`, so typing a tag finds the tasks carrying it. There is no filter
 syntax, deliberately — see `docs/data-model.md`.
 
-## Repos and the Planio ref
+## Repos and the external ref
 
 `task_add` and `task_update` take `repos` (names as the board lists them, comma separated) and
-`planio` (a ticket number). The same three-way reading as `tags` and `workstream`: omitted
-leaves them alone, `""` clears `repos`, and `0` clears `planio` — the `blocked_by` sentinel,
-for the same reason.
+`external_ref` (the issue in an outside tracker, e.g. `48213` or `PROJ-123`). The same three-way
+reading as `tags` and `workstream`: omitted leaves them alone, `""` clears either. The name says
+what it is without naming a tracker, and is not `ref`, which in a repository reads as a git
+ref.
 
 An unknown repo name fails with the names that exist. On a board with none, it says how to
 register one — `repo_add`.
@@ -394,7 +395,7 @@ neither surface can grow its own idea of what a repo name means.
 They **are on the board line**, unlike tags:
 
 ```
-  #4    Fix invoice rounding                     (user) [eee-api, eee-web] planio 48213
+  #4    Fix invoice rounding                     (user) [eee-api, eee-web] ref 48213
   #9    Contact form spam                        (agent) no repo set
 ```
 

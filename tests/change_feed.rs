@@ -82,8 +82,8 @@ fn every_mutation_moves_the_change_cursor() {
     s.update_task(pid, t.id, TaskPatch { repos: Some(vec![r.id]), ..Default::default() }).unwrap();
     moved(&s, "linking a task to a repo");
 
-    s.update_task(pid, t.id, TaskPatch { planio: Some(Some(48213)), ..Default::default() }).unwrap();
-    moved(&s, "setting a Planio ref");
+    s.update_task(pid, t.id, TaskPatch { external_ref: Some(Some("48213".into())), ..Default::default() }).unwrap();
+    moved(&s, "setting an external ref");
 
     s.remove_repo(pid, r.id, Actor::User).unwrap();
     moved(&s, "removing a repo");
@@ -130,7 +130,7 @@ fn a_save_that_changes_nothing_writes_nothing() {
 
     let same = s.update_task(pid, t.id, TaskPatch {
         title: Some("a task".into()), status: Some(t.status), priority: Some(t.priority),
-        tags: Some(vec![]), repos: Some(vec![]), planio: Some(None), workstream: Some(None),
+        tags: Some(vec![]), repos: Some(vec![]), external_ref: Some(None), workstream: Some(None),
         expected_version: Some(t.version),
         ..Default::default()
     }).unwrap();

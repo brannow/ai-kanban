@@ -96,15 +96,15 @@ ai-kanban serve                 # http://127.0.0.1:7373
 It shows which workstream the board is in, lets you switch it, and states which one a new
 task will join — so nothing lands somewhere you could not see.
 
-### Boards, repos and Planio tickets
+### Boards, repos and tracker issues
 
 A board is a project. One appears automatically for any repo an agent works in; for a project
-that spans several repositories — a Planio project, a customer — press **+ board** in the web
+that spans several repositories — a tracker's project, a customer — press **+ board** in the web
 UI and name it (`BMUKN`). Then press **repos** and add each checkout's path. From then on an
 agent opening any of them lands on that board, and tickets say which repos they touch:
 
 ```
-#4    Fix invoice rounding      (user) [eee-api, eee-web] planio 48213
+#4    Fix invoice rounding      (user) [eee-api, eee-web] ref 48213
 #9    Contact form spam         (agent) no repo set
 ```
 
@@ -117,7 +117,8 @@ of them, its *home*; **make home** in the repos menu moves that. A ticket on the
 moves with **move to board** in its panel (or `task_update(move_to: …)`), history and all.
 **All projects**, at the top of the board picker, shows every board's tickets in one view.
 
-`planio` is the Planio ticket a task tracks, and `recall 48213` finds it.
+`ref` is the issue in an outside tracker a task mirrors — `48213`, `PROJ-123` — and `recall 48213`
+finds it. Which tracker is yours to say, with `AI_KANBAN_REF_URL` below.
 
 ## Commands
 
@@ -169,7 +170,7 @@ The first board survives and the second is folded into it.
 | | |
 |---|---|
 | `AI_KANBAN_DB` | Use a different store. **Set this for any experiment** — otherwise you are writing to your real memory. |
-| `AI_KANBAN_PLANIO_URL` | Your Planio, e.g. `https://frs.plan.io`. Set it where you run `ai-kanban serve` and the web UI links every Planio number to its issue. |
+| `AI_KANBAN_REF_URL` | Where a task's `ref` links to, with `{ref}` as the placeholder — e.g. `https://frs.plan.io/issues/{ref}` or `https://acme.atlassian.net/browse/{ref}`. Set it where you run `ai-kanban serve` and the web UI links every ref to its issue. |
 | `CLAUDE_CONFIG_DIR` | Claude Code's own setting. If you use it, pass the same path as `CLAUDE_DIR` to `make install`. |
 
 **macOS and Linux.** Windows is a stated non-goal, not a gap — installation is a Makefile and

@@ -192,13 +192,13 @@ straight out of a 30-row limit — shipping the original failure with a new colu
 supposed to fix it. The trade, stated because it is real: an unscoped `doing` task now sorts
 below an active-workstream `backlog` one. Displaced work is counted, never dropped.
 
-### `repos` / `board_repos` / `task_repos`, and `tasks.planio`
+### `repos` / `board_repos` / `task_repos`, and `tasks.external_ref`
 
 Added in migrations 007 and 008. A **repo** is a local checkout work happens in. A ticket names
 the repos it touches, a repo carries many tickets, and a repo can be on several boards.
 
 **Boards own repos, rather than every repo being its own board.** A board is a body of work — a
-customer, a product, a Planio project — and it spans several repositories; a ticket in it
+customer, a product, a tracker's project — and it spans several repositories; a ticket in it
 touches some of them. With one board per repo, a ticket touching two has to live on one, and an
 agent opening the other never sees it. A repository can also serve more than one body of work —
 a shared library, a monorepo two projects deploy from — so repos are global and tied to boards
@@ -243,16 +243,26 @@ set and cannot explain, and `blocked` would stop meaning one thing. The board li
 `no repo set` instead: only on boards that have repos, and only on open work, because a line
 that always says the same thing is one a reader learns to skip.
 
-**`planio` is an INTEGER, not free text**, so `48213`, `#48213` and a pasted URL cannot coexist
-as three spellings of one ticket. It is indexed in `tasks_fts` so `recall 48213` finds the
-ticket — the FTS table was dropped and rebuilt again, exactly as in 006.
+**`external_ref` is the issue in an outside tracker a task mirrors** — `48213`, `PROJ-123`. 007
+added it as `planio INTEGER`, naming one vendor in the schema; 012 made it tracker-agnostic
+TEXT, because a Jira key or anything else that is not a bare number could not be stored. Which
+tracker it is, and where its issues live, is the person's setting (`AI_KANBAN_REF_URL`), not the
+store's. 012 is a new migration rather than an edit to 007 because 007 had already run on the
+stores it shipped to, and `migrate::run` skips every migration at or below a store's version.
+
+TEXT gives up what the INTEGER bought — `48213`, `#48213` and a pasted URL coexisting as three
+spellings of one ticket — so `core::task::check_external_ref` takes that job over for both
+adapters: blank clears, a leading `#` is dropped, whitespace and URLs are refused. It is indexed
+in `tasks_fts` so `recall 48213` finds the ticket; the FTS table is dropped and rebuilt, as in
+006. Exports written before 012 carry `"planio": 48213` and still import.
 
 Neither is in `TASK_COLS`, following 005 and 006, so `MIN_READABLE_VERSION` stays at 2. The
-reads that name them (`links_for`, `repo_count`, `task_repos`, `task_planio`) degrade to "no
+reads that name them (`links_for`, `repo_count`, `task_repos`, `task_external_ref`) degrade to "no
 repos" on a store the read-only hook finds unmigrated. `tests/repos.rs` drops the tables and
-the column and asserts the board and the hook still render.
+the column and asserts the board and the hook still render. `links_for` reads the ref and the
+repos in separate tolerant queries, so a store between 007 and 012 loses only the ref.
 
-Unlike tags, repos and the Planio ref **are on the board line**. Tags carry nothing an agent
+Unlike tags, repos and the external ref **are on the board line**. Tags carry nothing an agent
 acts on; which checkouts a ticket lives in and which ticket it is are what an agent needs to
 pick the work up at all. Measured at its worst — two repos and a ref on every listed row — in
 `tests/budget.rs`.
