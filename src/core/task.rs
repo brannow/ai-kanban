@@ -530,7 +530,7 @@ pub fn check_external_ref(raw: Option<String>) -> Result<Option<String>> {
         return Err(Error::InvalidValue {
             field: "external_ref",
             value: raw.clone(),
-            valid: "an issue id from your tracker, e.g. 48213 or PROJ-123 -- not its URL".into(),
+            valid: "an issue id such as 48213 or PROJ-123 (not its URL)".into(),
         });
     }
     Ok(Some(r.to_string()))
