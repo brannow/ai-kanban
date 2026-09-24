@@ -49,17 +49,55 @@ fn json_req(method: &str, path: &str, body: Value, if_match: Option<&str>) -> Re
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn the_web_api_cannot_run_the_work() {
+    // The web UI is for looking at what the agent's board holds and correcting it -- editing
+    // or forgetting a task or note -- not for running the work. Creating or destroying boards
+    // and repos, moving tickets and starting sessions belong to the agent's tools or to
+    // `ai-kanban board|repo` in a terminal. Asserted route by route, so one added back later
+    // fails here rather than quietly turning the page into a second place to work from.
+    let (api, pid) = api();
+    let dir = tempfile::tempdir().unwrap();
+    let rid = api.store().add_repo(pid, dir.path(), None, Actor::User).unwrap().id;
+    let tid = api.store().create_task(pid, TaskDraft::new("a task")).unwrap().id;
+    let req = |method: &str, path: String| Request::builder().method(method).uri(path)
+        .header("content-type", "application/json").header("if-match", "\"1\"")
+        .body(Body::from(r#"{"name":"x","path":"/tmp","to":1,"allowed":false}"#)).unwrap();
+
+    for (method, path) in [
+        ("POST", "/api/projects".to_string()),
+        ("DELETE", format!("/api/projects/{pid}")),
+        ("POST", format!("/api/projects/{pid}/repos")),
+        ("PATCH", format!("/api/projects/{pid}/repos/{rid}")),
+        ("DELETE", format!("/api/projects/{pid}/repos/{rid}")),
+        ("PUT", format!("/api/projects/{pid}/repos/{rid}/home")),
+        ("GET", "/api/repos".to_string()),
+        ("DELETE", format!("/api/repos/{rid}")),
+        ("POST", format!("/api/projects/{pid}/tasks/{tid}/move")),
+        ("POST", format!("/api/projects/{pid}/tasks/{tid}/start")),
+        ("PUT", format!("/api/projects/{pid}/profiles/claude")),
+    ] {
+        let (status, _, _) = call(&api, req(method, path.clone())).await;
+        assert!(status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {path} answered {status}");
+    }
+    let s = api.store();
+    assert_eq!(s.all_projects().unwrap().len(), 1, "no board created or forgotten");
+    assert_eq!(s.repos(pid).unwrap().len(), 1, "the repo is untouched");
+    assert!(s.task(pid, tid).is_ok(), "the task did not move");
+}
+
+#[tokio::test]
 async fn the_board_arrives_in_column_order() {
-    // The UI renders columns in the order it receives them. `Status::ALL` is declaration
-    // order (backlog first); `board_rank` is display order. Sending the wrong one puts the
-    // backlog where "doing" belongs.
+    // The UI renders columns in the order it receives them, so the server owns the order:
+    // backlog on the left, doing in the middle. It is `column_rank`, not the agent's
+    // `board_rank` -- sending that one would put "doing" on the far left.
     let (api, pid) = api();
     let (status, body, _) = call(&api, get(&format!("/api/projects/{pid}/board"))).await;
 
     assert_eq!(status, StatusCode::OK);
     let order: Vec<&str> = body["columns"].as_array().unwrap().iter()
         .map(|c| c["status"].as_str().unwrap()).collect();
-    assert_eq!(order, ["doing", "blocked", "backlog", "done", "archived"]);
+    assert_eq!(order, ["backlog", "blocked", "doing", "testing", "done", "archived"]);
     assert!(body["cursor"].is_number(), "a board read carries the cursor it was taken at");
     assert!(body["now"].is_number(), "raw timestamps plus now, so the browser can tick ages");
 }
@@ -143,7 +181,7 @@ async fn meta_carries_the_enums_so_the_ui_never_hardcodes_them() {
     assert_eq!(status, StatusCode::OK);
     let statuses: Vec<&str> = body["statuses"].as_array().unwrap()
         .iter().map(|s| s["value"].as_str().unwrap()).collect();
-    assert_eq!(statuses, ["doing", "blocked", "backlog", "done", "archived"], "display order");
+    assert_eq!(statuses, ["backlog", "blocked", "doing", "testing", "done", "archived"], "column order");
     assert!(body["schema_version"].as_i64().unwrap() >= 1);
     assert!(body["cursor"].is_null(), "meta is cacheable and must not carry a moving value");
 }
@@ -423,6 +461,60 @@ async fn paging_a_column_stays_inside_the_workstream_the_board_is_scoped_to() {
     assert!(!titles.contains(&"elsewhere"), "another workstream leaked into a page: {titles:?}");
 }
 
+#[tokio::test]
+async fn repos_are_linked_and_cleared_through_the_api() {
+    // Registering a repo is the agent's or the terminal's job; naming one on a ticket is a
+    // field edit like tags, which the page may correct.
+    let (api, pid) = api();
+    let checkout = tempfile::tempdir().unwrap();
+    let rid = api.store().add_repo(pid, checkout.path(), Some("EEE Web"), Actor::User).unwrap().id;
+
+    let (status, body, _) = call(&api, json_req(
+        "POST", &format!("/api/projects/{pid}/tasks"),
+        serde_json::json!({ "title": "invoice rounding", "repos": [rid], "external_ref": "#48213" }), None,
+    )).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let tid = body["task"]["id"].as_i64().unwrap();
+
+    // Links ride beside the rows, like tags; every repo rides along for the pickers and menu.
+    let (_, board, _) = call(&api, get(&format!("/api/projects/{pid}/board"))).await;
+    let links = &board["task_links"][tid.to_string()];
+    assert_eq!(links["repos"], serde_json::json!(["eee-web"]), "{board}");
+    assert_eq!(links["external_ref"], "48213", "stored in its one spelling");
+    assert_eq!(board["repos"][0]["total"], 1);
+
+    // `[]` and `""` clear -- not null, because a JSON null in an optional field reads as
+    // "absent".
+    let (_, detail, etag) = call(&api, get(&format!("/api/projects/{pid}/tasks/{tid}"))).await;
+    assert_eq!(detail["repos"][0]["name"], "eee-web");
+    let version = etag.unwrap().trim_matches('"').to_string();
+    let (status, body, _) = call(&api, json_req(
+        "PATCH", &format!("/api/projects/{pid}/tasks/{tid}"),
+        serde_json::json!({ "repos": [], "external_ref": "" }), Some(&version),
+    )).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, detail, _) = call(&api, get(&format!("/api/projects/{pid}/tasks/{tid}"))).await;
+    assert_eq!(detail["repos"], serde_json::json!([]));
+    assert!(detail["external_ref"].is_null());
+}
+
+#[tokio::test]
+async fn all_projects_shows_every_board() {
+    let (api, pid) = api();
+    let bid = api.store().create_board("BMUKN").unwrap().id;
+    let here = api.store().create_task(pid, TaskDraft::new("Rework header slider")).unwrap().id;
+    let there = api.store().create_task(bid, TaskDraft::new("Invoice rounding")).unwrap().id;
+
+    let (status, all, _) = call(&api, get("/api/all/board")).await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(all["projects"].as_array().unwrap().len(), 2);
+    assert_eq!(all["columns"][0]["status"], "backlog");
+    let listed: Vec<i64> = all["columns"].as_array().unwrap().iter()
+        .flat_map(|c| c["tasks"].as_array().unwrap().iter().map(|t| t["id"].as_i64().unwrap()))
+        .collect();
+    assert!(listed.contains(&here) && listed.contains(&there), "every board's tickets: {all}");
+}
+
 // ---------------------------------------------------------------------------
 // Which pages may talk to this server (#453)
 
@@ -448,7 +540,7 @@ async fn a_rebinding_page_cannot_read_the_store() {
     let (api, pid) = api();
     api.store().create_task(pid, TaskDraft::new("a secret worth stealing")).unwrap();
     for host in ["evil.example:7373", "localhost.evil.example:7373", "127.0.0.1.nip.io:7373", "localhost:7373@evil"] {
-        for path in ["/api/projects".to_string(), format!("/api/projects/{pid}/board"), "/api/recall?q=secret".into(), "/".into()] {
+        for path in ["/api/projects".to_string(), format!("/api/projects/{pid}/board"), "/api/recall?q=secret".into(), "/api/all/board".into(), "/".into()] {
             let (status, body, _) = call(&api, with_headers("GET", &path, Some(host), None, None)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "GET {path} with Host {host}");
             assert!(!body.to_string().contains("secret"), "{body}");

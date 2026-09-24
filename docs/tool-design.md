@@ -236,7 +236,7 @@ On this board:
 ```
 "finished" is not a valid status.
 
-Valid values: backlog, doing, blocked, done, archived
+Valid values: backlog, doing, blocked, testing, done, archived
 ```
 
 Both are one call away from correct. The listing is scoped to the resolved board — showing
@@ -301,6 +301,7 @@ One canonical format per domain, and every one of them is valid input somewhere 
 | `low\|normal\|high\|urgent` | Priority | `priority` |
 | `"all"` | Every board | `project` |
 | `0` | Clear `blocked_by` | `blocked_by` |
+| `""` | Clear `tags` / `repos` / `workstream` / `external_ref` | `tags`, `repos`, `workstream`, `external_ref` |
 
 That last one is a compromise worth naming: JSON has no way to say "set this to null" that
 survives an optional field, and inventing a magic string would be worse than a documented
@@ -355,7 +356,63 @@ is the design: the board listing is paid for on every `task_add`, and tags carry
 an agent must act on — which is the whole reason they are safe to offer at all. An agent can
 therefore set a tag it will not see on the board. That is correct. Tags exist so a person can
 say "in review" or "waiting-on-vendor" without inventing workflow states the agent would then
-have to interpret, which is what keeps the five statuses fixed.
+have to interpret, which is what keeps the status set fixed.
 
 They are indexed by `recall`, so typing a tag finds the tasks carrying it. There is no filter
 syntax, deliberately — see `docs/data-model.md`.
+
+## Repos and the external ref
+
+`task_add` and `task_update` take `repos` (names as the board lists them, comma separated) and
+`external_ref` (the issue in an outside tracker, e.g. `48213` or `PROJ-123`). The same three-way
+reading as `tags` and `workstream`: omitted leaves them alone, `""` clears either. The name says
+what it is without naming a tracker, and is not `ref`, which in a repository reads as a git
+ref.
+
+An unknown repo name fails with the names that exist. On a board with none, it says how to
+register one — `repo_add`.
+
+There are three repo tools, and they were added late, after the version of this section that
+argued for none. The argument was that registering changes which board a directory resolves to
+and is therefore the person's call. The hole in it: an agent is told to name repos on tickets,
+and on a board with no repos yet the only way to get the first one was a UI the agent cannot
+open. What it actually did was write SQL into the store by hand, straight past the name
+normalizer `eee-web` / `EEE_Web` exists to catch. A tool the agent routes around is not a
+restriction, it is a bug with a rationale.
+
+- `repo_add` — path, optional name. Idempotent by construction: a checkout this board already
+  has comes back unchanged, one another board homes is attached without moving its home, and a
+  path another board claims is refused with `merge` as the repair. Those three cases are what
+  makes it safe to hand to an agent; the consequential act — moving a repo's home — is still
+  only the person's, with `ai-kanban repo home`.
+- `repo_list` — the board's repos with their paths, or `project: "all"` for every repo in the
+  store with the board its folder opens on.
+- `repo_remove` — off this board and this board's tickets. Nothing is deleted but the link.
+
+`ai-kanban repo add|list|rm` is the same three from a terminal, over the same `Store` calls, so
+neither surface can grow its own idea of what a repo name means. The terminal also has what
+the agent does not get: `rename`, `home` and `forget`.
+
+They **are on the board line**, unlike tags:
+
+```
+  #4    Fix invoice rounding                     (user) [eee-api, eee-web] ref 48213
+  #9    Contact form spam                        (agent) no repo set
+```
+
+`no repo set` is a flag, not a status. On a board that tracks repos, an open ticket naming none
+says so; on a board with no repos it never appears. `task_show` lists each repo with its path —
+the answer to "where is this work" — and on an unset one tells the agent to ask the user and
+record the answer with `task_update`.
+
+### Moving a ticket to another board
+
+`task_update(move_to: "BMUKN")` moves a ticket filed on the wrong board, with `log` saying why.
+It is a field on `task_update` rather than a tool of its own, for the reason the workstream move
+is: "move it, and say why" is the intent `task_update` already serves. The response is the
+board the ticket landed on. Its history and notes travel with it; its blocker, its workstream
+and any repo the new board lacks stay behind, and the history says which.
+
+Boards themselves are not created by the agent. A board named by a model is how one project
+quietly becomes two (`ai-kanban` today, `ai_kanban` tomorrow), so a person creates named boards
+with `ai-kanban board add`, and the agent reaches them through their repos.

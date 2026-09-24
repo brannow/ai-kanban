@@ -27,7 +27,7 @@
 //! through a call of its own.
 
 use crate::core::error::Result;
-use crate::core::model::{Actor, Workstream, WorkstreamSummary};
+use crate::core::model::{Actor, Status, Workstream, WorkstreamSummary};
 use crate::core::store::{now, Store};
 use rusqlite::{params, OptionalExtension};
 
@@ -83,7 +83,7 @@ fn ws_cols(alias: &str) -> String {
 /// which renders exactly the pre-005 board -- rather than to an error that takes the whole
 /// hook output down with it. Matching on the message is crude; it is also the only thing
 /// SQLite gives us that distinguishes a missing table from a real failure.
-fn is_missing_schema(e: &rusqlite::Error) -> bool {
+pub(crate) fn is_missing_schema(e: &rusqlite::Error) -> bool {
     let m = e.to_string();
     m.contains("no such table") || m.contains("no such column")
 }
@@ -206,11 +206,12 @@ impl Store {
 
     fn summaries(&self, project_id: i64, exclude: Option<i64>, require_open: bool) -> Result<Vec<WorkstreamSummary>> {
         let having = if require_open { "HAVING COUNT(t.id) > 0" } else { "" };
+        let open = Status::open_sql_list();
         let sql = format!(
             "SELECT {}, COUNT(t.id)
                FROM workstreams w
                LEFT JOIN tasks t
-                 ON t.workstream_id = w.id AND t.status IN ('backlog','doing','blocked')
+                 ON t.workstream_id = w.id AND t.status IN ({open})
               WHERE w.project_id = ?1 AND w.closed_at IS NULL AND (?2 IS NULL OR w.id != ?2)
               GROUP BY w.id
               {having}

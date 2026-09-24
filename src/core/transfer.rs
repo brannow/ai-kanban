@@ -67,6 +67,10 @@ pub struct ProjectExport {
     /// and an importer that rejected them would turn a new column into a broken restore.
     #[serde(default)]
     pub workstreams: Vec<WorkstreamExport>,
+    /// Exported in full, like workstreams: a repo no ticket names yet is still registered.
+    /// `serde(default)` keeps pre-007 exports importable.
+    #[serde(default)]
+    pub repos: Vec<RepoExport>,
     pub tasks: Vec<TaskExport>,
     pub notes: Vec<NoteExport>,
     pub events: Vec<EventExport>,
@@ -80,6 +84,23 @@ pub struct WorkstreamExport {
     pub name: String,
     pub created_at: i64,
     pub closed_at: Option<i64>,
+}
+
+/// Carried by name, which is unique in its store, for the reason workstreams are: an id means
+/// nothing in a store that numbers its rows differently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoExport {
+    pub name: String,
+    pub path: String,
+    pub created_at: i64,
+    /// Whether this board was the repo's home. Defaults to true: an export written before
+    /// repos could be shared only ever listed a board's own repos.
+    #[serde(default = "home_by_default")]
+    pub home: bool,
+}
+
+fn home_by_default() -> bool {
+    true
 }
 
 /// Rows carry their **source** id, and only so that references inside the same export can
@@ -105,8 +126,29 @@ pub struct TaskExport {
     /// one that wrote it.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Repo names. `serde(default)` on both of these for the reason `tags` has it.
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// Also read under its old name: exports written before 012 carry `"planio": 48213`,
+    /// a number, which a plain alias would refuse to read into a string.
+    #[serde(default, alias = "planio", deserialize_with = "external_ref_compat")]
+    pub external_ref: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// `external_ref` as either a string or the number a pre-012 `planio` export wrote.
+fn external_ref_compat<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Number(i64),
+        Text(String),
+    }
+    Ok(Option::<Raw>::deserialize(d)?.map(|r| match r {
+        Raw::Number(n) => n.to_string(),
+        Raw::Text(s) => s,
+    }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +197,11 @@ pub struct ImportedProject {
     /// sessions into this one. Skipping loses an alias, which the next session in that
     /// directory restores anyway.
     pub paths_skipped: Vec<String>,
+    /// Repos this board was home to in the export that are already homed on another board
+    /// here. They are attached, tickets keep them, but the folder keeps opening where it did:
+    /// one directory resolves to one board, and an import is not the place to move that.
+    #[serde(default)]
+    pub repos_skipped: Vec<String>,
 }
 
 impl Store {
@@ -249,11 +296,34 @@ impl Store {
             })?
             .collect::<rusqlite::Result<_>>()?;
 
+        let mut st = self.conn.prepare(
+            "SELECT r.name, r.path, br.created_at, r.home_project_id = br.project_id
+               FROM board_repos br JOIN repos r ON r.id = br.repo_id
+              WHERE br.project_id = ?1 ORDER BY r.id",
+        )?;
+        let repos: Vec<RepoExport> = st
+            .query_map([p.id], |r| Ok(RepoExport {
+                name: r.get(0)?, path: r.get(1)?, created_at: r.get(2)?, home: r.get(3)?,
+            }))?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let mut task_repos: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+        let mut st = self.conn.prepare(
+            "SELECT tr.task_id, r.name FROM task_repos tr
+               JOIN repos r ON r.id = tr.repo_id
+               JOIN tasks t ON t.id = tr.task_id
+              WHERE t.project_id = ?1 ORDER BY tr.task_id, r.name",
+        )?;
+        for row in st.query_map([p.id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (task, name) = row?;
+            task_repos.entry(task).or_default().push(name);
+        }
+
         // Ordered by id everywhere below: an export that reorders between two runs is one
         // nobody can diff, which is half the reason the JSON format exists at all.
         let mut st = self.conn.prepare(
             "SELECT t.id, t.title, t.body, t.status, t.type, t.origin, t.priority, t.blocked_by,
-                    t.created_at, t.updated_at, w.name, t.tags
+                    t.created_at, t.updated_at, w.name, t.tags, t.external_ref
                FROM tasks t LEFT JOIN workstreams w ON w.id = t.workstream_id
               WHERE t.project_id = ?1 ORDER BY t.id",
         )?;
@@ -272,9 +342,15 @@ impl Store {
                     updated_at: r.get(9)?,
                     workstream: r.get(10)?,
                     tags: crate::core::note::split_tags(&r.get::<_, String>(11)?),
+                    repos: Vec::new(),
+                    external_ref: r.get(12)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
+        let mut tasks = tasks;
+        for t in &mut tasks {
+            t.repos = task_repos.remove(&t.id).unwrap_or_default();
+        }
 
         let mut st = self.conn.prepare(
             "SELECT id, task_id, title, body, tags, created_at, updated_at
@@ -324,6 +400,7 @@ impl Store {
             created_at: p.created_at,
             paths,
             workstreams,
+            repos,
             tasks,
             notes,
             events,
@@ -407,6 +484,50 @@ impl Store {
             workstream_ids.insert(w.name.clone(), id);
         }
 
+        // Repos before tasks, for the reason workstreams go first: a task names its repos,
+        // so the rows have to exist. Written directly rather than through `add_repo`, which
+        // writes an event and checks the directory exists -- a restore replays the export's
+        // own history, and may run on a machine where the checkout is not (yet) cloned.
+        let mut repo_ids = std::collections::HashMap::new();
+        let mut repos_skipped = Vec::new();
+        for r in &pe.repos {
+            let existing: Option<i64> = self.conn
+                .query_row("SELECT id FROM repos WHERE path = ?1", [&r.path], |row| row.get(0))
+                .ok();
+            let rid = match existing {
+                // Already a repo here: shared, not stolen. Attached so tickets keep it, but
+                // its home -- where its folder opens -- stays with the board that has it.
+                Some(id) => {
+                    if r.home {
+                        repos_skipped.push(r.path.clone());
+                    }
+                    id
+                }
+                // New here, so this is the only board it is on, and so its home -- even when
+                // it was homed elsewhere in the source store.
+                None => {
+                    let name = self.free_repo_name(&r.name)?;
+                    self.conn.execute(
+                        "INSERT INTO repos (home_project_id, name, path, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![pid, name, r.path, r.created_at],
+                    )?;
+                    let id = self.conn.last_insert_rowid();
+                    // Its folder opens on its home. OR IGNORE: a path another board claims is
+                    // left alone, as the project's own paths are above.
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO project_paths (path, project_id, created_at) VALUES (?1, ?2, ?3)",
+                        params![r.path, pid, r.created_at],
+                    )?;
+                    id
+                }
+            };
+            self.conn.execute(
+                "INSERT OR IGNORE INTO board_repos (project_id, repo_id, created_at) VALUES (?1, ?2, ?3)",
+                params![pid, rid, r.created_at],
+            )?;
+            repo_ids.insert(r.name.clone(), rid);
+        }
+
         // Tasks in two passes. `blocked_by` points at another task in the same export, so
         // it cannot be written until every id in the project has been allocated.
         let mut task_ids = std::collections::HashMap::new();
@@ -416,12 +537,20 @@ impl Store {
             // while inventing a workstream would put the task in one that never existed.
             let ws = t.workstream.as_ref().and_then(|n| workstream_ids.get(n));
             self.conn.execute(
-                "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, workstream_id, tags, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?11, ?9, ?10)",
+                "INSERT INTO tasks (project_id, title, body, status, type, origin, priority, workstream_id, tags, external_ref, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?11, ?12, ?9, ?10)",
                 params![pid, t.title, t.body, t.status, t.r#type, t.origin, t.priority, ws, t.created_at, t.updated_at,
-                        crate::core::note::join_tags(&t.tags)],
+                        crate::core::note::join_tags(&t.tags), t.external_ref],
             )?;
-            task_ids.insert(t.id, self.conn.last_insert_rowid());
+            let tid = self.conn.last_insert_rowid();
+            task_ids.insert(t.id, tid);
+            // A repo that was skipped above is dropped from the task, same rule as workstreams.
+            for rid in t.repos.iter().filter_map(|n| repo_ids.get(n)) {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO task_repos (task_id, repo_id) VALUES (?1, ?2)",
+                    params![tid, rid],
+                )?;
+            }
         }
         for t in &pe.tasks {
             // A dangling reference is dropped rather than carried. `blocked_by` is
@@ -495,6 +624,7 @@ impl Store {
             notes: pe.notes.len(),
             events: pe.events.len(),
             paths_skipped,
+            repos_skipped,
         })
     }
 }

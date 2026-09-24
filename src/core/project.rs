@@ -167,6 +167,31 @@ impl Store {
         }
     }
 
+    /// A board a person creates by name -- a tracker's project, a customer -- rather than one
+    /// derived from a directory.
+    ///
+    /// It has no directory of its own. Agents reach it through the repos whose home it is:
+    /// adding a repo claims that repo's folder for its home board. Keyed `board:<name>`, so
+    /// the key can never collide with a `git:` or `path:` identity derived from a folder.
+    ///
+    /// A name another board already has is refused rather than numbered: two boards with one
+    /// name is exactly what a split looks like in `ai-kanban projects`, and a person choosing
+    /// a name can choose another.
+    pub fn create_board(&self, name: &str) -> Result<Project> {
+        let name = name.trim();
+        let key = format!("board:{}", crate::core::workstream::normalize_name(name));
+        let taken = self.all_projects()?.iter().any(|p| p.name.eq_ignore_ascii_case(name))
+            || self.project_by_key(&key)?.is_some();
+        if name.is_empty() || key == "board:" || taken {
+            return Err(crate::core::Error::InvalidValue {
+                field: "name",
+                value: name.to_string(),
+                valid: "a name with a letter or digit that no other board has".into(),
+            });
+        }
+        Ok(self.upsert_project(&key, name)?.0)
+    }
+
     pub fn all_projects(&self) -> Result<Vec<Project>> {
         let mut st = self.conn.prepare(
             "SELECT id, key, name, created_at FROM projects ORDER BY name, id",

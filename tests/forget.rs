@@ -24,6 +24,75 @@ fn finds(s: &Store, pid: i64, text: &str) -> usize {
         .len()
 }
 
+fn finds_anywhere(s: &Store, text: &str) -> usize {
+    s.recall(&ai_kanban::core::recall::RecallQuery { text, project_id: None, limit: 20 })
+        .unwrap()
+        .hits
+        .len()
+}
+
+#[test]
+fn a_forgotten_board_leaves_nothing_behind() {
+    let s = Store::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let pid = s.resolve_project(dir.path()).unwrap().project.id;
+    let other = s.create_board("other").unwrap();
+    s.create_task(pid, TaskDraft::new("rotate AKIAsecret123")).unwrap();
+    s.create_note(pid, NoteDraft { body: "AKIAsecret123".into(), ..NoteDraft::new("key") }, Actor::Agent).unwrap();
+    let kept = s.create_task(other.id, TaskDraft::new("unrelated")).unwrap();
+    assert!(finds_anywhere(&s, "AKIAsecret123") > 0, "precondition");
+
+    s.forget_board(pid).unwrap();
+
+    assert!(s.project(pid).is_err(), "the board itself is gone");
+    assert_eq!(finds_anywhere(&s, "AKIAsecret123"), 0, "nothing of it is searchable");
+    assert!(s.task(other.id, kept.id).is_ok(), "other boards are untouched");
+    // Its folder is released: the next session there starts over rather than landing on
+    // whatever happens to hold the old id.
+    assert_ne!(s.resolve_project(dir.path()).unwrap().project.id, pid);
+}
+
+#[test]
+fn a_shared_repo_moves_home_when_its_board_is_forgotten() {
+    let s = Store::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let pid = s.resolve_project(dir.path()).unwrap().project.id;
+    let checkout = dir.path().join("lib");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let r = s.add_repo(pid, &checkout, None, Actor::User).unwrap();
+    let other = s.create_board("other").unwrap();
+    s.add_repo(other.id, &checkout, None, Actor::User).unwrap();
+
+    s.forget_board(pid).unwrap();
+
+    let repos = s.repos(other.id).unwrap();
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0].id, r.id);
+    assert_eq!(repos[0].home_project_id, other.id, "the home passed to the board still holding it");
+    assert_eq!(s.resolve_project(&checkout).unwrap().project.id, other.id, "its folder opens there");
+}
+
+#[test]
+fn a_forgotten_repo_is_off_every_board_and_ticket() {
+    let s = Store::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let pid = s.resolve_project(dir.path()).unwrap().project.id;
+    let checkout = dir.path().join("lib");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let r = s.add_repo(pid, &checkout, None, Actor::User).unwrap();
+    let other = s.create_board("other").unwrap();
+    s.add_repo(other.id, &checkout, None, Actor::User).unwrap();
+    let t = s.create_task(other.id, TaskDraft::new("uses lib")).unwrap();
+    s.update_task(other.id, t.id, TaskPatch { repos: Some(vec![r.id]), ..Default::default() }).unwrap();
+
+    s.forget_repo(r.id).unwrap();
+
+    assert!(s.repos(pid).unwrap().is_empty());
+    assert!(s.repos(other.id).unwrap().is_empty());
+    assert!(s.task_repos(other.id, t.id).unwrap().is_empty(), "no ticket still names it");
+    assert_eq!(s.resolve_project(&checkout).unwrap().project.id, pid, "its folder still opens on its home");
+}
+
 #[test]
 fn a_forgotten_note_is_gone_from_search_too() {
     let (s, pid) = fixture();

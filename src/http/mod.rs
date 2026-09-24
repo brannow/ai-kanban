@@ -49,9 +49,12 @@ pub fn router(api: Api) -> Router {
         .route("/", get(|| async { axum::response::Html(INDEX) }))
         .route("/api/meta", get(routes::meta))
         .route("/api/projects", get(routes::projects))
+        .route("/api/all/board", get(routes::all_board))
+        .route("/api/all/tasks", get(routes::all_tasks))
         .route("/api/projects/{p}", get(routes::project))
         .route("/api/projects/{p}/board", get(routes::board))
         .route("/api/projects/{p}/workstream", put(routes::set_workstream))
+        .route("/api/projects/{p}/repos", get(routes::repos))
         .route("/api/projects/{p}/tasks", get(routes::tasks).post(routes::create_task))
         .route("/api/projects/{p}/tasks/{t}", get(routes::task))
         .route("/api/projects/{p}/tasks/{t}", patch(routes::update_task))
@@ -62,6 +65,8 @@ pub fn router(api: Api) -> Router {
         .route("/api/projects/{p}/events", get(routes::events))
         .route("/api/recall", get(routes::recall))
         .route("/api/stream", get(stream::sse))
+        // Last on purpose: a layer wraps only the routes added before it, so a route added
+        // below this line would skip the check.
         .layer(axum::middleware::from_fn(same_site_only))
         .with_state(api)
 }
@@ -120,6 +125,13 @@ impl IntoResponse for ApiError {
                 StatusCode::NOT_FOUND,
                 "not_found",
                 serde_json::json!({ "existing": existing }),
+            ),
+            // 409 with the owner named, so the UI can say which board holds the directory
+            // rather than just refusing.
+            Error::PathClaimed { board, key, .. } => (
+                StatusCode::CONFLICT,
+                "claimed",
+                serde_json::json!({ "board": board, "key": key }),
             ),
             Error::AmbiguousProject { candidates, .. } => (
                 StatusCode::CONFLICT,

@@ -21,7 +21,7 @@ use ai_kanban::core::Store;
 
 /// What the HTTP server polls.
 fn cursor(s: &Store) -> i64 {
-    s.conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0)).unwrap()
+    s.change_cursor().unwrap()
 }
 
 #[test]
@@ -70,6 +70,70 @@ fn every_mutation_moves_the_change_cursor() {
 
     s.close_workstream(pid, w.id).unwrap();
     moved(&s, "closing a workstream");
+
+    let checkout = dir.path().join("a-checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let r = s.add_repo(pid, &checkout, None, Actor::User).unwrap();
+    moved(&s, "registering a repo");
+
+    s.rename_repo(pid, r.id, "renamed", Actor::User).unwrap();
+    moved(&s, "renaming a repo");
+
+    s.update_task(pid, t.id, TaskPatch { repos: Some(vec![r.id]), ..Default::default() }).unwrap();
+    moved(&s, "linking a task to a repo");
+
+    s.update_task(pid, t.id, TaskPatch { external_ref: Some(Some("48213".into())), ..Default::default() }).unwrap();
+    moved(&s, "setting an external ref");
+
+    s.remove_repo(pid, r.id, Actor::User).unwrap();
+    moved(&s, "removing a repo");
+
+    let board = s.create_board("BMUKN").unwrap();
+    moved(&s, "creating a board");
+
+    let shared_dir = dir.path().join("shared");
+    std::fs::create_dir_all(&shared_dir).unwrap();
+    let shared = s.add_repo(pid, &shared_dir, None, Actor::User).unwrap();
+    s.add_repo(board.id, &shared_dir, None, Actor::User).unwrap();
+    moved(&s, "sharing a repo with a second board");
+
+    s.set_repo_home(board.id, shared.id, Actor::User).unwrap();
+    moved(&s, "moving a repo's home");
+
+    s.move_task(pid, t.id, board.id, Actor::User, None, None).unwrap();
+    moved(&s, "moving a task to another board");
+
+    s.forget_repo(shared.id).unwrap();
+    moved(&s, "forgetting a repo");
+
+    // The last one on purpose: it deletes the board's events, which is exactly what could
+    // leave MAX(id) standing still or going backwards.
+    s.forget_board(board.id).unwrap();
+    moved(&s, "forgetting a board");
+}
+
+#[test]
+fn a_save_that_changes_nothing_writes_nothing() {
+    // The web form sends every field on every save. Recording those as edits filled the
+    // history with "no change" lines and bumped the version under anyone else's open form.
+    let s = Store::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let pid = s.resolve_project(dir.path()).unwrap().project.id;
+    let t = s.create_task(pid, TaskDraft::new("a task")).unwrap();
+    let before = cursor(&s);
+
+    let same = s.update_task(pid, t.id, TaskPatch {
+        title: Some("a task".into()), status: Some(t.status), priority: Some(t.priority),
+        tags: Some(vec![]), repos: Some(vec![]), external_ref: Some(None), workstream: Some(None),
+        expected_version: Some(t.version),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(cursor(&s), before, "an unchanged save must not reach the history");
+    assert_eq!(same.version, t.version);
+
+    // A reason on its own is a comment, and that is history.
+    s.update_task(pid, t.id, TaskPatch { log: Some("checked, still valid".into()), ..Default::default() }).unwrap();
+    assert!(cursor(&s) > before);
 }
 
 #[test]

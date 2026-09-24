@@ -60,7 +60,15 @@ macro_rules! sql_enum {
 sql_enum!(
     /// `archived` is terminal and hidden from the default board. There is deliberately no
     /// `next` -- priority covers it.
-    Status { Backlog => "backlog", Doing => "doing", Blocked => "blocked", Done => "done", Archived => "archived" },
+    ///
+    /// `testing` is work that is written but not accepted: the code exists, and something
+    /// (a run, a review, a person) still has to say it holds. It is OPEN, because a task
+    /// sitting there is unfinished work an agent may have to pick back up -- counting it as
+    /// done is how knowledge of "built but never verified" dies at the end of a session.
+    /// It is a fixed status rather than a tag (see `migrations/006_task_tags.sql`) for the
+    /// reason that file gives: it carries behaviour -- openness and ordering -- that every
+    /// consumer must agree on, and it means the same thing on every board.
+    Status { Backlog => "backlog", Doing => "doing", Blocked => "blocked", Testing => "testing", Done => "done", Archived => "archived" },
     default = Backlog
 );
 
@@ -90,11 +98,38 @@ impl Status {
     /// Board display order. Not a DB concern -- it is presentation, but it is the *same*
     /// presentation for every adapter, so it lives with the type rather than in one renderer.
     pub fn board_rank(self) -> u8 {
-        match self { Status::Doing => 0, Status::Blocked => 1, Status::Backlog => 2, Status::Done => 3, Status::Archived => 4 }
+        match self {
+            Status::Doing => 0,
+            // Ahead of `blocked` and `backlog`: a task in testing is the closest thing on
+            // the board to finished, and it is the one a returning agent can close out.
+            Status::Testing => 1,
+            Status::Blocked => 2,
+            Status::Backlog => 3,
+            Status::Done => 4,
+            Status::Archived => 5,
+        }
+    }
+    /// Left-to-right column order on the person's web board: backlog, then blocked, doing in
+    /// the middle, finished work on the right.
+    ///
+    /// Deliberately separate from `board_rank`. That one orders the AGENT's list, in-flight
+    /// first, because it decides which rows survive a capped board -- reordering it for looks
+    /// would change what a cold agent is told. A person scanning columns sees every column at
+    /// once, so their order is free to follow how they read the board instead.
+    pub fn column_rank(self) -> u8 {
+        match self { Status::Backlog => 0, Status::Blocked => 1, Status::Doing => 2, Status::Testing => 3, Status::Done => 4, Status::Archived => 5 }
+    }
+    /// The open statuses as a SQL literal list, for the `status IN (...)` counts that cannot
+    /// bind a variable-length parameter list. Derived rather than typed out: a status added
+    /// to the enum has to reach every "how much is still open" count on the board, and a
+    /// hand-written copy is what silently leaves one of them behind. Never caller input.
+    pub fn open_sql_list() -> String {
+        Self::ALL.iter().filter(|s| s.is_open())
+            .map(|s| format!("'{}'", s.as_str())).collect::<Vec<_>>().join(",")
     }
     /// Counted as "open" in board headers and remainder counts.
     pub fn is_open(self) -> bool {
-        matches!(self, Status::Backlog | Status::Doing | Status::Blocked)
+        matches!(self, Status::Backlog | Status::Doing | Status::Blocked | Status::Testing)
     }
 }
 
@@ -194,6 +229,50 @@ pub struct WorkstreamSummary {
 }
 
 // ---------------------------------------------------------------------------
+// Repos
+// ---------------------------------------------------------------------------
+
+/// A local checkout boards' work happens in. Tied to any number of boards; see migrations
+/// 007 and 008 for why boards own repos and why each repo still has exactly one home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Repo {
+    pub id: i64,
+    /// The board its folder resolves to -- where an agent opening it lands. Always one of
+    /// the boards the repo is on.
+    pub home_project_id: i64,
+    /// Normalized, so the spelling an agent types matches the one a person registered.
+    pub name: String,
+    /// Canonical absolute path. What tells an agent where the work actually is.
+    pub path: String,
+    pub created_at: i64,
+}
+
+/// One row of a board's repos menu.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoSummary {
+    pub repo: Repo,
+    /// Tickets on THIS board naming the repo. Other boards' tickets are theirs to count.
+    pub open: usize,
+    pub total: usize,
+    /// Named, so the menu can say where the folder opens without a second lookup.
+    pub home_board: String,
+    /// The other boards it is on.
+    pub other_boards: Vec<String>,
+}
+
+/// What a listed task links to: the repos it touches and the outside issue it tracks.
+///
+/// Carried beside the rows rather than on `Task` for the reason tags are: neither is in
+/// `TASK_COLS` (migration 007), because widening that list would raise
+/// MIN_READABLE_VERSION and silence the SessionStart hook for a session per upgrade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskLinks {
+    pub task_id: i64,
+    pub repos: Vec<String>,
+    pub external_ref: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Board query + snapshot
 // ---------------------------------------------------------------------------
 
@@ -282,10 +361,19 @@ pub struct BoardSnapshot {
     /// The annotation then reads as "do not pick this up" forever, and it is the cold-start
     /// view that says it, which is the reader least able to check.
     pub blocker_status: Vec<(i64, Status)>,
+    /// Repos and external ref for the listed tasks that have either. Must describe `tasks` as
+    /// finally listed -- `board_after_mutation` recomputes it after splicing a row in.
+    pub links: Vec<TaskLinks>,
+    /// How many repos the board owns. Zero means the board does not track repos at all, and
+    /// then a task with none is not worth flagging: every task on it would say so.
+    pub repo_count: usize,
     pub now: i64,
 }
 
 impl BoardSnapshot {
+    pub fn links_of(&self, task_id: i64) -> Option<&TaskLinks> {
+        self.links.iter().find(|l| l.task_id == task_id)
+    }
     pub fn count_of(&self, s: Status) -> usize {
         self.counts.iter().find(|(k, _)| *k == s).map(|(_, n)| *n).unwrap_or(0)
     }
@@ -312,6 +400,13 @@ pub struct TaskDetail {
     /// migration 006. task_show is the response allowed to cost more, so it is where the
     /// labels belong; the board line deliberately does not show them.
     pub tags: Vec<String>,
+    /// With their paths: task_show is where an agent commits to the work, so it is where it
+    /// learns which checkouts that work is in.
+    pub repos: Vec<Repo>,
+    pub external_ref: Option<String>,
+    /// Whether the board tracks repos at all, so an empty `repos` can be told apart from a
+    /// board where the question does not arise.
+    pub board_has_repos: bool,
     pub blocker: Option<Task>,
     pub blocking: Vec<Task>,
     pub events: Vec<Event>,

@@ -150,6 +150,40 @@ fn a_mutation_response_still_shows_what_is_in_flight() {
 }
 
 #[test]
+fn repos_and_an_external_ref_on_every_line_stay_affordable() {
+    // The one change to the board LINE since these ceilings were set, and unlike tags it is
+    // rendered there: which checkouts a ticket lives in and which ticket it is are what an
+    // agent needs to pick work up. So it is measured at its worst -- two repos and a ref on
+    // every listed row -- on the same year-old board.
+    let (s, pid) = year_old_project();
+    let root = std::env::temp_dir().join(format!("aik-budget-repos-{}", std::process::id()));
+    let (a, b) = (root.join("api"), root.join("web"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let ra = s.add_repo(pid, &a, Some("eee-api"), Actor::User).unwrap();
+    let rb = s.add_repo(pid, &b, Some("eee-web"), Actor::User).unwrap();
+
+    let open = s.board(pid, &BoardQuery::board().with_limit(usize::MAX)).unwrap().tasks;
+    for (i, t) in open.iter().enumerate() {
+        s.update_task(pid, t.id, TaskPatch {
+            repos: Some(vec![ra.id, rb.id]),
+            external_ref: Some(Some((48000 + i).to_string())),
+            ..Default::default()
+        }).unwrap();
+    }
+
+    let text = render::board(&s.board(pid, &BoardQuery::board()).unwrap());
+    eprintln!("\n=== board() with repos + ref on every line -- ~{} tokens ===\n{}", tokens(&text), text);
+    assert!(text.contains("[eee-api, eee-web] ref"), "the fixture must actually render them");
+    assert!(tokens(&text) < 1100, "board with repos cost {} tokens", tokens(&text));
+
+    let t = s.create_task(pid, TaskDraft { repos: vec![ra.id], ..TaskDraft::new("side quest found in the api") }).unwrap();
+    let text = render::board(&s.board_after_mutation(pid, t.id).unwrap());
+    eprintln!("\n=== task_add with repos -- ~{} tokens ===\n{}", tokens(&text), text);
+    assert!(tokens(&text) < 250, "task_add with repos cost {} tokens", tokens(&text));
+}
+
+#[test]
 fn the_all_boards_view_is_capped_by_board_count() {
     // The one call whose cost scales with something the project does not control: how many
     // repositories the user has touched this year. Uncapped, it grows without bound.
@@ -168,4 +202,29 @@ fn the_all_boards_view_is_capped_by_board_count() {
     assert_eq!(sums.len(), Store::SUMMARY_LIMIT);
     assert!(text.contains("35 more"), "the omitted boards must be reported: {text}");
     assert!(tokens(&text) < 700, "all-boards view cost {} tokens", tokens(&text));
+}
+
+#[test]
+fn the_repo_menu_stays_affordable_on_a_board_with_many_checkouts() {
+    // `repo_list` is uncapped, on purpose: a menu you pick from cannot hide a row, and the
+    // first thing a truncated one would cost is the repo an agent was looking for. That makes
+    // its cost scale with something the project does not control -- how many checkouts a board
+    // has -- so it is measured at a scale well past any real monorepo rather than capped.
+    let (s, pid) = year_old_project();
+    let root = std::env::temp_dir().join(format!("aik-budget-menu-{}", std::process::id()));
+    for i in 0..20 {
+        let d = root.join(format!("payments-service-{i}"));
+        std::fs::create_dir_all(&d).unwrap();
+        s.add_repo(pid, &d, None, Actor::User).unwrap();
+    }
+    // The board's own name, not a literal: a mismatch would put "opens on board ..." on every
+    // row and measure a case that cannot happen.
+    let board = s.project(pid).unwrap().name;
+    let text = render::repo_menu(&board, &s.repo_summaries(pid).unwrap());
+    eprintln!("\n=== repo_list, 20 repos -- ~{} tokens ===\n{}", tokens(&text), text);
+    // Generous partly because the fixture's paths are macOS temp paths, ~90 characters of
+    // `/private/var/folders/...` that a real checkout does not carry. The tripwire is an
+    // order-of-magnitude regression, not this number.
+    assert!(tokens(&text) < 750, "repo_list cost {} tokens", tokens(&text));
+    std::fs::remove_dir_all(&root).ok();
 }

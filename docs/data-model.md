@@ -189,10 +189,99 @@ straight out of a 30-row limit — shipping the original failure with a new colu
 supposed to fix it. The trade, stated because it is real: an unscoped `doing` task now sorts
 below an active-workstream `backlog` one. Displaced work is counted, never dropped.
 
+### `repos` / `board_repos` / `task_repos`, and `tasks.external_ref`
+
+Added in migrations 007 and 008. A **repo** is a local checkout work happens in. A ticket names
+the repos it touches, a repo carries many tickets, and a repo can be on several boards.
+
+**Boards own repos, rather than every repo being its own board.** A board is a body of work — a
+customer, a product, a tracker's project — and it spans several repositories; a ticket in it
+touches some of them. With one board per repo, a ticket touching two has to live on one, and an
+agent opening the other never sees it. A repository can also serve more than one body of work —
+a shared library, a monorepo two projects deploy from — so repos are global and tied to boards
+through `board_repos`, many-to-many. 007 gave each repo one board; 008 replaced that the first
+time real use put one repo on two projects.
+
+**Exactly one home.** What cannot be shared is where a folder resolves: an agent opening a
+directory has to land on one board, the same one every time, or the folder reads a different
+memory on different days. So each repo has a **home** (`repos.home_project_id`) — the board its
+root's `project_paths` alias points at, always one of its boards. It starts as the first board
+the repo is added to. Adding the same checkout to another board *attaches* it and leaves the
+home alone; `set_repo_home` moves it, re-pointing the root alias and every subdirectory the old
+home learned (left behind, a learned `src/` alias would keep answering for the old home). When
+the home lets a repo go, the home passes to the earliest remaining board. "Most recently active
+board" was rejected: it makes resolution depend on the clock.
+
+**`repos.path` and `repos.name` are unique across the store.** The path because one directory
+resolves to one board; the name because a repo is one thing seen from several boards, and
+`eee-api` must mean the same checkout on each. Registering a *new* checkout in a directory
+another board already claims — at that path *or below it* — is refused with the owner named.
+Below matters: resolution checks the deepest alias first, so another board's `src/` alias would
+keep answering and the registration would silently not take effect. `merge` is the repair when
+both boards are the same work.
+
+**Removing a repo from its last board leaves its path alias in place.** Taking it out of the
+menu says it is no longer part of this work, not that its history belongs elsewhere. Dropping
+the alias would send the next session in that folder to a brand-new empty board.
+
+**Boards can be created by name** (`create_board`, key `board:<name>`), for a project that is
+not one directory. Such a board has no path of its own; agents reach it through the repos it is
+home to. A name another board has is refused, because two boards with one name is what a split
+looks like.
+
+**A ticket can move between boards** (`move_task`). Task ids are global, so it keeps its id, and
+its events and the notes written on it move with it. What only means something on the old board
+— its blocker, its workstream, a repo the new board lacks, other tasks' `blocked_by` pointing at
+it — is dropped, and the `moved` event says what was left behind.
+
+**A ticket with no repo is flagged, not blocked.** `status` is authoritative and carries
+behaviour — the argument under `tags` below. A status forced by a rule is one the agent did not
+set and cannot explain, and `blocked` would stop meaning one thing. The board line says
+`no repo set` instead: only on boards that have repos, and only on open work, because a line
+that always says the same thing is one a reader learns to skip.
+
+**`external_ref` is the issue in an outside tracker a task mirrors** — `48213`, `PROJ-123`. 007
+added it as `planio INTEGER`, naming one vendor in the schema; 012 made it tracker-agnostic
+TEXT, because a Jira key or anything else that is not a bare number could not be stored. Which
+tracker it is, and where its issues live, is the person's setting (`AI_KANBAN_REF_URL`), not the
+store's. 012 is a new migration rather than an edit to 007 because 007 had already run on the
+stores it shipped to, and `migrate::run` skips every migration at or below a store's version.
+
+TEXT gives up what the INTEGER bought — `48213`, `#48213` and a pasted URL coexisting as three
+spellings of one ticket — so `core::task::check_external_ref` takes that job over for both
+adapters: blank clears, a leading `#` is dropped, whitespace and URLs are refused. It is indexed
+in `tasks_fts` so `recall 48213` finds the ticket; the FTS table is dropped and rebuilt, as in
+006. Exports written before 012 carry `"planio": 48213` and still import.
+
+Neither is in `TASK_COLS`, following 005 and 006, so `MIN_READABLE_VERSION` stays at 2. The
+reads that name them (`links_for`, `repo_count`, `task_repos`, `task_external_ref`) degrade to "no
+repos" on a store the read-only hook finds unmigrated. `tests/repos.rs` drops the tables and
+the column and asserts the board and the hook still render. `links_for` reads the ref and the
+repos in separate tolerant queries, so a store between 007 and 012 loses only the ref.
+
+Unlike tags, repos and the external ref **are on the board line**. Tags carry nothing an agent
+acts on; which checkouts a ticket lives in and which ticket it is are what an agent needs to
+pick the work up at all. Measured at its worst — two repos and a ref on every listed row — in
+`tests/budget.rs`.
+
+**Repos are registered by the agent (`repo_add`) or in a terminal (`ai-kanban repo add`)**,
+never from the web UI, which only lists them. Both call `Store::add_repo`, which is where the name is normalized
+and where a path another board already claims is refused — the guard that makes it safe for an
+agent to register one. What stays the person's call is *moving* a repo's home
+(`set_repo_home`, `ai-kanban repo home`), since that is what changes where an existing folder
+resolves.
+
 ### `tasks`
 
-`status` is one of `backlog | doing | blocked | done | archived`. There is no `next` —
-priority covers it. `archived` is terminal and hidden from the default board.
+`status` is one of `backlog | doing | blocked | testing | done | archived`. There is no
+`next` — priority covers it. `archived` is terminal and hidden from the default board.
+
+`testing` is work that is written but not accepted: the code exists, and a run, a review or a
+person still has to say it holds. It counts as **open**, and that is the whole point — a task
+parked there is unfinished work, and calling it done is how "built but never verified" dies
+with the session that built it. It ranks just behind `doing` on the agent's board, ahead of
+`blocked` and `backlog`, because it is the closest thing on the board to finished and the
+easiest thing for a returning agent to close out.
 
 **`status` is authoritative; `blocked_by` is annotation.** They may disagree:
 `status = 'blocked'` with `blocked_by = NULL` is legal and means "blocked on something
@@ -219,7 +308,7 @@ carry the same column for the same reason.
 Passing it is **optional**, and the two consumers differ: the HTTP API always sends it, the
 MCP agent never does. The reasoning is in `docs/http-api.md` and on `TaskPatch::expected_version`.
 
-**`tags` — the escape valve that keeps the five statuses fixed.**
+**`tags` — the escape valve that keeps the status set fixed.**
 
 People ask for custom board columns. They cannot have them, and the reason is not
 conservatism: every status carries BEHAVIOUR, not just a label. `is_open()` decides what
@@ -229,6 +318,11 @@ open, should I pick work from it" except in the user's head — which inverts th
 the agent would need knowledge of the USER'S configuration, worse than needing ours. And
 since the store is global and recall crosses projects, one board's "in review" against
 another's "reviewing" quietly makes cross-project search meaningless.
+
+`testing` (migration 010) is not a counterexample. It is defined once, in `Status`, with its
+openness and its ordering settled for every consumer, and it means the same thing on every
+board — which is exactly what a user-defined column cannot offer. The bar for a new status is
+that behaviour, not the label.
 
 Tags carry no semantics an agent must honour, which is exactly what makes them safe. A person
 gets "in review", "waiting-on-vendor", "frontend" without inventing workflow states.
@@ -412,3 +506,30 @@ adoption possible, it does not cause it. See `docs/plan.md`.
 
 Task dependencies beyond `blocked_by`, sprints, estimates, burndown, assignees, WIP limits.
 Board-management ceremony that serves humans managing humans.
+
+---
+
+## `todos` and `todo_rev`: dormant tables
+
+Migration 011 creates them and nothing reads or writes them. They held a personal to-do list
+for the human, reachable only from the web UI, that was built on the `mb-fork` branch and taken
+out again before it reached main: it makes no agent work better, which is the test in
+`docs/vision.md`, and it would have been the one documented exception to "every mutation
+writes an event". It may come back later as an opt-in.
+
+**Why the tables stay.** 011 had already run on the stores the branch shipped to, and
+migrations are append-only: removing 011, or giving its number to something else, would leave
+those stores at version 11 and silently skip whatever took its place. Dropping the tables in a
+later migration would delete the to-do items people wrote on that branch. Empty tables cost
+nothing, and an opt-in would start from them. If the feature is ever declared dead for good,
+drop them in a new migration -- never by editing 011.
+
+## `board_denied_profiles`: a dormant table
+
+Migration 009 creates it and nothing reads or writes it. It held, per board, which Claude Code
+setups the web UI's "start a session" button could open. That button came with the `mb-fork`
+branch and was taken out again before it reached main: the web UI is for looking at what the
+agent recorded, not for running the work (`docs/http-api.md`). The table stays for the reason
+`todos` does -- 009 has already run on the stores the branch shipped to, and migrations are
+append-only. `forget_board` still clears its rows, which cost nothing and leave nothing behind
+from those stores.

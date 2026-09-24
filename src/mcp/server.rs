@@ -128,6 +128,17 @@ fn csv(s: &Option<String>) -> Option<Vec<String>> {
     s.as_ref().map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
 }
 
+/// Repo names as the agent typed them, resolved to ids on this board. `None` when the field
+/// was absent; `Some(vec![])` for `""`, which clears. An unknown name fails with the names
+/// that exist, rather than filing the task minus the repo the agent meant.
+fn repo_ids(store: &Store, project_id: i64, raw: &Option<String>) -> Result<Option<Vec<i64>>, ErrorData> {
+    match csv(raw) {
+        None => Ok(None),
+        Some(names) if names.is_empty() => Ok(Some(vec![])),
+        Some(names) => store.resolve_repos(project_id, &names).map(Some).map_err(fail),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parameters
 // ---------------------------------------------------------------------------
@@ -136,7 +147,8 @@ fn csv(s: &Option<String>) -> Option<Vec<String>> {
 pub struct BoardParams {
     /// Which board. Omit for the current project. Pass "all" for a summary of every board.
     pub project: Option<String>,
-    /// Restrict to statuses, comma separated: backlog, doing, blocked, done, archived.
+    /// Restrict to statuses, comma separated: backlog, doing, blocked, testing, done,
+    /// archived.
     /// Omit for open work only.
     pub status: Option<String>,
     /// Show more than the default. Pass "all" to lift the cap on listed tasks.
@@ -169,6 +181,11 @@ pub struct TaskAddParams {
     /// For the person's filtering: they carry no meaning you have to act on, and they are
     /// not shown on the board.
     pub tags: Option<String>,
+    /// Repos this touches, by name as the board lists them, comma separated. On a board that
+    /// tracks repos, a task without any shows "no repo set".
+    pub repos: Option<String>,
+    /// The issue in an outside tracker this task mirrors, e.g. 48213 or PROJ-123.
+    pub external_ref: Option<String>,
     pub project: Option<String>,
 }
 
@@ -176,7 +193,8 @@ pub struct TaskAddParams {
 pub struct TaskUpdateParams {
     /// The task id, as shown on the board.
     pub task: i64,
-    /// backlog, doing, blocked, done or archived.
+    /// backlog, doing, blocked, testing, done or archived. Use testing for work that is
+    /// written but not yet verified -- it stays open, so it is still there next session.
     pub status: Option<String>,
     /// Move it to another workstream. Pass "" to make it general work with no workstream.
     ///
@@ -193,6 +211,14 @@ pub struct TaskUpdateParams {
     pub blocked_by: Option<i64>,
     /// Replaces the labels, comma separated. Pass "" to clear them.
     pub tags: Option<String>,
+    /// Replaces the repos this touches, by name, comma separated. Pass "" to clear them.
+    pub repos: Option<String>,
+    /// The issue in an outside tracker this task mirrors, e.g. 48213 or PROJ-123. Pass ""
+    /// to clear it.
+    pub external_ref: Option<String>,
+    /// Move it to another board, by name as `board(project: "all")` lists them. Its history
+    /// and notes go with it; `log` says why.
+    pub move_to: Option<String>,
     /// Why this changed. This is the part worth reading in six months -- record the
     /// reasoning, not the fact that something moved.
     pub log: Option<String>,
@@ -246,6 +272,31 @@ pub struct LogParams {
     pub body: String,
     /// Attach to a task. Omit for project-level history.
     pub task: Option<i64>,
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct RepoAddParams {
+    /// The local checkout, e.g. "/Users/me/code/eee-web" or "~/code/eee-web". The directory
+    /// has to exist on this machine.
+    pub path: String,
+    /// What to call it. Defaults to the directory's name, which is usually right.
+    pub name: Option<String>,
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct RepoListParams {
+    /// Which board. Omit for the current project. Pass "all" for every repo in the store
+    /// with the board its folder opens on -- how to tell whether a checkout is already
+    /// registered somewhere else.
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct RepoRemoveParams {
+    /// The repo, by name as the board lists it, or by path.
+    pub repo: String,
     pub project: Option<String>,
 }
 
@@ -342,6 +393,7 @@ impl AiKanban {
     fn task_add(&self, Parameters(p): Parameters<TaskAddParams>) -> Result<String, ErrorData> {
         let store = self.store();
         let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
+        let repos = repo_ids(&store, resolved.project.id, &p.repos)?.unwrap_or_default();
 
         let draft = TaskDraft {
             title: p.title.clone(),
@@ -352,6 +404,9 @@ impl AiKanban {
             status: parse_enum("status", &p.status, Status::parse)?.unwrap_or_default(),
             blocked_by: p.blocked_by.filter(|b| *b > 0),
             tags: csv(&p.tags).unwrap_or_default(),
+            repos,
+            // Blank means none; core normalizes the rest, so the error can say what is valid.
+            external_ref: p.external_ref.clone(),
         };
         let task = store.create_task(resolved.project.id, draft).map_err(fail)?;
         let snap = store.board_after_mutation(resolved.project.id, task.id).map_err(fail)?;
@@ -364,6 +419,12 @@ impl AiKanban {
     fn task_update(&self, Parameters(p): Parameters<TaskUpdateParams>) -> Result<String, ErrorData> {
         let store = self.store();
         let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
+        // Resolved before anything is written, so a misspelled board fails the whole call
+        // rather than applying the edit and then refusing the move.
+        let target = match p.move_to.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(name) => Some(store.project_by_name_or_key(name).map_err(fail)?),
+            None => None,
+        };
 
         let patch = TaskPatch {
             title: p.title.clone(),
@@ -386,13 +447,27 @@ impl AiKanban {
             // Absent leaves them alone; "" clears them. Same three-way reading as
             // `workstream` above, so one shape means one thing across the whole tool.
             tags: p.tags.as_deref().map(|t| csv(&Some(t.to_string())).unwrap_or_default()),
-            log: p.log.clone(),
+            // Same three-way reading again: absent leaves them, "" clears, names replace.
+            repos: repo_ids(&store, resolved.project.id, &p.repos)?,
+            // Absent leaves it, "" clears -- core reads a blank ref as none.
+            external_ref: p.external_ref.clone().map(Some),
+            // With a move, the reason goes on the move's event instead: one reason, one
+            // entry, rather than the same sentence twice in the history.
+            log: if target.is_some() { None } else { p.log.clone() },
             // Unguarded, deliberately -- see `TaskPatch::expected_version`.
             expected_version: None,
             actor: Actor::Agent,
         };
         store.update_task(resolved.project.id, p.task, patch).map_err(fail)?;
-        let snap = store.board_after_mutation(resolved.project.id, p.task).map_err(fail)?;
+        let board = match &target {
+            Some(t) => {
+                store.move_task(resolved.project.id, p.task, t.id, Actor::Agent, p.log.as_deref(), None).map_err(fail)?;
+                t.id
+            }
+            None => resolved.project.id,
+        };
+        // The board the task is on now, so "did it land" is answered where it landed.
+        let snap = store.board_after_mutation(board, p.task).map_err(fail)?;
         Ok(render::board(&snap))
     }
 
@@ -480,6 +555,90 @@ impl AiKanban {
             None => Default::default(),
         };
         Ok(render::recall(&result, cross, &missing))
+    }
+
+
+    /// Register a local checkout on this board, so tickets can name it and so an agent
+    /// opening that folder lands here. Pass the directory; the name defaults to its own.
+    ///
+    /// Safe to call again: a checkout this board already has comes back unchanged, and one
+    /// that is already a repo on another board is attached to this board without moving
+    /// where its folder opens.
+    #[tool(name = "repo_add", annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true))]
+    fn repo_add(&self, Parameters(p): Parameters<RepoAddParams>) -> Result<String, ErrorData> {
+        let store = self.store();
+        let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
+        let pid = resolved.project.id;
+        // Read before the write, so the response can say which of the three things happened.
+        // Asking afterwards could not distinguish "created" from "was already here".
+        let before = store.repos(pid).map_err(fail)?;
+        let repo = store
+            .add_repo(pid, &crate::expand_home(p.path.trim()), p.name.as_deref(), Actor::Agent)
+            .map_err(fail)?;
+        let note = match before.iter().find(|r| r.id == repo.id) {
+            Some(_) => format!("{} was already on this board.", repo.name),
+            None if repo.home_project_id == pid => {
+                format!("{} added. Its folder now opens on this board.", repo.name)
+            }
+            // Attached, not created: saying where it opens matters most here, because it is
+            // the one case where the folder does NOT lead back to the board that just took it.
+            None => format!(
+                "{} added to this board. Its folder still opens on the board it is homed on.",
+                repo.name
+            ),
+        };
+        let menu = store.repo_summaries(pid).map_err(fail)?;
+        Ok(format!("{}\n{note}\nName it on a ticket with task_add or task_update `repos`.\n",
+            render::repo_menu(&resolved.project.name, &menu)))
+    }
+
+    /// The repos on this board -- their names, as a ticket must spell them, and the folder
+    /// each one opens. Pass project "all" to see every repo in the store instead.
+    #[tool(name = "repo_list", annotations(read_only_hint = true, idempotent_hint = true))]
+    fn repo_list(&self, Parameters(p): Parameters<RepoListParams>) -> Result<String, ErrorData> {
+        let store = self.store();
+        if p.project.as_deref().map(|s| s.eq_ignore_ascii_case(ALL)).unwrap_or(false) {
+            let homes: std::collections::HashMap<i64, String> = store
+                .all_projects().map_err(fail)?.into_iter().map(|x| (x.id, x.name)).collect();
+            let repos: Vec<(Repo, String)> = store.all_repos().map_err(fail)?.into_iter()
+                .map(|r| {
+                    let home = homes.get(&r.home_project_id).cloned().unwrap_or_default();
+                    (r, home)
+                })
+                .collect();
+            return Ok(render::repo_directory(&repos));
+        }
+        let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
+        let menu = store.repo_summaries(resolved.project.id).map_err(fail)?;
+        Ok(render::repo_menu(&resolved.project.name, &menu))
+    }
+
+    /// Take a repo off this board and off this board's tickets, when it turns out not to be
+    /// part of this work. Other boards keep it; if this board was its home and others have
+    /// it, the folder starts opening on the earliest of those instead.
+    ///
+    /// Nothing is deleted except the link -- the tickets, notes and history stay.
+    #[tool(name = "repo_remove", annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false))]
+    fn repo_remove(&self, Parameters(p): Parameters<RepoRemoveParams>) -> Result<String, ErrorData> {
+        let store = self.store();
+        let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
+        let pid = resolved.project.id;
+        // Through the same resolver `task_add`'s `repos` uses, so one spelling works on both
+        // and an unknown one fails with the names that exist.
+        let ids = store.resolve_repos(pid, std::slice::from_ref(&p.repo)).map_err(fail)?;
+        let Some(&id) = ids.first() else {
+            return Err(fail(Error::InvalidValue {
+                field: "repo",
+                value: p.repo.clone(),
+                valid: "a repo on this board -- repo_list shows them".into(),
+            }));
+        };
+        let name = store.repo(pid, id).map_err(fail)?.name;
+        let unlinked = store.remove_repo(pid, id, Actor::Agent).map_err(fail)?;
+        let menu = store.repo_summaries(pid).map_err(fail)?;
+        Ok(format!("{}\n{name} removed from this board, off {unlinked} ticket{}.\n",
+            render::repo_menu(&resolved.project.name, &menu),
+            if unlinked == 1 { "" } else { "s" }))
     }
 
     /// Record what happened or what was decided. Use it for decisions and session summaries

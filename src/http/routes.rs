@@ -123,7 +123,7 @@ fn etag(version: i64) -> [(header::HeaderName, String); 1] {
 ///
 /// The design law applied to the second consumer: a page that hardcodes
 /// `["backlog","doing","blocked"]` needs internal knowledge of the schema and drifts silently
-/// the day a status is added. Values arrive in display order (`Status::board_rank`,
+/// the day a status is added. Values arrive in display order (`Status::column_rank`,
 /// `Priority::rank`) so the client renders columns left to right without knowing the rule.
 ///
 /// Carries no cursor on purpose -- this document is cacheable for the life of the process,
@@ -132,7 +132,7 @@ fn etag(version: i64) -> [(header::HeaderName, String); 1] {
 pub async fn meta(State(api): State<Api>) -> ApiResult<Json<serde_json::Value>> {
     let store = api.store();
     let mut statuses: Vec<Status> = Status::ALL.to_vec();
-    statuses.sort_by_key(|s| s.board_rank());
+    statuses.sort_by_key(|s| s.column_rank());
     let mut priorities: Vec<Priority> = Priority::ALL.to_vec();
     priorities.sort_by_key(|p| p.rank());
 
@@ -146,6 +146,13 @@ pub async fn meta(State(api): State<Api>) -> ApiResult<Json<serde_json::Value>> 
         "priorities": priorities.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
         "types": TaskType::ALL.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
         "actors": Actor::ALL.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+        // Where an external ref links to: a template whose `{ref}` the UI fills in, e.g.
+        // `https://frs.plan.io/issues/{ref}` or `https://acme.atlassian.net/browse/{ref}`.
+        // A setting rather than a constant: the store knows refs, not which tracker they
+        // are in. Unset, the UI shows the ref without a link.
+        "ref_url": std::env::var("AI_KANBAN_REF_URL").ok()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty()),
     })))
 }
 
@@ -206,8 +213,9 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
     let ws = current.as_ref().map(|w| w.id);
 
     let counts = store.status_counts_in(project.id, ws)?;
+    // Column order, not the agent's `board_rank` -- see `Status::column_rank`.
     let mut statuses: Vec<Status> = Status::ALL.to_vec();
-    statuses.sort_by_key(|s| s.board_rank());
+    statuses.sort_by_key(|s| s.column_rank());
 
     let mut columns = Vec::new();
     // Kept alongside the JSON so the blocker lookup below is one query for the whole board
@@ -228,6 +236,8 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
     // fixing one and not the other is how the two views start disagreeing.
     let blockers = store.blocker_status(project.id, &listed)?;
     let tags = store.tags_for(project.id, &listed)?;
+    let links = store.links_for(project.id, &listed)?;
+    let repos = store.repo_summaries(project.id)?;
     let cursor = store.change_cursor()?;
     tx.commit()?;
 
@@ -245,6 +255,12 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
         // actually have tags appear here.
         "task_tags": tags.iter().map(|(id, t)| (id.to_string(), json!(t)))
             .collect::<serde_json::Map<String, serde_json::Value>>(),
+        // Same shape and the same reason as `task_tags`: neither the repo links nor
+        // `external_ref` is in `TASK_COLS` (migrations 007, 012).
+        "task_links": links_json(&links),
+        // Every repo on the board, so the cards, the pickers and the repos menu all come
+        // from this one read.
+        "repos": repos,
         // Both halves are needed by the UI: `workstream` is what the board is scoped to and
         // what a new task will join, `workstreams` is everything selectable. Sent even when
         // nothing is scoped, so the control can offer the list without a second request.
@@ -352,11 +368,13 @@ pub async fn tasks(
     // Appended pages need their tags too, or an expanded column shows labels on the first
     // 50 cards and none after -- which reads as "those tasks have no tags".
     let tags = store.tags_for(project.id, &page.items)?;
+    let links = store.links_for(project.id, &page.items)?;
     Ok(Json(json!({
         "now": crate::core::now(),
         "tasks": page.items,
         "task_tags": tags.iter().map(|(id, t)| (id.to_string(), json!(t)))
             .collect::<serde_json::Map<String, serde_json::Value>>(),
+        "task_links": links_json(&links),
         "next": page.next.map(encode_cursor),
     })))
 }
@@ -373,10 +391,13 @@ pub async fn task(
         "task": detail.task,
         // Same reason as `workstream` below: out of `TASK_COLS`, so no `Task` carries it.
         "tags": detail.tags,
+        "repos": detail.repos,
+        "external_ref": detail.external_ref,
         "blocker": detail.blocker,
         "blocking": detail.blocking,
         "notes": detail.notes,
         "events": detail.events,
+        // Which "open in …" buttons the panel shows.
         "project": detail.project,
         // Looked up rather than read off the task: `workstream_id` is kept out of
         // `TASK_COLS` (see migration 005), so no `Task` carries it. The panel needs the
@@ -400,6 +421,13 @@ pub struct TaskBody {
     pub blocked_by: Option<Option<i64>>,
     /// Freeform labels. Replaces the whole set on update; omitted leaves it alone.
     pub tags: Option<Vec<String>>,
+    /// Repo ids on this board. Replaces the whole set on update; `[]` clears; omitted leaves
+    /// it alone.
+    pub repos: Option<Vec<i64>>,
+    /// The issue in an outside tracker. `""` clears it on update -- the same spelling the
+    /// agent uses, because a JSON `null` in an optional field reads as "absent" once
+    /// deserialized.
+    pub external_ref: Option<String>,
     /// The *why*. Recorded as the event body -- the field that makes history worth reading.
     pub log: Option<String>,
     /// Which **existing** workstream this task joins, by name. Omitted means "inherit the
@@ -435,6 +463,8 @@ pub async fn create_task(
         origin: Origin::User,
         blocked_by: b.blocked_by.flatten(),
         tags: b.tags.clone().unwrap_or_default(),
+        repos: b.repos.clone().unwrap_or_default(),
+        external_ref: b.external_ref.clone(),
     };
     let task = match b.workstream.as_ref().map(|w| w.trim()) {
         // Absent: inherit whatever the board is scoped to, exactly as `task_add` does.
@@ -475,6 +505,8 @@ pub async fn update_task(
         blocked_by: b.blocked_by,
         workstream,
         tags: b.tags.clone(),
+        repos: b.repos.clone(),
+        external_ref: b.external_ref.clone().map(Some),
         log: b.log.clone(),
         actor: Actor::User,
         expected_version: Some(expected),
@@ -493,6 +525,135 @@ pub async fn forget_task(
     let project = resolve(&store, &p)?;
     store.forget_task(project.id, t)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// All Projects
+//
+// The person's view across every board. The agent's cross-board view stays a per-board
+// summary (`board(project: "all")`): for a reader paying per token, every open task across
+// every project is a pile, not a board. A person scanning columns is not paying per token,
+// and asked for exactly this.
+// ---------------------------------------------------------------------------
+
+type Extras = (Vec<(i64, Status)>, Vec<(i64, Vec<String>)>, Vec<TaskLinks>);
+
+/// Blocker statuses, tags and links for tasks from any number of boards. Every one of those
+/// lookups is scoped to a board -- the store is global, and a bare id can name another board's
+/// row -- so the rows are grouped by the board they are on and each group asked separately.
+fn extras_across(store: &Store, tasks: &[Task]) -> Result<Extras, Error> {
+    let mut by_board: std::collections::BTreeMap<i64, Vec<Task>> = std::collections::BTreeMap::new();
+    for t in tasks {
+        by_board.entry(t.project_id).or_default().push(t.clone());
+    }
+    let (mut blockers, mut tags, mut links) = (Vec::new(), Vec::new(), Vec::new());
+    for (pid, rows) in &by_board {
+        blockers.extend(store.blocker_status(*pid, rows)?);
+        tags.extend(store.tags_for(*pid, rows)?);
+        links.extend(store.links_for(*pid, rows)?);
+    }
+    Ok((blockers, tags, links))
+}
+
+fn tags_json(tags: &[(i64, Vec<String>)]) -> serde_json::Map<String, serde_json::Value> {
+    tags.iter().map(|(id, t)| (id.to_string(), json!(t))).collect()
+}
+
+/// Every board's tickets in one set of columns. Same shape as `/board`, plus `projects` so a
+/// card can name its board, and no workstream -- that is a slice of ONE board.
+pub async fn all_board(State(api): State<Api>) -> ApiResult<Json<serde_json::Value>> {
+    let store = api.store();
+    // One read transaction, for the reason `/board` takes one.
+    let tx = store.conn.unchecked_transaction()?;
+    let counts = store.status_counts_all()?;
+    let mut statuses: Vec<Status> = Status::ALL.to_vec();
+    statuses.sort_by_key(|s| s.column_rank());
+
+    let mut columns = Vec::new();
+    let mut listed: Vec<Task> = Vec::new();
+    for s in statuses {
+        let page = store.tasks_page_all(&[s], None, PAGE)?;
+        listed.extend(page.items.iter().cloned());
+        columns.push(json!({
+            "status": s.as_str(),
+            "total": counts.iter().find(|(k, _)| *k == s).map(|(_, n)| *n).unwrap_or(0),
+            "tasks": page.items,
+            "next": page.next.map(encode_cursor),
+        }));
+    }
+    let (blockers, tags, links) = extras_across(&store, &listed)?;
+    let projects = store.all_projects()?;
+    // Which boards track repos, so a card can say "no repo set" by its OWN board's rule.
+    let mut with_repos = Vec::new();
+    for p in &projects {
+        if store.repo_count(p.id)? > 0 {
+            with_repos.push(p.id);
+        }
+    }
+    let cursor = store.change_cursor()?;
+    tx.commit()?;
+
+    Ok(Json(json!({
+        "now": crate::core::now(),
+        "cursor": cursor,
+        "all": true,
+        "projects": projects,
+        "boards_with_repos": with_repos,
+        "counts": counts.iter().map(|(s, n)| json!({ "status": s.as_str(), "count": n })).collect::<Vec<_>>(),
+        "columns": columns,
+        "blocker_status": blockers.iter()
+            .map(|(id, s)| json!({ "id": id, "status": s.as_str() }))
+            .collect::<Vec<_>>(),
+        "task_tags": tags_json(&tags),
+        "task_links": links_json(&links),
+    })))
+}
+
+/// A further page of one All Projects column.
+pub async fn all_tasks(
+    State(api): State<Api>, Query(q): Query<PageParams>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let store = api.store();
+    let page = store.tasks_page_all(
+        &parse_status_list(&q.status)?,
+        decode_cursor(&q.cursor)?,
+        q.limit.unwrap_or(PAGE).min(200),
+    )?;
+    let (_, tags, links) = extras_across(&store, &page.items)?;
+    Ok(Json(json!({
+        "now": crate::core::now(),
+        "tasks": page.items,
+        "task_tags": tags_json(&tags),
+        "task_links": links_json(&links),
+        "next": page.next.map(encode_cursor),
+    })))
+}
+
+/// Task links keyed by task id, like `task_tags`. Only tasks with a repo or an external ref appear.
+fn links_json(links: &[TaskLinks]) -> serde_json::Map<String, serde_json::Value> {
+    links.iter()
+        .map(|l| (l.task_id.to_string(), json!({ "repos": l.repos, "external_ref": l.external_ref })))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Repos
+//
+// No `If-Match` on these writes, unlike tasks and notes. The guard exists for a form held
+// open while an agent overwrites the same row, and a repo has no such row: an agent can now
+// register and remove repos (`repo_add`, `repo_remove`), but neither edits a field this form
+// owns. A rename is still only from here, and a repo removed underneath an open form fails
+// the rename outright rather than losing what was typed into it.
+// ---------------------------------------------------------------------------
+
+/// The repos menu: every repo on the board, with how many tickets touch it.
+pub async fn repos(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<Json<serde_json::Value>> {
+    let store = api.store();
+    let project = resolve(&store, &p)?;
+    Ok(Json(json!({
+        "now": crate::core::now(),
+        "repos": store.repo_summaries(project.id)?,
+    })))
 }
 
 // ---------------------------------------------------------------------------

@@ -17,3 +17,17 @@ pub mod hook;
 pub mod http;
 pub mod mcp;
 pub mod render;
+
+/// `~/...` expanded against the home directory.
+///
+/// Above core and shared by every adapter rather than living in one of them: a path typed
+/// into the web form, handed to an MCP tool by an agent, or quoted on a command line can all
+/// carry a `~` nothing has expanded yet, while core takes real paths. One implementation, so
+/// the three surfaces cannot disagree about what `~` means.
+pub fn expand_home(raw: &str) -> std::path::PathBuf {
+    let rest = if raw == "~" { Some("") } else { raw.strip_prefix("~/") };
+    match (rest, dirs::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => raw.into(),
+    }
+}

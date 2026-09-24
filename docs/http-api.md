@@ -10,6 +10,14 @@ Everything it depended on landed first: schema migrations (#9), the row-version 
 guard (#10), delete semantics (#11), project resolution over HTTP (#12) and the rule that
 every mutation writes an event (#13).
 
+**What the page is for.** The board is the agent's. The page exists so the person can see what
+the agent recorded and correct it: read the board, search, edit or forget a task or note, file
+a task. It is not a place to run the work from. Creating, sharing and destroying boards and
+repos, moving tickets and starting sessions are the agent's tools or `ai-kanban board|repo` in
+a terminal. `tests/http_api.rs` (`the_web_api_cannot_run_the_work`) asserts those routes do
+not exist, so one added back fails there. The `mb-fork` branch built them all into the page;
+they were taken out again for this reason.
+
 ## What makes this consumer different
 
 Every difference below follows from one fact: **the human is a second writer, and the server
@@ -96,6 +104,9 @@ POST   /api/projects/{p}/notes                -> 201, Note
 GET    /api/projects/{p}/notes/{n}            ETag
 PATCH  /api/projects/{p}/notes/{n}            If-Match required
 GET    /api/projects/{p}/events               ?cursor= &limit=   the history
+GET    /api/projects/{p}/repos                the repos list: repos + ticket counts (read-only)
+GET    /api/all/board                         All Projects: every board's tickets, one set of columns
+GET    /api/all/tasks                         ?status= &cursor= -- paging an All Projects column
 GET    /api/recall                            ?q= &project= &limit=
 GET    /api/stream                            SSE, live updates
 ```
@@ -105,7 +116,12 @@ GET    /api/stream                            SSE, live updates
 ### `/api/meta` — so the UI never hardcodes an enum
 
 Returns the statuses, task types, priorities and actors, each with its display order
-(`Status::board_rank`, `Priority::rank`, both of which already exist on the types).
+(`Status::column_rank`, `Priority::rank`).
+
+The web board's columns run backlog, blocked, doing, done, archived — doing in the middle.
+That is `column_rank`, deliberately not the agent's `board_rank`, which lists in-flight work
+first because it decides which rows survive a capped text board. A person sees every column
+at once, so the column order is free to follow how they read the board.
 
 This is the design law applied to consumer #2. A web UI that hardcodes
 `["backlog","doing","blocked"]` needs internal knowledge of the schema, and drifts silently
@@ -132,8 +148,8 @@ tell that client whether what it is showing has gone stale.
   // An ARRAY, already in column order -- the client renders left to right without knowing
   // the ordering rule. `total` is every task in that status; `tasks` is the first page.
   "columns": [
-    { "status": "doing",   "total": 2,  "tasks": [ ... ], "next": null },
-    { "status": "backlog", "total": 75, "tasks": [ ... ], "next": "1756399000:31" }
+    { "status": "backlog", "total": 75, "tasks": [ ... ], "next": "1756399000:31" },
+    { "status": "doing",   "total": 2,  "tasks": [ ... ], "next": null }
   ],
   "workstream":  { ... },        // what the board is scoped to, or null
   "workstreams": [ ... ],        // everything selectable
@@ -277,7 +293,27 @@ matching by text would be a guess, and a wrong guess deletes another entity's hi
 after forgetting something that genuinely must not persist, search `recall` for it — the
 operation is precise, not exhaustive.
 
-Core: `Store::forget_task` / `Store::forget_note`, `src/core/forget.rs`.
+```
+ai-kanban board forget <board> [--yes]    a whole board
+ai-kanban repo forget <repo> [--yes]      a repo, off every board and ticket
+```
+
+Not HTTP routes: forgetting a whole board or repo is rare and deliberate, so it is a terminal
+command, like `merge`. Without `--yes` either one prints what it would delete and exits
+non-zero.
+
+Forgetting a **board** deletes its tasks, notes, workstreams, history and path aliases, so the
+next session opened in one of its folders starts a fresh board. Repos it was home to pass to
+the earliest other board sharing them; repos only it had go. With no board left to hold a
+tombstone, it advances the events sequence instead, which `change_cursor` reads alongside
+`MAX(events.id)` — otherwise the delete would be invisible to every live page.
+
+Forgetting a **repo** differs from `ai-kanban repo rm` (off one board): it
+leaves the store, off every board and every ticket. Its folder's path aliases stay, because
+they belong to a board whose history is still there. The tombstone is `repo #3`, on each
+board that had it.
+
+Core: `Store::forget_task` / `forget_note` / `forget_repo` / `forget_board`, `src/core/forget.rs`.
 
 ### Errors
 
@@ -448,6 +484,47 @@ that unscoped queries never name the column at all (see `docs/data-model.md`; as
 `TASK_COLS` alone was enough is what shipped a bug). So surfacing it per card needs a separate
 lookup, as `GET /tasks/{t}` already does, rather than a wider column list. Worth doing; not
 worth reopening that decision for.
+
+## Repos
+
+Migration 007 (see `docs/data-model.md`). A board owns the local checkouts its tickets live
+in. They are registered by the agent (`repo_add`) or in a terminal (`ai-kanban repo add <path>
+[--board <b>]`), never from the page. The page's **repos** button only lists them: path, home
+board, the other boards sharing them, and ticket counts.
+
+Everything that changes a repo lives in `ai-kanban repo`: `add`, `rm`, `rename`, `home <repo>
+<board>` (its folder, and every subdirectory the old home had learned, opens on that board from
+now on) and `forget`. A path that is already a repo on another board is **shared**: attached,
+home unchanged. A new checkout in a directory another board already claims is refused, naming
+that board, because the repair is `ai-kanban merge`.
+
+On tasks, naming repos is a field edit like tags, so the page may correct it: `POST`/`PATCH
+/tasks` take `repos` (ids of this board's repos; `[]` clears) and `external_ref` (`""` clears —
+a JSON `null` in an optional field deserializes as "absent", so it cannot mean "clear"). `GET
+/tasks/{t}` returns `repos`, with paths, and `external_ref`. `GET /board` and `GET /tasks` return
+`task_links` keyed by task id like `task_tags` — `{"repos": ["eee-web"], "external_ref": "48213"}` —
+and `/board` also returns `repos`, every repo with `open` and `total` ticket counts, so the
+cards, the pickers and the list all come from one read.
+
+`/api/meta` carries `ref_url` from `AI_KANBAN_REF_URL`, a template such as
+`https://frs.plan.io/issues/{ref}`, and the page links each ref by replacing `{ref}` (or
+appending it, when the template has none). A setting rather than a constant: the store knows
+refs, not which tracker they are in. Unset, refs show without a link.
+
+## Boards by name and All Projects
+
+`ai-kanban board add <name>` creates a board for a project that is not one folder (key
+`board:<name>`); a name another board has is refused. Agents reach such a board through the
+repos it is home to. A ticket on the wrong board is moved by the agent, `task_update(move_to:
+...)`, which keeps its id, history and notes.
+
+`GET /api/all/board` is the **All Projects** view, where the page opens: every board's tickets
+in one set of columns, the same shape as `/board` plus `projects` (so a card can name its
+board) and `boards_with_repos` (so "no repo set" follows each card's own board). No workstream
+— that is a slice of one board. `GET /api/all/tasks` pages its columns. This is the person's
+view only: the agent's cross-board view stays `board(project: "all")`, a per-board summary,
+because for a reader paying per token every open task across every project is a pile, not a
+board.
 
 ## Explicitly not in v1
 

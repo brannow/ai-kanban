@@ -6,6 +6,7 @@
 //! resolver does.
 
 use ai_kanban::core::project::{normalize_remote, Resolution};
+use ai_kanban::core::model::Actor;
 use ai_kanban::core::{Error, Store};
 use std::fs;
 use std::path::Path;
@@ -515,4 +516,48 @@ fn a_worktree_honours_a_marker_that_exists_only_in_the_main_checkout() {
 
     assert_eq!(in_main.project.key, "monorepo/api");
     assert_eq!(in_wt.project.id, in_main.project.id);
+}
+
+#[test]
+fn a_worktree_of_a_repo_on_a_named_board_lands_on_that_board() {
+    // A registered repo resolves through its path alias on the named board. A worktree
+    // must follow it there rather than keying on its own directory and starting a board.
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("api");
+    let wt = tmp.path().join("api-feature");
+    fs::create_dir_all(&main).unwrap();
+    fake_repo(&main, None);
+    fake_worktree(&main, &wt, "api-feature");
+    let s = store();
+    let board = s.create_board("BMUKN").unwrap();
+    s.add_repo(board.id, &main, None, Actor::User).unwrap();
+    let boards = s.all_projects().unwrap().len();
+
+    let w = s.resolve_project(&wt).unwrap();
+
+    assert_eq!(w.project.id, board.id, "worktree must land on the repo's board");
+    assert!(!w.created);
+    assert_eq!(s.all_projects().unwrap().len(), boards, "a worktree created a board");
+}
+
+#[test]
+fn a_worktree_of_a_shared_repo_lands_on_its_home_board() {
+    // A shared repo is on two boards but opens on one, its home. Its worktree has to agree,
+    // or the same checkout reads a different memory depending on which directory it is in.
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("lib");
+    let wt = tmp.path().join("lib-feature");
+    fs::create_dir_all(&main).unwrap();
+    fake_repo(&main, None);
+    fake_worktree(&main, &wt, "lib-feature");
+    let s = store();
+    let home = s.create_board("OTHER").unwrap();
+    let guest = s.create_board("BMUKN").unwrap();
+    s.add_repo(home.id, &main, None, Actor::User).unwrap();
+    s.add_repo(guest.id, &main, None, Actor::User).unwrap();
+
+    let w = s.resolve_project(&wt).unwrap();
+
+    assert_eq!(w.project.id, home.id, "worktree must land on the home board");
+    assert!(!w.created);
 }

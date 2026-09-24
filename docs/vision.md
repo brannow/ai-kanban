@@ -65,7 +65,8 @@ ecosystems, to solve "remember what happened last week".
 - **Not a platform, not an ecosystem.** No orchestration layer, no per-task runtime, no
   scheduler, no daemon.
 - **Not a Jira clone.** No sprints, estimates, burndown, assignees, WIP limits, or workflow
-  states beyond the five that carry meaning. Board-management ceremony serves humans managing
+  states beyond the ones that carry meaning — a status earns its place by changing what an
+  agent does, never by labelling a stage. Board-management ceremony serves humans managing
   humans.
 - **Not a team planning tool.** One person and their agents.
 - **Not a chat log.** Events record what happened and why, not a transcript.
