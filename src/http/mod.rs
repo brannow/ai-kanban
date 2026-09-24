@@ -16,7 +16,9 @@ pub mod routes;
 pub mod stream;
 
 use crate::core::{Error, Store};
-use axum::http::StatusCode;
+use axum::extract::Request;
+use axum::http::{header, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, put};
 use axum::{Json, Router};
@@ -63,6 +65,9 @@ pub fn router(api: Api) -> Router {
         .route("/api/projects/{p}/events", get(routes::events))
         .route("/api/recall", get(routes::recall))
         .route("/api/stream", get(stream::sse))
+        // Last on purpose: a layer wraps only the routes added before it, so a route added
+        // below this line would skip the check.
+        .layer(axum::middleware::from_fn(same_site_only))
         .with_state(api)
 }
 
@@ -155,6 +160,64 @@ impl IntoResponse for ApiError {
         }
         (status, Json(serde_json::json!({ "error": body }))).into_response()
     }
+}
+
+/// Whether a `Host` header names this machine's loopback: `127.0.0.1`, `localhost` or `[::1]`,
+/// with or without a port. Anything else -- `localhost.evil.example`, `127.0.0.1.nip.io` -- is
+/// a name that merely resolves here, which is exactly what DNS rebinding produces.
+pub fn loopback_host(host: &str) -> bool {
+    let (name, rest) = match host.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((name, rest)) => (name, rest),
+            None => return false,
+        },
+        None => match host.find(':') {
+            Some(i) => (&host[..i], &host[i..]),
+            None => (host, ""),
+        },
+    };
+    let port_ok = rest.is_empty()
+        || rest.strip_prefix(':').is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    port_ok && (name == "127.0.0.1" || name == "::1" || name.eq_ignore_ascii_case("localhost"))
+}
+
+/// Refuses any request a web page other than this one could have sent. Binding `127.0.0.1`
+/// keeps the network out, but not the person's own browser: every page they have open can
+/// make requests to this port.
+///
+/// * **`Host`, on every request, reads included.** A DNS-rebinding page points its own
+///   hostname at 127.0.0.1, and the browser then treats this server as that page's origin --
+///   it can READ every response, the person's whole memory store included. What it cannot
+///   change is the `Host` header, which still carries its hostname. A request with no `Host`
+///   is let through: browsers always send one, so only a local program omits it, and a local
+///   program could open the SQLite file directly anyway.
+/// * **`Origin`, on writes.** An ordinary cross-site form post or `fetch` carries the other
+///   site's `Origin`. Most writes here would already fail its CORS preflight, but that rests
+///   on every route happening to need one; this does not. A write with no `Origin` is again
+///   a local program.
+async fn same_site_only(req: Request, next: Next) -> Response {
+    let host = match req.headers().get(header::HOST).map(|v| v.to_str()) {
+        None => None,
+        Some(Ok(h)) if loopback_host(h) => Some(h.to_string()),
+        Some(_) => return forbidden("this server only answers requests addressed to 127.0.0.1 or localhost"),
+    };
+    if !matches!(*req.method(), Method::GET | Method::HEAD) {
+        if let Some(origin) = req.headers().get(header::ORIGIN) {
+            let same = match (origin.to_str(), &host) {
+                (Ok(o), Some(h)) => o == format!("http://{h}"),
+                _ => false,
+            };
+            if !same {
+                return forbidden("writes are only accepted from this server's own page");
+            }
+        }
+    }
+    next.run(req).await
+}
+
+fn forbidden(message: &str) -> Response {
+    let body = serde_json::json!({ "error": { "code": "forbidden", "message": message } });
+    (StatusCode::FORBIDDEN, Json(body)).into_response()
 }
 
 pub type ApiResult<T> = std::result::Result<T, ApiError>;

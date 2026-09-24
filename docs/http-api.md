@@ -71,6 +71,23 @@ The store is global: every project the user has ever opened, and every note abou
 There is no auth, so there must be no remote surface. Written down as a decision so it is not
 later "improved" into `0.0.0.0` by someone who reads the bind address as an oversight.
 
+**6. Refuse any request another web page could have sent (#453).**
+Binding loopback keeps the network out but not the person's own browser: every page they have
+open can make requests to this port. `same_site_only` in `src/http/mod.rs`, one layer over the
+whole router, so a route added later is covered without anyone remembering to:
+
+- `Host` must be `127.0.0.1`, `localhost` or `[::1]` (any port) on **every** request, reads and
+  the live stream included. DNS rebinding makes this server the attacker page's own origin, so
+  the browser lets it *read* responses -- the whole store, across every project on the machine.
+  The one thing that page cannot change is `Host`, which still carries its hostname.
+- `Origin`, when sent, must be `http://<that host>` on anything but `GET`/`HEAD`. That stops the
+  ordinary cross-site form post or `fetch`, without relying on every route happening to need a
+  CORS preflight.
+- A request with neither header passes. Browsers always send `Host`, so only a local program
+  omits it, and a local program can open the SQLite file directly anyway.
+
+`tests/http_api.rs` covers the rebinding read, the cross-site write and the page's own requests.
+
 ## Resources
 
 ```
