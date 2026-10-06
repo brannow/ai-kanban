@@ -25,6 +25,14 @@ use rusqlite::params;
 /// mutation response -- but not unboundedly more.
 pub const DEFAULT_LIMIT: usize = 10;
 
+/// Cap when whole texts are asked for. One session hand-off runs to several hundred
+/// tokens, so ten of them would cost more than the board itself; the agent asking for the
+/// full text usually wants the newest one or two, and the omitted count says if there is more.
+pub const FULL_LIMIT: usize = 3;
+/// Ceiling on an explicit limit in full mode. The body is what the agent asked to pay for,
+/// but an unbounded body count is a call that can silently cost tens of thousands of tokens.
+pub const FULL_MAX: usize = 10;
+
 /// Turns whatever the agent typed into a valid FTS5 query.
 ///
 /// This exists because FTS5's MATCH syntax is a query language, not a string: `auth-loop`
@@ -33,19 +41,33 @@ pub const DEFAULT_LIMIT: usize = 10;
 /// error -- and the agent would have to learn FTS5 syntax to avoid it, which is exactly the
 /// "needs knowledge of the system's internals" failure the design law forbids.
 ///
-/// Every token is quoted, which makes it a literal, and terms are ANDed together.
+/// Every term is quoted, which makes it a literal, and terms are ANDed together.
+///
+/// A word glued together by punctuation -- `hand-off`, `go-live`, `2026-10-06`,
+/// `src/render.rs` -- stays one term, as an FTS5 phrase of its parts. Split into loose words
+/// instead, `hand-off` matched any text holding "hand" and "off" anywhere, and those hits
+/// crowded out the hand-offs themselves. The tokenizer stores the parts adjacently, so the
+/// phrase finds exactly the glued word.
 ///
 /// Bare FTS5 operator keywords are dropped rather than quoted. An agent typing
 /// "middleware AND auth" means the boolean, not a document containing the word "and" --
 /// and since every term is ANDed regardless, treating them as noise is both closer to the
-/// intent and impossible to get wrong.
+/// intent and impossible to get wrong. Inside a glued word they are ordinary words
+/// (`rock-and-roll`), and a quoted phrase is a literal anyway.
 pub fn fts_query(input: &str) -> Option<String> {
     const OPERATORS: [&str; 4] = ["AND", "OR", "NOT", "NEAR"];
     let terms: Vec<String> = input
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|t| !t.is_empty())
-        .filter(|t| !OPERATORS.contains(&t.to_uppercase().as_str()))
-        .map(|t| format!("\"{}\"", t.replace('"', "")))
+        .split_whitespace()
+        .map(|word| word
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>())
+        .filter(|parts| match parts.as_slice() {
+            [] => false,
+            [one] => !OPERATORS.contains(&one.to_uppercase().as_str()),
+            _ => true,
+        })
+        .map(|parts| format!("\"{}\"", parts.join(" ")))
         .collect();
     if terms.is_empty() { None } else { Some(terms.join(" AND ")) }
 }
@@ -145,7 +167,7 @@ impl Store {
             Ok(RecallHit {
                 kind: HitKind::Note,
                 id: r.get(0)?, task_id: r.get(6)?, project: r.get(1)?, title: r.get(2)?,
-                snippet: r.get(3)?, ts: r.get(4)?, score: r.get(5)?, status: None,
+                snippet: r.get(3)?, ts: r.get(4)?, score: r.get(5)?, status: None, body: None,
             })
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -166,7 +188,7 @@ impl Store {
             Ok(RecallHit {
                 kind: HitKind::Task,
                 id: r.get(0)?, task_id: Some(r.get(0)?), project: r.get(1)?, title: r.get(2)?,
-                snippet: r.get(3)?, ts: r.get(4)?, score: r.get(5)?, status: Some(r.get(6)?),
+                snippet: r.get(3)?, ts: r.get(4)?, score: r.get(5)?, status: Some(r.get(6)?), body: None,
             })
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -207,10 +229,28 @@ impl Store {
                 task_id,
                 project: r.get(1)?,
                 title: if title.is_empty() { "project log".into() } else { title },
-                snippet: r.get(3)?, ts: r.get(4)?, score: r.get(5)?, status: None,
+                snippet: r.get(3)?, ts: r.get(4)?, score: r.get(5)?, status: None, body: None,
             })
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Loads the whole text of every hit -- recall's `full` mode.
+    ///
+    /// A second step after the search, not a flag on it: it touches only the hits that
+    /// survived the cap, and the search stays one code path. Looking rows up by bare id is
+    /// safe here, unlike the general rule, because the ids are the search's own output and
+    /// the search already applied the project scope.
+    pub fn fill_bodies(&self, r: &mut RecallResult) -> Result<()> {
+        for h in &mut r.hits {
+            let sql = match h.kind {
+                HitKind::Note => "SELECT body FROM notes WHERE id = ?1",
+                HitKind::Task => "SELECT body FROM tasks WHERE id = ?1",
+                HitKind::Event => "SELECT body FROM events WHERE id = ?1",
+            };
+            h.body = Some(self.conn.query_row(sql, params![h.id], |row| row.get(0))?);
+        }
+        Ok(())
     }
 
     /// Feeds the empty-result case, so "nothing found" can still be useful.

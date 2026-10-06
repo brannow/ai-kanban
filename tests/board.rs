@@ -448,3 +448,24 @@ fn testing_work_outranks_the_backlog_an_agent_has_not_started() {
     let b = s.board(pid, &BoardQuery::board()).unwrap();
     assert_eq!(b.tasks[0].id, verify.id, "the closest thing to finished comes first");
 }
+
+#[test]
+fn a_resumed_task_shows_its_reasons_whole() {
+    // task_show promises full history. Its history went through the board's one-line
+    // renderer, so a logged decision came back as its first 55 characters.
+    let s = Store::open_in_memory().unwrap();
+    let dir = std::env::temp_dir().join("aik-board-reasons");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pid = s.resolve_project(&dir).unwrap().project.id;
+    let t = s.create_task(pid, TaskDraft::new("the decision task")).unwrap();
+    let decision = "USER DECISION: option (c), delete all 89 orphans via a migration patch, \
+                    because moving them would duplicate visible text";
+    s.update_task(pid, t.id, TaskPatch {
+        status: Some(Status::Doing), log: Some(decision.into()), ..Default::default()
+    }).unwrap();
+    s.log_on(pid, Some(t.id), Actor::Agent, "verified:\nfirst line\n\nsecond paragraph").unwrap();
+
+    let text = ai_kanban::render::task_detail(&s.task_detail(pid, t.id).unwrap());
+    assert!(text.contains(decision), "{text}");
+    assert!(text.contains("verified:\n       first line\n\n       second paragraph"), "{text}");
+}

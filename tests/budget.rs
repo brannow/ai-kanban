@@ -13,7 +13,7 @@
 
 use ai_kanban::core::model::*;
 use ai_kanban::core::note::NoteDraft;
-use ai_kanban::core::recall::{RecallQuery, DEFAULT_LIMIT};
+use ai_kanban::core::recall::{RecallQuery, DEFAULT_LIMIT, FULL_LIMIT};
 use ai_kanban::core::task::{TaskDraft, TaskPatch};
 use ai_kanban::core::Store;
 use ai_kanban::render;
@@ -227,4 +227,24 @@ fn the_repo_menu_stays_affordable_on_a_board_with_many_checkouts() {
     // order-of-magnitude regression, not this number.
     assert!(tokens(&text) < 750, "repo_list cost {} tokens", tokens(&text));
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn full_recall_costs_the_bodies_and_little_else() {
+    // Full mode is the one read whose cost the agent chooses: it asked for whole texts, so
+    // the bodies are the price. What must stay bounded is everything around them, and the
+    // number of bodies -- one hand-off is several hundred tokens.
+    let (s, pid) = year_old_project();
+    let handoff = "SESSION HAND-OFF: worked through the triage list, every ticket verified. ".repeat(25);
+    for _ in 0..5 { s.log(pid, Actor::Agent, &handoff).unwrap(); }
+
+    let mut r = s.recall(&RecallQuery { text: "session hand-off", project_id: Some(pid), limit: FULL_LIMIT }).unwrap();
+    s.fill_bodies(&mut r).unwrap();
+    let text = render::recall(&r, false, &Default::default());
+    let bodies: usize = r.hits.iter().map(|h| tokens(h.body.as_deref().unwrap_or(""))).sum();
+    eprintln!("\n=== recall full ({} hits) -- ~{} tokens, ~{} of them bodies ===", r.hits.len(), tokens(&text), bodies);
+
+    assert_eq!(r.hits.len(), FULL_LIMIT);
+    assert!(r.omitted > 0, "the hand-offs left out must be reported");
+    assert!(tokens(&text) - bodies < 120, "full recall overhead {} tokens", tokens(&text) - bodies);
 }

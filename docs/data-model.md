@@ -376,7 +376,7 @@ re-tagging every note ever written. Cheap now, expensive later.
 External-content tables (`content='notes'`) with triggers, so bodies are not stored twice.
 `bundled` rusqlite ships FTS5 enabled — verified, not assumed, since it is a compile flag.
 
-Three things learned building `recall`, each of which was silently wrong first:
+Four things learned building `recall`, each of which was silently wrong first:
 
 - **`snippet(fts, -1, ...)`, never a hardcoded column.** Pinning it to the body column
   returns an *empty* snippet for anything matched on its title alone — which is the shape
@@ -388,6 +388,10 @@ Three things learned building `recall`, each of which was silently wrong first:
 - **`created` and `note_added` events are excluded from search.** Their bodies are copies of
   the task or note title, so including them makes every entity match twice — once as
   itself, once as an event repeating its own name.
+- **A glued word is a phrase, not loose terms.** Splitting on every non-alphanumeric made
+  `hand-off` into "hand" AND "off" anywhere in the row; on a real board unrelated notes
+  outranked the hand-offs that were searched for. Whitespace separates terms; punctuation
+  inside a word joins its parts into an FTS5 phrase.
 
 **Adding a column to an external-content FTS table means dropping and rebuilding it.** The
 column list is fixed at creation, so migration 006 (`tasks.tags`) had to drop the table and
@@ -420,7 +424,8 @@ Measured on a year-old board (200 tasks, 40 notes, 800 events) in `tests/budget.
 | `task_add` (nothing in flight) | ~127 tokens |
 | `task_add` (with in-flight work) | ~138 tokens |
 | `recall`, 10 hits | ~510 tokens |
-| `task_show`, 16 events | ~358 tokens |
+| `task_show`, 16 events | ~400 tokens |
+| `recall(full)`, 3 hand-offs | ~75 tokens + the bodies |
 | `board(project: "all")`, 60 boards | ~509 tokens |
 
 Every figure above is printed by that test, not estimated.

@@ -263,3 +263,81 @@ fn the_omitted_count_ignores_exactly_what_the_search_ignores() {
         r.hits.iter().map(|h| (h.kind, h.title.as_str())).collect::<Vec<_>>());
     assert_eq!(r.omitted, 0, "nothing was withheld, so nothing may be claimed withheld");
 }
+
+#[test]
+fn a_hyphenated_word_is_searched_as_one_term() {
+    // The failure this guards, seen on a real board: `hand-off` became "hand" AND "off"
+    // anywhere in the text, so notes that did something "by hand" and switched something
+    // "off" outranked the session hand-offs that were being looked for.
+    let s = Store::open_in_memory().unwrap();
+    let pid = project(&s, "hyphen");
+    s.create_note(pid, NoteDraft {
+        body: "the hand-off lists what the next session starts with".into(),
+        ..NoteDraft::new("session hand-off")
+    }, Actor::Agent).unwrap();
+    s.create_note(pid, NoteDraft {
+        body: "patched by hand, then the cache was switched off".into(),
+        ..NoteDraft::new("cache workaround")
+    }, Actor::Agent).unwrap();
+
+    let r = s.recall(&q("hand-off", Some(pid))).unwrap();
+    assert_eq!(r.hits.len(), 1, "only the glued word may match: {:?}", r.hits);
+    assert_eq!(r.hits[0].title, "session hand-off");
+
+    assert_eq!(fts_query("hand-off go").as_deref(), Some("\"hand off\" AND \"go\""));
+    assert_eq!(fts_query("2026-10-06").as_deref(), Some("\"2026 10 06\""));
+    // Operators are noise on their own, ordinary words inside a glued one.
+    assert_eq!(fts_query("auth AND loop").as_deref(), Some("\"auth\" AND \"loop\""));
+    assert_eq!(fts_query("rock-and-roll").as_deref(), Some("\"rock and roll\""));
+}
+
+#[test]
+fn full_mode_reads_back_what_the_snippet_cuts_off() {
+    // A session summary is written in full and was readable only as a 20-token snippet --
+    // the part that mattered ("NEXT: ...") sat at the end and never came back.
+    let s = Store::open_in_memory().unwrap();
+    let pid = project(&s, "full");
+    let filler = "worked through the list and verified each ticket on the board. ".repeat(20);
+    let summary = format!("SESSION HAND-OFF: {filler}\nNEXT: the zebra-crossing ticket");
+    s.log(pid, Actor::Agent, &summary).unwrap();
+    s.create_note(pid, NoteDraft {
+        body: format!("{filler} the session hand-off explains the trap"),
+        ..NoteDraft::new("hand-off trap")
+    }, Actor::Agent).unwrap();
+
+    let mut r = s.recall(&q("session hand-off", Some(pid))).unwrap();
+    assert!(r.hits.iter().all(|h| h.body.is_none()), "bodies are loaded only on request");
+    assert!(!r.hits.iter().any(|h| h.snippet.contains("zebra")), "fixture must exceed the snippet");
+
+    s.fill_bodies(&mut r).unwrap();
+    let event = r.hits.iter().find(|h| h.kind == HitKind::Event).expect("the log must match");
+    assert_eq!(event.body.as_deref(), Some(summary.as_str()));
+    let note = r.hits.iter().find(|h| h.kind == HitKind::Note).expect("the note must match");
+    assert!(note.body.as_deref().unwrap().ends_with("explains the trap"));
+
+    let text = ai_kanban::render::recall(&r, false, &Default::default());
+    assert!(text.contains("NEXT: the zebra-crossing ticket"), "{text}");
+    assert!(!text.contains(">>"), "full mode shows the text, not the snippet markers: {text}");
+}
+
+#[test]
+fn a_line_the_board_cut_short_finds_its_entry() {
+    // The round trip full mode exists for: the board shows an entry cut short, the agent
+    // searches with that line and reads the whole entry. This body is a real one; cut
+    // mid-word ("...dump wit…") the line held a term no row contains and found nothing.
+    let s = Store::open_in_memory().unwrap();
+    let pid = project(&s, "roundtrip");
+    let body = "PIPELINE GATE MET 2026-10-06: full replay of live-2026-09-24 dump with the v13 \
+                step pinned -- exit 0, every verify query as expected";
+    s.create_task(pid, TaskDraft::new("an open task, so the board renders its recent section")).unwrap();
+    s.log(pid, Actor::Agent, body).unwrap();
+
+    let board = ai_kanban::render::board(&s.board(pid, &BoardQuery::board()).unwrap());
+    let line = board.lines().find(|l| l.contains("PIPELINE GATE")).unwrap_or_else(|| panic!("the log must be in recent:\n{board}"));
+    let pasted = line.trim().strip_prefix("just now").unwrap().trim().trim_end_matches('…');
+    assert!(pasted.len() < body.len(), "fixture must be cut by the board: {line}");
+
+    let mut r = s.recall(&q(pasted, Some(pid))).unwrap();
+    s.fill_bodies(&mut r).unwrap();
+    assert_eq!(r.hits.first().and_then(|h| h.body.as_deref()), Some(body), "searched {pasted:?}");
+}

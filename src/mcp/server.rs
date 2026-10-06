@@ -28,7 +28,7 @@
 use crate::core::model::*;
 use crate::core::note::{NoteDraft, NotePatch};
 use crate::core::project::Resolved;
-use crate::core::recall::{RecallQuery, DEFAULT_LIMIT};
+use crate::core::recall::{RecallQuery, DEFAULT_LIMIT, FULL_LIMIT, FULL_MAX};
 use crate::core::task::{TaskDraft, TaskPatch};
 use crate::core::{Error, Store};
 use crate::render;
@@ -264,6 +264,10 @@ pub struct RecallParams {
     /// Omit for this project. Pass "all" to search every board you have ever worked on.
     pub project: Option<String>,
     pub limit: Option<u32>,
+    /// true returns each hit's whole text instead of a snippet -- to read a session summary,
+    /// a note or a decision the board shows cut short. Search with the words of that line.
+    /// Returns 3 hits unless you pass a limit (at most 10).
+    pub full: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Default)]
@@ -526,6 +530,8 @@ impl AiKanban {
     /// Search everything remembered about a topic -- notes, tasks and the reasoning
     /// recorded against them. Use it before debugging something that feels familiar, and
     /// pass project "all" to check whether you hit the same problem on another codebase.
+    /// Pass full: true to read the whole text of what it finds -- to read an entry the board
+    /// shows cut short, search with the words of its line.
     #[tool(name = "recall", annotations(read_only_hint = true, idempotent_hint = true))]
     fn recall(&self, Parameters(p): Parameters<RecallParams>) -> Result<String, ErrorData> {
         let store = self.store();
@@ -536,11 +542,15 @@ impl AiKanban {
         } else {
             Some(self.resolve(&store, p.project.as_deref()).map_err(fail)?.project.id)
         };
-        let result = store.recall(&RecallQuery {
-            text: &p.query,
-            project_id,
-            limit: p.limit.map(|l| l.clamp(1, 50) as usize).unwrap_or(DEFAULT_LIMIT),
-        }).map_err(fail)?;
+        let full = p.full.unwrap_or(false);
+        let limit = match (full, p.limit) {
+            (false, l) => l.map(|l| l.clamp(1, 50) as usize).unwrap_or(DEFAULT_LIMIT),
+            (true, l) => l.map(|l| (l as usize).clamp(1, FULL_MAX)).unwrap_or(FULL_LIMIT),
+        };
+        let mut result = store.recall(&RecallQuery { text: &p.query, project_id, limit }).map_err(fail)?;
+        if full {
+            store.fill_bodies(&mut result).map_err(fail)?;
+        }
 
         // Only for a single-project search. Cross-project hits come from repos whose
         // checkouts are mostly not on this machine, so the calibration in `staleness` would
@@ -643,8 +653,8 @@ impl AiKanban {
 
     /// Record what happened or what was decided. Use it for decisions and session summaries
     /// -- the things a future session would otherwise have to reconstruct. Attach it to a
-    /// task with `task`, or omit that for project-level history. Either way it shows up in
-    /// the board's recent section.
+    /// task with `task`, or omit that for project-level history. Either way it shows up as
+    /// one line in the board's recent section; recall with full: true reads it back whole.
     #[tool(name = "log", annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false))]
     fn log(&self, Parameters(p): Parameters<LogParams>) -> Result<String, ErrorData> {
         let store = self.store();

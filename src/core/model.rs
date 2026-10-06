@@ -448,6 +448,11 @@ pub struct RecallHit {
     pub score: f64,
     /// Only set for tasks, so a hit can say "done, 2mo ago" instead of just naming the task.
     pub status: Option<Status>,
+    /// The whole text, only when it was asked for (`Store::fill_bodies`). A session
+    /// hand-off or a note is written in full and must be readable in full; the snippet
+    /// alone made everything but a task body write-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
 }
 
 /// Recall's full result, including what to say when there are no hits.

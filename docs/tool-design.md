@@ -56,8 +56,14 @@ resolving to two identities — the failure that otherwise happens silently.
 unprompted", and a metric nobody sees is a metric nobody checks.
 
 **The `recent` section is the reader for project-level events.** An append-only log with no
-named consumer is exactly the extra work an agent correctly skips. Naming the reader also
-bounds how much narrative belongs in one entry: if it doesn't fit on that line, it's a note.
+named consumer is exactly the extra work an agent correctly skips. The line is a pointer, not
+the whole reader: a session summary legitimately runs to paragraphs and is not a durable claim
+about the code, so it is not a note either. It is read back whole with `recall(full: true)`,
+searching with the words of the line -- which is why lines are cut at a word boundary: a
+word cut in half ("dump wit…") is a term no row contains, and the search for the line came
+back empty.
+Until that existed, the `log` tool invited session summaries that no tool could return in
+full -- write-only memory, found on a real board where hand-offs ran to 2,500 characters.
 
 ---
 
@@ -75,7 +81,8 @@ Measured on a year-old board (200 tasks, 40 notes, 800 events), asserted in `tes
 | `board` | ~611 tokens |
 | `task_add` | ~127–138 tokens |
 | `recall`, 10 hits | ~510 tokens |
-| `task_show`, 16 events | ~358 tokens |
+| `task_show`, 16 events | ~400 tokens |
+| `recall(full)`, 3 hand-offs | ~75 tokens + the bodies |
 | `board(project: "all")`, 60 boards | ~509 tokens |
 
 The `task_add` figure is the one that matters — it is paid every time the agent files a side
@@ -166,7 +173,11 @@ history
 ```
 
 The deliberate exception to the volume rule: full history, because it is asked for only once
-the agent has committed to one piece of work, and history is what it came for.
+the agent has committed to one piece of work, and history is what it came for. **Logs and
+the reasons on status changes print whole**, continuation lines indented under the entry;
+every other kind keeps the board's one-line form, since a `created` body only repeats the
+title. History once went through the board's renderer and cut each reason at 55
+characters -- the promise above was true of the event count and false of the content.
 
 When `status` is `blocked` but nothing on the board blocks it, the response says so
 explicitly. `status` is authoritative and `blocked_by` is annotation; they are allowed to
@@ -206,6 +217,17 @@ expression, a stray quote is a syntax error, `AND` is a keyword. Raw input would
 phrasings fail with a parser error — and the agent would have to learn FTS5 to avoid it,
 which is precisely the "needs internal knowledge" failure the design law forbids. Every token
 is quoted and ANDed; bare operators are dropped as noise.
+
+**A glued word is one term.** `hand-off`, `go-live`, `2026-10-06`, `src/render.rs` become an
+FTS5 phrase of their parts. Split into loose ANDed words, `hand-off` matched anything holding
+"hand" and "off" somewhere, and those hits outranked the hand-offs being searched for.
+
+**`full: true` returns whole texts instead of snippets** -- the reader for anything the board
+or a history line shows cut short: a session summary, a note, a long decision. It is a
+second step after the search (`Store::fill_bodies`), so it touches only the capped hits.
+It defaults to 3 hits and accepts at most 10: the bodies are the price the agent chose,
+but a body count without a ceiling is a call that can quietly cost tens of thousands of
+tokens. `tests/budget.rs` asserts the overhead around the bodies, not the bodies.
 
 ### Empty results orient
 
@@ -285,7 +307,9 @@ has touched all year.
 **No required `project` argument.** See above.
 
 **No tool for reading raw events.** They surface through `board`'s `recent`, `task_show`'s
-history, and `recall`. A tool that dumps the log would be a tool for producing token cost.
+history, and `recall` -- with `full: true` when an entry must be read whole. A tool that
+dumps the log would be a tool for producing token cost; a search that returns three whole
+entries is not.
 
 ---
 

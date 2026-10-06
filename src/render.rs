@@ -232,6 +232,33 @@ fn event_line(e: &Event, now: i64) -> String {
     format!("  {:<4} {what}\n", when)
 }
 
+/// A history line in `task_show`. Logs and the reasons on status changes print whole: they
+/// are the "why" the agent resumes a task for, and cut at 55 characters a "USER DECISION
+/// ..." or a "DONE, commit ..." survives only as its first clause. Every other kind keeps
+/// the one-line board rendering -- a `created` body only repeats the title shown above.
+fn history_line(e: &Event, now: i64) -> String {
+    let body = e.body.trim_end();
+    let what = match (status_transition(&e.kind), e.kind.as_str()) {
+        (Some(to), _) if !body.is_empty() => match e.task_id {
+            Some(id) => format!("#{id} -> {to}: {body}"),
+            None => format!("-> {to}: {body}"),
+        },
+        (None, "log") => body.to_string(),
+        _ => return event_line(e, now),
+    };
+    // Continuation lines hang under the text, so a multi-line entry stays visibly one entry.
+    let mut text = String::new();
+    for (i, line) in what.lines().enumerate() {
+        let line = line.trim_end();
+        if i > 0 {
+            text.push('\n');
+            if !line.is_empty() { text.push_str("       "); }
+        }
+        text.push_str(line);
+    }
+    format!("  {:<4} {text}\n", ago(now, e.ts))
+}
+
 fn reason(body: &str) -> String {
     if body.is_empty() { String::new() } else { format!(": {}", truncate(body, 55)) }
 }
@@ -292,7 +319,7 @@ pub fn task_detail(d: &TaskDetail) -> String {
     if !d.events.is_empty() {
         out.push_str("\nhistory\n");
         for e in &d.events {
-            out.push_str(&event_line(e, d.now));
+            out.push_str(&history_line(e, d.now));
         }
     }
     out
@@ -320,8 +347,17 @@ pub fn recall(r: &RecallResult, cross_project: bool, missing: &MissingSubjects) 
             (HitKind::Event, None) => "  --".to_string(),
             _ => format!("#{}", h.id),
         };
-        out.push_str(&format!("\n{kind} {:<5} {}  ({})\n", id, truncate(&h.title, 46), tail.join(", ")));
-        if !h.snippet.is_empty() {
+        if let Some(body) = &h.body {
+            // Full mode: the text the agent asked to read, unindented and with its own line
+            // breaks, because a hand-off is structured by them. The title is not cut either.
+            out.push_str(&format!("\n{kind} {:<5} {}  ({})\n", id, h.title, tail.join(", ")));
+            if !body.is_empty() {
+                out.push_str(&format!("{}\n", body.trim_end()));
+            }
+        } else {
+            out.push_str(&format!("\n{kind} {:<5} {}  ({})\n", id, truncate(&h.title, 46), tail.join(", ")));
+        }
+        if h.body.is_none() && !h.snippet.is_empty() {
             out.push_str(&format!("       {}\n", h.snippet.replace('\n', " ")));
         }
         // Only ever on note hits, and only when the check was calibrated -- see
@@ -597,9 +633,20 @@ pub fn repo_directory(repos: &[(Repo, String)]) -> String {
 
 fn plural(n: usize) -> &'static str { if n == 1 { "" } else { "s" } }
 
+/// Cuts at a word boundary. A cut line is what an agent pastes into `recall` to read the
+/// whole entry, and every term there must match: a word cut in half ("...dump wit…") is a
+/// term no row contains, so the search for the line came back empty. A single word longer
+/// than the line is still cut hard -- there is no boundary to fall back to.
 fn truncate(s: &str, max: usize) -> String {
     let s = s.replace('\n', " ");
     if s.chars().count() <= max { return s; }
-    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    let chars: Vec<char> = s.chars().collect();
+    let keep = max.saturating_sub(1);
+    let mid_word = chars[keep].is_alphanumeric() && keep > 0 && chars[keep - 1].is_alphanumeric();
+    let end = match chars[..keep].iter().rposition(|c| c.is_whitespace()) {
+        Some(space) if mid_word => space,
+        _ => keep,
+    };
+    let cut: String = chars[..end].iter().collect();
     format!("{}…", cut.trim_end())
 }
