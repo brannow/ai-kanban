@@ -24,7 +24,7 @@
 use crate::core::error::Result;
 use crate::core::event::housekeeping_filter;
 use crate::core::model::{Event, Note, Status, Task};
-use crate::core::note::split_tags;
+use crate::core::note::split_list;
 use crate::core::store::Store;
 use crate::core::task::{row_to_task, TASK_COLS};
 use rusqlite::params;
@@ -196,7 +196,7 @@ impl Store {
             let tags: String = r.get(5)?;
             Ok(Note {
                 id: r.get(0)?, project_id: r.get(1)?, task_id: r.get(2)?,
-                title: r.get(3)?, body: r.get(4)?, tags: split_tags(&tags),
+                title: r.get(3)?, body: r.get(4)?, tags: split_list(&tags),
                 paths: Vec::new(),
                 created_at: r.get(6)?, updated_at: r.get(7)?, version: r.get(8)?,
             })

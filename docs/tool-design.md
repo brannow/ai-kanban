@@ -380,6 +380,13 @@ forever while checking nothing.
 `""` as "clear them" and an omitted field as "leave them alone", the same three-way reading
 `workstream` uses.
 
+A JSON array of strings is accepted too, for every list parameter (`tags`, `repos`, `paths`),
+and stored in the comma form. The schema still asks for commas, and agents send arrays anyway.
+Taking only the first stored nine `["a","b"]` strings verbatim on a real board, and those
+read back as the tags `["a"` and `"b"]`, so filtering by tag missed them. The stored column is
+read by the same parser (`core::note::split_list`), so rows written that way before read
+correctly and are rewritten in the comma form by their next update.
+
 They appear in `task_show` and in the web UI, and **not on the board line**. That asymmetry
 is the design: the board listing is paid for on every `task_add`, and tags carry no semantics
 an agent must act on — which is the whole reason they are safe to offer at all. An agent can

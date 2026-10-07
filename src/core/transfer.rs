@@ -341,7 +341,7 @@ impl Store {
                     created_at: r.get(8)?,
                     updated_at: r.get(9)?,
                     workstream: r.get(10)?,
-                    tags: crate::core::note::split_tags(&r.get::<_, String>(11)?),
+                    tags: crate::core::note::split_list(&r.get::<_, String>(11)?),
                     repos: Vec::new(),
                     external_ref: r.get(12)?,
                 })

@@ -182,7 +182,7 @@ impl Store {
             params![id, project_id],
             |r| r.get(0),
         ).optional()?;
-        Ok(crate::core::note::split_tags(&raw.unwrap_or_default()))
+        Ok(crate::core::note::split_list(&raw.unwrap_or_default()))
     }
 
     /// Tags for a set of tasks, in one query.
@@ -200,7 +200,7 @@ impl Store {
         ))?;
         let ids = std::iter::once(project_id).chain(tasks.iter().map(|t| t.id)).collect::<Vec<_>>();
         let rows = st.query_map(rusqlite::params_from_iter(ids), |r| {
-            Ok((r.get::<_, i64>(0)?, crate::core::note::split_tags(&r.get::<_, String>(1)?)))
+            Ok((r.get::<_, i64>(0)?, crate::core::note::split_list(&r.get::<_, String>(1)?)))
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }

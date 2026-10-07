@@ -125,7 +125,7 @@ where F: Fn(&str) -> Result<T, String> {
 }
 
 fn csv(s: &Option<String>) -> Option<Vec<String>> {
-    s.as_ref().map(|v| v.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
+    s.as_deref().map(crate::core::note::split_list)
 }
 
 /// Repo names as the agent typed them, resolved to ids on this board. `None` when the field

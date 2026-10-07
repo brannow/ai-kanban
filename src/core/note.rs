@@ -48,7 +48,7 @@ fn row_to_note(r: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
         task_id: r.get(2)?,
         title: r.get(3)?,
         body: r.get(4)?,
-        tags: split_tags(&tags),
+        tags: split_list(&tags),
         paths: Vec::new(), // filled by hydrate_paths
         created_at: r.get(6)?,
         updated_at: r.get(7)?,
@@ -56,8 +56,24 @@ fn row_to_note(r: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
     })
 }
 
-pub(crate) fn split_tags(s: &str) -> Vec<String> {
-    s.split(',').map(str::trim).filter(|t| !t.is_empty()).map(String::from).collect()
+/// A list as an agent types it: comma separated, which is what the tool schemas ask for, or
+/// a JSON array of strings, which agents send anyway. Taking only the first stored
+/// `["a","b"]` verbatim on a real board, and that then read back as the tags `["a"` and
+/// `"b"]`. The store keeps the comma form; this is also its reader, so rows written that way
+/// before read correctly and are rewritten by their next update.
+pub fn split_list(s: &str) -> Vec<String> {
+    let s = s.trim();
+    let items = match s.starts_with('[').then(|| serde_json::from_str::<Vec<String>>(s)) {
+        Some(Ok(list)) => list,
+        _ => vec![s.to_string()],
+    };
+    // Split each item again: a comma inside an array element would split on the next read anyway.
+    items.iter()
+        .flat_map(|i| i.split(','))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 pub(crate) fn join_tags(tags: &[String]) -> String {

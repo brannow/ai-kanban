@@ -121,3 +121,19 @@ fn tags_survive_export_and_import() {
     assert_eq!(target.task_tags(tpid, imported.tasks[0].id).unwrap(),
         tags(&["frontend", "in review"]));
 }
+
+#[test]
+fn a_list_is_read_the_same_whether_typed_as_csv_or_json() {
+    // The schemas ask for comma separated, and agents send a JSON array anyway. Nine tasks
+    // on a real board stored `["broken-in-v10","search","solr"]` verbatim, and then read
+    // back as the tags `["broken-in-v10"`, `"search"` and `"solr"]`, so filtering for
+    // broken-in-v10 missed them. The same parser reads the store, so those rows heal on read.
+    use ai_kanban::core::note::split_list;
+    let want = tags(&["broken-in-v10", "search", "solr"]);
+    assert_eq!(split_list("broken-in-v10, search,solr"), want);
+    assert_eq!(split_list(r#"["broken-in-v10","search","solr"]"#), want);
+    assert_eq!(split_list(r#" [ "broken-in-v10", " search", "solr,"] "#), want);
+    assert_eq!(split_list(r#"["a,b"]"#), tags(&["a", "b"]), "the store's separator stays a separator");
+    assert!(split_list("").is_empty() && split_list("[]").is_empty(), "both still mean clear");
+    assert_eq!(split_list("[wip"), tags(&["[wip"]), "not JSON: taken as typed, not dropped");
+}
