@@ -174,10 +174,15 @@ history
 
 The deliberate exception to the volume rule: full history, because it is asked for only once
 the agent has committed to one piece of work, and history is what it came for. **Logs and
-the reasons on status changes print whole**, continuation lines indented under the entry;
-every other kind keeps the board's one-line form, since a `created` body only repeats the
-title. History once went through the board's renderer and cut each reason at 55
-characters -- the promise above was true of the event count and false of the content.
+every reason a `task_update` or move carries print whole** -- kinds `log`, `status:*`,
+`updated` and `moved` -- continuation lines indented under the entry; every other kind keeps
+the board's one-line form, since a `created` body only repeats the title. History once went
+through the board's renderer and cut each reason at 55 characters -- the promise above was
+true of the event count and false of the content. The first fix covered only `log` and
+status changes, and missed that a `log` passed with no status change is stored as `updated`.
+On a real board, a user's decision came back as its first few words, and the next agent
+wrote it off as unverified. Which kind a reason lands in is an internal detail, so the
+renderer must not depend on it.
 
 When `status` is `blocked` but nothing on the board blocks it, the response says so
 explicitly. `status` is authoritative and `blocked_by` is annotation; they are allowed to

@@ -469,3 +469,29 @@ fn a_resumed_task_shows_its_reasons_whole() {
     assert!(text.contains(decision), "{text}");
     assert!(text.contains("verified:\n       first line\n\n       second paragraph"), "{text}");
 }
+
+#[test]
+fn a_reason_logged_without_a_status_change_shows_whole_too() {
+    // `task_update` with only a `log` is stored as kind `updated`, and a move as `moved`.
+    // Both carry the agent's reason, and an agent cannot be expected to know the kind
+    // depends on whether the status changed. Found on a real board: a 326-character
+    // "USER DECISION" came back as its first 55 characters, and the next agent wrote
+    // the decision off as unverified.
+    let s = Store::open_in_memory().unwrap();
+    let dir = std::env::temp_dir().join("aik-board-reasons-updated");
+    let other_dir = std::env::temp_dir().join("aik-board-reasons-moved-to");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let pid = s.resolve_project(&dir).unwrap().project.id;
+    let other = s.resolve_project(&other_dir).unwrap().project.id;
+    let t = s.create_task(pid, TaskDraft::new("dead links")).unwrap();
+    let decision = "USER DECISION 2026-10-02: the 54 distinct dead absolute links (82 occurrences) \
+                    stay as they are, because they are already broken on production";
+    s.update_task(pid, t.id, TaskPatch { log: Some(decision.into()), ..Default::default() }).unwrap();
+    let why = "belongs to the content board, because the links live in editor-managed pages";
+    s.move_task(pid, t.id, other, Actor::Agent, Some(why), None).unwrap();
+
+    let text = ai_kanban::render::task_detail(&s.task_detail(other, t.id).unwrap());
+    assert!(text.contains(decision), "{text}");
+    assert!(text.contains(why), "{text}");
+}

@@ -232,10 +232,10 @@ fn event_line(e: &Event, now: i64) -> String {
     format!("  {:<4} {what}\n", when)
 }
 
-/// A history line in `task_show`. Logs and the reasons on status changes print whole: they
-/// are the "why" the agent resumes a task for, and cut at 55 characters a "USER DECISION
-/// ..." or a "DONE, commit ..." survives only as its first clause. Every other kind keeps
-/// the one-line board rendering -- a `created` body only repeats the title shown above.
+/// A history line in `task_show`. Logs and every reason a `task_update` or move carries
+/// print whole: they are the "why" the agent resumes a task for, and cut at 55 characters a
+/// "USER DECISION ..." or a "DONE, commit ..." survives only as its first clause. Every
+/// other kind keeps the one-line board rendering -- a `created` body only repeats the title.
 fn history_line(e: &Event, now: i64) -> String {
     let body = e.body.trim_end();
     let what = match (status_transition(&e.kind), e.kind.as_str()) {
@@ -244,6 +244,13 @@ fn history_line(e: &Event, now: i64) -> String {
             None => format!("-> {to}: {body}"),
         },
         (None, "log") => body.to_string(),
+        // Where a `task_update` or a move puts its `log`: same reason, different kind,
+        // because the kind records whether the status changed. Without a log the body
+        // is a short generated summary, so printing it whole costs nothing.
+        (None, "updated" | "moved") => match e.task_id {
+            Some(id) => format!("#{id} {body}"),
+            None => body.to_string(),
+        },
         _ => return event_line(e, now),
     };
     // Continuation lines hang under the text, so a multi-line entry stays visibly one entry.
