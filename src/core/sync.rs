@@ -157,6 +157,13 @@ pub struct Applied {
     pub parked: usize,
 }
 
+/// Whether this run may use the network. `AI_KANBAN_SYNC=off` keeps one Claude run (or shell)
+/// local-only without changing anything stored. Defined here, once, because the board header
+/// says so too; `remote::config::sync_enabled` is this.
+pub fn sync_enabled() -> bool {
+    !std::env::var("AI_KANBAN_SYNC").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"))
+}
+
 /// A connected board's sync state, for `room status` and the board header.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SyncStatus {
@@ -171,6 +178,8 @@ pub struct SyncStatus {
     pub paused: Option<String>,
     /// (tag, user) of everyone in the room, as last reported.
     pub members: Vec<(String, String)>,
+    /// This run has sync off (`AI_KANBAN_SYNC`): nothing reaches the relay until a run allows it.
+    pub off: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -341,7 +350,7 @@ impl Store {
         let parked = self.conn.query_row("SELECT COUNT(*) FROM sync_parked WHERE project_id = ?1", [project_id], |r| r.get(0))?;
         let members: Vec<Value> = serde_json::from_str(&members).unwrap_or_default();
         let members = members.iter().filter_map(|m| Some((m.get("tag")?.as_str()?.to_string(), m.get("user")?.as_str()?.to_string()))).collect();
-        Ok(Some(SyncStatus { room, cursor, unsent, parked, last_ok_at, last_error, paused: self.paused()?, members }))
+        Ok(Some(SyncStatus { room, cursor, unsent, parked, last_ok_at, last_error, paused: self.paused()?, members, off: !sync_enabled() }))
     }
 
     /// Why sync is stopped for this store, if it is.

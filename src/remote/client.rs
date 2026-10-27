@@ -28,6 +28,26 @@ pub enum RemoteError {
     Paused(String),
 }
 
+impl RemoteError {
+    /// What kind of failure this is, in a word or two, for the board header: "offline" says
+    /// "it will pass", everything else says "someone has to act".
+    pub fn kind(&self) -> &'static str {
+        match self {
+            RemoteError::Offline(_) => "offline",
+            RemoteError::Unauthorized => "key rejected",
+            RemoteError::NotFound(_) => "room not found",
+            RemoteError::Conflict(_) => "conflict",
+            RemoteError::BadRequest(_) | RemoteError::Http(..) => "relay error",
+            RemoteError::Paused(_) => "paused",
+        }
+    }
+
+    /// How it is recorded as a board's last error: its kind, then the detail.
+    pub fn recorded(&self) -> String {
+        format!("{}: {self}", self.kind())
+    }
+}
+
 impl From<RemoteError> for crate::core::Error {
     fn from(e: RemoteError) -> Self {
         crate::core::Error::Other(e.to_string())

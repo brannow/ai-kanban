@@ -171,8 +171,15 @@ fn sync_line(s: &crate::core::sync::SyncStatus, now: i64) -> String {
         return format!("sync paused: {why}\n");
     }
     let mut state = Vec::new();
+    if s.off {
+        state.push("sync off for this run".to_string());
+    }
     match (&s.last_error, s.last_ok_at) {
-        (Some(_), _) => state.push("offline".to_string()),
+        // "offline" passes by itself; anything else needs someone to act, so it says what.
+        (Some(e), _) => match e.split(':').next().unwrap_or("").trim() {
+            "offline" => state.push("offline".to_string()),
+            kind => state.push(format!("sync failing: {kind}")),
+        },
         (None, None) => state.push("not synced yet".to_string()),
         (None, Some(t)) if now - t > 3600 => state.push(format!("last sync {}", ago(now, t))),
         _ => {}

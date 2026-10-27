@@ -15,7 +15,7 @@ pub struct RemoteConfig {
 /// shell) local-only without changing anything stored: connected boards keep recording, and
 /// sync picks up where it left off in the next run that allows it.
 pub fn sync_enabled() -> bool {
-    !std::env::var("AI_KANBAN_SYNC").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"))
+    crate::core::sync::sync_enabled()
 }
 
 impl RemoteConfig {

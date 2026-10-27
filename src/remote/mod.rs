@@ -14,4 +14,4 @@ pub mod engine;
 
 pub use client::{Client, RemoteError};
 pub use config::RemoteConfig;
-pub use engine::{check_identity, sync_board, Synced};
+pub use engine::{check_identity, sync_board, sync_board_within, Synced};

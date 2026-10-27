@@ -10,7 +10,7 @@
 
 use super::client::{Client, RemoteError};
 use super::config::{self, RemoteConfig};
-use super::engine::{check_identity, sync_board};
+use super::engine::{check_identity, sync_board, sync_board_within};
 use crate::core::Store;
 use std::collections::HashSet;
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
@@ -20,9 +20,11 @@ use std::time::Duration;
 const EVERY: Duration = Duration::from_secs(60);
 /// Writes in quick succession (a task_update and its log) go out as one round.
 const SETTLE: Duration = Duration::from_millis(300);
-/// The round before a claim runs inside a tool call. Bounded hard, so an unreachable relay
-/// costs the agent at most this, and the claim goes through regardless.
-const CLAIM_TIMEOUT: Duration = Duration::from_millis(2500);
+/// The round before a claim runs inside a tool call. No request starts after this budget is
+/// spent, and each is bounded by `CLAIM_REQUEST`, so an unreachable or stalled relay costs the
+/// agent about this much at most, and the claim goes through regardless.
+const CLAIM_BUDGET: Duration = Duration::from_millis(2500);
+const CLAIM_REQUEST: Duration = Duration::from_millis(1200);
 
 pub struct Syncer {
     kick: Sender<()>,
@@ -64,7 +66,7 @@ impl Syncer {
                 }
             })
             .ok()?;
-        Some(Syncer { kick: tx, claim: Client::new(&cfg.url, &cfg.key, CLAIM_TIMEOUT) })
+        Some(Syncer { kick: tx, claim: Client::new(&cfg.url, &cfg.key, CLAIM_REQUEST) })
     }
 
     /// Something was written: publish it soon.
@@ -78,7 +80,7 @@ impl Syncer {
     /// relay is unreachable.
     pub fn now(&self, store: &Store, project_id: i64) {
         if store.room_of(project_id).ok().flatten().is_some() && store.paused().ok().flatten().is_none() {
-            let _ = sync_board(store, &self.claim, project_id);
+            let _ = sync_board_within(store, &self.claim, project_id, CLAIM_BUDGET);
         }
     }
 }
@@ -95,7 +97,7 @@ fn round(store: &Store, client: &Client, watched: &mut HashSet<String>, notify: 
         Err(RemoteError::Paused(_)) => return false,
         Err(e) => {
             for (pid, _) in &boards {
-                let _ = store.sync_failed(*pid, &e.to_string());
+                let _ = store.sync_failed(*pid, &e.recorded());
             }
             return false;
         }

@@ -311,8 +311,13 @@ and the run allows sync.
   notification may only delay a pull, never lose one. While the relay is unreachable or sync is
   paused, rounds back off up to every five minutes.
 - **Before a claim** (`task_update` to `doing`) **and before `task_add`**: a round on the tool
-  call's own connection, so what the agent sees is current. It is bounded at 2.5s. When the relay
-  cannot be reached the claim still goes through, and the header says the board is offline.
+  call's own connection, so what the agent sees is current. No request starts after 2.5s and each
+  is bounded at 1.2s, so even a relay that accepts connections and never answers costs the agent
+  about that much. It skips refreshing the member list (the background round does that). When the
+  relay cannot be reached the claim still goes through, and the header says so.
+- **The syncer starts with the session.** A session that was already running when the remote was
+  set or a board connected does not sync until it is restarted; `ai-kanban room sync` covers the
+  gap by hand.
 - **Several sessions on one store sync independently.** There is no lock held across the network:
   retries are stored once per change id, an older clock never wins, and the cursor only moves
   forward, so concurrent rounds agree (`tests/remote_sync.rs`).
@@ -332,8 +337,10 @@ team: b1 benny, v1 volker  (offline, 13 changes unsent)
 ```
 
 The second line can also say `not synced yet`, `last sync 3h ago` (a stale local copy must say
-so), `N parked until ai-kanban is upgraded`, or replace everything with `sync paused: <why and
-what to do>`. A board that is not shared renders exactly as before.
+so), `sync off for this run`, `N parked until ai-kanban is upgraded`, or replace everything with
+`sync paused: <why and what to do>`. Only an unreachable relay reads as `offline`, which passes by
+itself; any other failure reads as `sync failing: key rejected` / `room not found` / ..., because
+someone has to act. A board that is not shared renders exactly as before.
 
 ### When sync pauses
 

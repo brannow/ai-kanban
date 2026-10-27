@@ -266,7 +266,7 @@ fn a_shared_board_with_handles_on_every_line_stays_affordable() {
     let team: Vec<(String, String)> = ["benny", "volker", "carla", "dana", "erik"].iter().enumerate()
         .map(|(i, u)| (format!("{}{}", &u[..1], i + 1), u.to_string())).collect();
     s.sync_succeeded(pid, &team).unwrap();
-    s.sync_failed(pid, "relay unreachable").unwrap();
+    s.sync_failed(pid, &ai_kanban::remote::RemoteError::Offline("connection refused".into()).recorded()).unwrap();
 
     let text = render::board(&s.board(pid, &BoardQuery::board()).unwrap());
     eprintln!("\n=== shared board() with handles and blockers -- ~{} tokens ===\n{}", tokens(&text), text);

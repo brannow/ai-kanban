@@ -69,24 +69,40 @@ fn pause(store: &Store, why: &str) {
 /// One round for `project_id`: flush, push the outbox, pull and apply until caught up, and
 /// record who is in the room. Returns what moved.
 pub fn sync_board(store: &Store, client: &Client, project_id: i64) -> Result<Synced, RemoteError> {
-    let result = round(store, client, project_id);
+    finish(store, project_id, round(store, client, project_id, None))
+}
+
+/// A round that gives up starting new requests once `budget` is spent, and skips refreshing the
+/// member list. For the round before a claim, which runs inside a tool call: the client's
+/// timeout bounds each request, and a relay that accepts connections but never answers would
+/// otherwise stall every one of the round's requests in turn. What it did not get to, the
+/// background round does.
+pub fn sync_board_within(store: &Store, client: &Client, project_id: i64, budget: std::time::Duration) -> Result<Synced, RemoteError> {
+    let deadline = std::time::Instant::now() + budget;
+    finish(store, project_id, round(store, client, project_id, Some(deadline)))
+}
+
+fn finish(store: &Store, project_id: i64, result: Result<Synced, RemoteError>) -> Result<Synced, RemoteError> {
     match &result {
         // A pause is the store's state, reported once by the header, not as this board's error.
         Err(RemoteError::Paused(_)) | Ok(_) => {}
         // A reused change id means this store was restored: stop until it has a new tag.
-        Err(RemoteError::Conflict(msg)) => {
+        Err(e @ RemoteError::Conflict(msg)) => {
             pause(store, msg);
-            let _ = store.sync_failed(project_id, msg);
+            let _ = store.sync_failed(project_id, &e.recorded());
         }
         Err(e) => {
-            let _ = store.sync_failed(project_id, &e.to_string());
+            let _ = store.sync_failed(project_id, &e.recorded());
         }
     }
     result
 }
 
-fn round(store: &Store, client: &Client, project_id: i64) -> Result<Synced, RemoteError> {
+fn round(store: &Store, client: &Client, project_id: i64, deadline: Option<std::time::Instant>) -> Result<Synced, RemoteError> {
     let core = |e: crate::core::Error| RemoteError::Http(0, e.to_string());
+    // With a deadline, no new request starts once it has passed. The round then ends early as
+    // a success of what it did; it does not claim to be a full sync.
+    let out_of_time = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
     if let Some(why) = store.paused().map_err(core)? {
         return Err(RemoteError::Paused(why));
     }
@@ -95,6 +111,9 @@ fn round(store: &Store, client: &Client, project_id: i64) -> Result<Synced, Remo
 
     store.flush().map_err(core)?;
     loop {
+        if out_of_time() {
+            return Ok(done);
+        }
         let out = store.outbox(project_id, MAX_BATCH).map_err(core)?;
         let Some(&(last, _)) = out.last() else { break };
         let changes: Vec<_> = out.into_iter().map(|(_, c)| c).collect();
@@ -104,6 +123,9 @@ fn round(store: &Store, client: &Client, project_id: i64) -> Result<Synced, Remo
     }
 
     loop {
+        if out_of_time() {
+            return Ok(done);
+        }
         let since = store.sync_status(project_id).map_err(core)?.map(|s| s.cursor).unwrap_or(0);
         let page = client.pull(&room, since, MAX_PAGE)?;
         if page.changes.is_empty() {
@@ -119,6 +141,9 @@ fn round(store: &Store, client: &Client, project_id: i64) -> Result<Synced, Remo
     // Applying can have flushed pending edits made meanwhile; send them now rather than a round
     // later.
     loop {
+        if out_of_time() {
+            return Ok(done);
+        }
         let out = store.outbox(project_id, MAX_BATCH).map_err(core)?;
         let Some(&(last, _)) = out.last() else { break };
         let changes: Vec<_> = out.into_iter().map(|(_, c)| c).collect();
@@ -127,6 +152,11 @@ fn round(store: &Store, client: &Client, project_id: i64) -> Result<Synced, Remo
         done.pushed += changes.len();
     }
 
+    if deadline.is_some() {
+        // The quick round leaves the member list to the background one: it is one more request,
+        // and the header can show the team from a minute ago.
+        return Ok(done);
+    }
     let members = client
         .rooms()
         .ok()

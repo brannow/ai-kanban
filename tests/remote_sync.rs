@@ -195,3 +195,35 @@ fn the_notification_stream_announces_a_teammates_push() {
     assert_eq!(heads.len(), 2, "{heads:?}");
     assert!(heads[1] > heads[0], "{heads:?}");
 }
+
+/// The realistic bad network: a relay address that accepts the connection and then never says a
+/// word (a stalled proxy, captive wifi). The round before a claim must still end quickly.
+#[test]
+fn the_round_before_a_claim_is_bounded_even_by_a_relay_that_never_answers() {
+    use ai_kanban::remote::sync_board_within;
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = silent.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for c in silent.incoming().flatten() {
+            held.push(c);
+        }
+    });
+    let s = Store::open_in_memory().unwrap();
+    s.set_origin_tag("b1").unwrap();
+    let pid = s.create_board("sbb").unwrap().id;
+    s.connect_board(pid, "sbahn").unwrap();
+    s.create_task(pid, TaskDraft::new("claimed while the network is bad")).unwrap();
+
+    let client = Client::new(&format!("http://{addr}"), "akb_x", Duration::from_millis(1200));
+    let start = std::time::Instant::now();
+    let r = sync_board_within(&s, &client, pid, Duration::from_millis(2500));
+    assert!(start.elapsed() < Duration::from_millis(3500), "took {:?}", start.elapsed());
+    assert!(matches!(r, Err(RemoteError::Offline(_))), "{r:?}");
+    assert!(s.sync_status(pid).unwrap().unwrap().last_error.unwrap().starts_with("offline:"));
+    assert_eq!(titles_of(&s, pid), ["claimed while the network is bad"], "local work is untouched");
+}
+
+fn titles_of(s: &Store, pid: i64) -> Vec<String> {
+    s.board(pid, &BoardQuery::board()).unwrap().tasks.into_iter().map(|t| t.title).collect()
+}
