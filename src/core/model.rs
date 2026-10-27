@@ -529,7 +529,8 @@ impl Handles {
     /// In text another member wrote, a plain `#N` meant *their* #N, so it becomes `#N-<their
     /// tag>` -- always, even when no such task is known here, because reading it as one of
     /// this machine's own tasks is the worse mistake. In this machine's own text it is the
-    /// local task, shown by its handle. `#12-v1`, `&#12;` and `abc#12` are left alone.
+    /// local task, shown by its handle. `#12-v1`, `&#12;` and `abc#12` are left alone, and so
+    /// is `note #12`: core writes that for notes, whose ids are a separate sequence.
     pub fn text<'a>(&self, text: &'a str, origin: Option<&str>) -> std::borrow::Cow<'a, str> {
         if self.tag.is_none() || !text.contains('#') {
             return std::borrow::Cow::Borrowed(text);
@@ -538,7 +539,9 @@ impl Handles {
         let b = text.as_bytes();
         let (mut out, mut last, mut i) = (String::new(), 0, 0);
         while i < b.len() {
-            let starts = b[i] == b'#' && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'&'));
+            let starts = b[i] == b'#'
+                && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'&'))
+                && !text[..i].to_ascii_lowercase().ends_with("note ");
             if starts {
                 let mut j = i + 1;
                 while j < b.len() && b[j].is_ascii_digit() {

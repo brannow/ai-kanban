@@ -218,3 +218,28 @@ fn the_task_param_is_a_string_in_the_schema_and_still_takes_an_integer() {
         assert!(!s.contains("$ref"), "{tool}.{field} is inline: {s}");
     }
 }
+
+#[test]
+fn a_note_number_in_generated_history_is_never_taken_for_a_task() {
+    use ai_kanban::core::note::{NoteDraft, NotePatch};
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    let t = benny.store.create_task(benny.pid, TaskDraft::new("t")).unwrap();
+    let n = benny.store.create_note(benny.pid, NoteDraft { task_id: Some(t.id), ..NoteDraft::new("fact") }, Actor::Agent).unwrap();
+    // Task and note ids are separate sequences, so in a fresh store they collide -- the case
+    // that went wrong: "note #1" read as task #1.
+    assert_eq!(n.id, t.id, "precondition: the note's id is also a synced task's id");
+    benny.store.update_note(benny.pid, n.id, NotePatch { body: Some("better".into()), actor: Actor::Agent, ..Default::default() }).unwrap();
+    converge(&relay, &[&benny, &volker]);
+
+    for m in [&benny, &volker] {
+        let task = task_by_title(m, "t");
+        let shown = render::task_detail(&m.store.task_detail(m.pid, task.id).unwrap());
+        assert!(shown.contains(&format!("note #{} \"fact\"", n.id)), "{}: {shown}", m.p.tag);
+        assert!(!shown.contains(&format!("note #{}-", n.id)), "{}: a note number became a task handle: {shown}", m.p.tag);
+    }
+    let h = Handles { tag: Some("b1".into()), ..Default::default() };
+    assert_eq!(h.text("note #3 \"x\" -- was: see #4", Some("v1")), "note #3 \"x\" -- was: see #4-v1");
+    assert_eq!(h.text("Note #3", Some("v1")), "Note #3");
+}

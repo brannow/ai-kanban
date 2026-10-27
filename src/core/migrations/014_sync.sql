@@ -14,6 +14,13 @@ CREATE TABLE IF NOT EXISTS sync_node (
 );
 INSERT OR IGNORE INTO sync_node (id) VALUES (1);
 
+-- Every tag this store has published under. A store restored from a backup takes a new tag,
+-- and its work from before is still its own: wiping "others' tasks" must not take it, and its
+-- plain numbers must still resolve.
+CREATE TABLE IF NOT EXISTS sync_own_tags (
+    tag  TEXT PRIMARY KEY
+);
+
 -- Which board is connected to which room. One room per board, one board per room.
 CREATE TABLE IF NOT EXISTS sync_rooms (
     project_id    INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,

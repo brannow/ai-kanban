@@ -188,7 +188,13 @@ impl Store {
             return Err(Error::Other("disconnect every board before changing this store's origin tag".into()));
         }
         self.conn.execute("UPDATE sync_node SET tag = ?1 WHERE id = 1", [tag])?;
+        self.conn.execute("INSERT OR IGNORE INTO sync_own_tags (tag) VALUES (?1)", [tag])?;
         Ok(())
+    }
+
+    /// Whether `tag` is one this store has published under, now or before a restore.
+    pub fn is_own_tag(&self, tag: &str) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sync_own_tags WHERE tag = ?1)", [tag], |r| r.get(0))?)
     }
 
     /// The next clock value: never behind the wall clock, never behind anything seen before.
@@ -259,7 +265,6 @@ impl Store {
         if self.room_of(project_id)?.is_none() {
             return Err(Error::Other("this board is not connected to a room".into()));
         }
-        let tag = self.origin_tag()?.unwrap_or_default();
         let room = self.room_of(project_id)?.unwrap_or_default();
         let tx = self.conn.unchecked_transaction()?;
         // A dropped change was recorded as published. Unrecord it, as long as nothing newer has
@@ -277,24 +282,32 @@ impl Store {
         tx.execute("DELETE FROM sync_outbox WHERE project_id = ?1", [project_id])?;
         tx.execute("DELETE FROM sync_parked WHERE project_id = ?1", [project_id])?;
         tx.commit()?;
+        // Only tasks other members created, with their history and the notes others attached
+        // to them. Teammates' findings on this store's own tasks stay: they are the reason own
+        // tasks sync both ways. "Other members" means any tag this store never published under,
+        // so work from before a restore (and a new tag) is still its own.
         if wipe_foreign {
-            let foreign = |kind: &str| -> Result<Vec<i64>> {
-                let mut st = self.conn.prepare(&format!(
-                    "SELECT x.id FROM {} x JOIN sync_ids s ON s.kind = ?1 AND s.local_id = x.id
-                      WHERE x.project_id = ?2 AND s.origin != ?3 ORDER BY x.id",
-                    table(kind)
-                ))?;
-                let ids = st.query_map(params![kind, project_id, tag], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
-                Ok(ids)
+            let foreign_tasks: Vec<i64> = {
+                let mut st = self.conn.prepare(
+                    "SELECT t.id FROM tasks t JOIN sync_ids s ON s.kind = 'task' AND s.local_id = t.id
+                      WHERE t.project_id = ?1 AND s.origin NOT IN (SELECT tag FROM sync_own_tags) ORDER BY t.id",
+                )?;
+                let ids = st.query_map([project_id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+                ids
             };
-            for id in foreign("task")? {
+            for id in foreign_tasks {
+                let their_notes: Vec<i64> = {
+                    let mut st = self.conn.prepare(
+                        "SELECT n.id FROM notes n JOIN sync_ids s ON s.kind = 'note' AND s.local_id = n.id
+                          WHERE n.task_id = ?1 AND s.origin NOT IN (SELECT tag FROM sync_own_tags)",
+                    )?;
+                    let ids = st.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+                    ids
+                };
+                for n in their_notes {
+                    self.forget_note_unchecked(project_id, n, false)?;
+                }
                 self.forget_task_unchecked(project_id, id, false)?;
-            }
-            for id in foreign("note")? {
-                self.forget_note_unchecked(project_id, id, false)?;
-            }
-            for id in foreign("event")? {
-                self.conn.execute("DELETE FROM events WHERE id = ?1", [id])?;
             }
         }
         Ok(())
@@ -754,6 +767,12 @@ impl Store {
             if self.local_id(e)?.is_some() {
                 return Ok(Outcome::Ignored);
             }
+            let row = |k: &str| c.value.get(k).cloned().unwrap_or(Value::Null);
+            if self.points_elsewhere(project_id, Enc::TaskRef, &row("task"))?
+                || self.points_elsewhere(project_id, Enc::NoteRef, &row("note"))?
+            {
+                return Ok(Outcome::Ignored);
+            }
             return self.insert_event(room, project_id, e, &c.value, &c.clock);
         }
 
@@ -769,6 +788,9 @@ impl Store {
             if stored >= c.clock {
                 return Ok(Outcome::Ignored);
             }
+        }
+        if matches!(s.enc, Enc::TaskRef | Enc::NoteRef) && self.points_elsewhere(project_id, s.enc, &c.value)? {
+            return Ok(Outcome::Ignored);
         }
         let local = self.local_or_placeholder(room, project_id, e)?;
         // A row moved to another board here keeps receiving nothing: it left the room.
@@ -806,6 +828,27 @@ impl Store {
         )?;
         self.store_field(room, e, ROW, row, c)?;
         Ok(Outcome::Applied)
+    }
+
+    /// Whether a received reference names a row this machine has on another board: a task it
+    /// moved off the shared board, or a note that went with one. Writing it would link the
+    /// shared board into a private one -- the cross-board reference `task.rs` refuses -- so the
+    /// change is ignored: the thing it is about left the room here. Not stored as NULL either,
+    /// because that difference would flush back out and clear the reference for everyone.
+    fn points_elsewhere(&self, project_id: i64, enc: Enc, v: &Value) -> Result<bool> {
+        let kind = match enc {
+            Enc::TaskRef => "task",
+            Enc::NoteRef => "note",
+            _ => return Ok(false),
+        };
+        let (Some(origin), Some(id)) = (v.get("origin").and_then(Value::as_str), v.get("id").and_then(Value::as_i64)) else {
+            return Ok(false);
+        };
+        let Some(local) = self.local_id(&Ref { kind: kind.into(), origin: origin.into(), id })? else { return Ok(false) };
+        let board: Option<i64> = self.conn
+            .query_row(&format!("SELECT project_id FROM {} WHERE id = ?1", table(kind)), [local], |r| r.get(0))
+            .optional()?;
+        Ok(board.is_some_and(|b| b != project_id))
     }
 
     /// A task another member moved off the team board. Their history stays here, frozen and
@@ -943,7 +986,7 @@ impl Store {
         if let Ok(n) = s.parse::<i64>() {
             if self.any_connected()? {
                 if let Some(r) = self.identity("task", n)? {
-                    if Some(r.origin.as_str()) != self.origin_tag()?.as_deref() {
+                    if !self.is_own_tag(&r.origin)? {
                         return Err(Error::InvalidValue {
                             field: "task",
                             value: raw.trim().into(),

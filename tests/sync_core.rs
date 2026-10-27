@@ -614,3 +614,70 @@ fn disconnecting_keeps_or_wipes_foreign_rows_and_reconnecting_does_not_duplicate
     let left: Vec<String> = volker.store.board(volker.pid, &BoardQuery::board()).unwrap().tasks.into_iter().map(|t| t.title).collect();
     assert_eq!(left, ["volker's"], "only the rows other members created are wiped");
 }
+
+#[test]
+fn wiping_on_disconnect_takes_only_tasks_others_created_and_keeps_their_findings_on_mine() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    let mine = benny.store.create_task(benny.pid, TaskDraft::new("mine")).unwrap();
+    volker.store.create_task(volker.pid, TaskDraft::new("theirs")).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    let on_mine = task_by_title(&volker, "mine");
+    volker.store.log_on(volker.pid, Some(on_mine.id), Actor::Agent, "their finding on my task").unwrap();
+    volker.store.create_note(volker.pid, NoteDraft { task_id: Some(on_mine.id), ..NoteDraft::new("their note on my task") }, Actor::Agent).unwrap();
+    volker.store.log(volker.pid, Actor::Agent, "their board-level decision").unwrap();
+    converge(&relay, &[&benny, &volker]);
+
+    benny.store.disconnect_board(benny.pid, true).unwrap();
+    let titles: Vec<String> = benny.store.board(benny.pid, &BoardQuery::board()).unwrap().tasks.into_iter().map(|t| t.title).collect();
+    assert_eq!(titles, ["mine"]);
+    let detail = benny.store.task_detail(benny.pid, mine.id).unwrap();
+    assert!(detail.events.iter().any(|e| e.body == "their finding on my task"), "{:?}", detail.events);
+    assert_eq!(detail.notes.len(), 1, "their note on my task stays");
+    assert!(benny.store.recent_events(benny.pid, 50).unwrap().iter().any(|e| e.body == "their board-level decision"));
+}
+
+/// A store restored from a backup takes a new tag. Its work from before is still its own.
+#[test]
+fn work_published_under_an_earlier_tag_stays_this_stores_own() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    let old = benny.store.create_task(benny.pid, TaskDraft::new("from before the restore")).unwrap();
+    volker.store.create_task(volker.pid, TaskDraft::new("theirs")).unwrap();
+    converge(&relay, &[&benny, &volker]);
+
+    benny.store.disconnect_board(benny.pid, false).unwrap();
+    benny.store.set_origin_tag("b2").unwrap();
+    assert_eq!(benny.store.resolve_task_arg(benny.pid, &old.id.to_string()).unwrap(), old.id, "its plain number still resolves");
+    benny.store.connect_board(benny.pid, ROOM).unwrap();
+    benny.store.disconnect_board(benny.pid, true).unwrap();
+    let titles: Vec<String> = benny.store.board(benny.pid, &BoardQuery::board()).unwrap().tasks.into_iter().map(|t| t.title).collect();
+    assert_eq!(titles, ["from before the restore"], "the wipe took only volker's task");
+}
+
+#[test]
+fn a_teammates_event_about_a_task_i_took_private_does_not_link_the_boards() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    let private = benny.store.create_board("private").unwrap().id;
+    volker.store.create_task(volker.pid, TaskDraft::new("theirs")).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    let here = task_by_title(&benny, "theirs");
+    benny.store.move_task(benny.pid, here.id, private, Actor::Agent, None, None).unwrap();
+    // Volker, who has not synced yet, keeps working on it.
+    let there = task_by_title(&volker, "theirs");
+    volker.store.log_on(volker.pid, Some(there.id), Actor::Agent, "still on it").unwrap();
+    let blocked = volker.store.create_task(volker.pid, TaskDraft { blocked_by: Some(there.id), ..TaskDraft::new("waits on theirs") }).unwrap();
+    let _ = blocked;
+    converge(&relay, &[&benny, &volker]);
+
+    let cross: i64 = benny.store.conn.query_row(
+        "SELECT COUNT(*) FROM events e JOIN tasks t ON t.id = e.task_id WHERE e.project_id != t.project_id", [], |r| r.get(0)).unwrap();
+    assert_eq!(cross, 0, "no event on the shared board points at the private one");
+    let waits = task_by_title(&benny, "waits on theirs");
+    assert_eq!(waits.blocked_by, None, "a blocker that left the room here is not linked across boards");
+    assert!(benny.store.task_detail(private, here.id).unwrap().events.iter().all(|e| e.body != "still on it"));
+}
