@@ -262,10 +262,16 @@ fn a_shared_board_with_handles_on_every_line_stays_affordable() {
     s.set_origin_tag("b1").unwrap();
     s.connect_board(pid, "budget-room").unwrap();
     s.flush().unwrap();
+    // A team of five and a failing sync with a backlog: the header at its longest.
+    let team: Vec<(String, String)> = ["benny", "volker", "carla", "dana", "erik"].iter().enumerate()
+        .map(|(i, u)| (format!("{}{}", &u[..1], i + 1), u.to_string())).collect();
+    s.sync_succeeded(pid, &team).unwrap();
+    s.sync_failed(pid, "relay unreachable").unwrap();
 
     let text = render::board(&s.board(pid, &BoardQuery::board()).unwrap());
     eprintln!("\n=== shared board() with handles and blockers -- ~{} tokens ===\n{}", tokens(&text), text);
     assert!(text.contains("-b1") && text.contains("blocked by #"), "the fixture must actually render handles");
+    assert!(text.contains("team: b1 benny") && text.contains("offline"), "and the header's team line");
     assert!(tokens(&text) < 1000, "shared board cost {} tokens", tokens(&text));
 
     let t = s.create_task(pid, TaskDraft::new("side quest on the shared board")).unwrap();

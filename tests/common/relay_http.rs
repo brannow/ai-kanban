@@ -66,7 +66,13 @@ impl HttpRelay {
                 };
                 ready_tx.send(()).unwrap();
                 let relay = Relay::new(ServerDb::open(&path).unwrap());
-                axum::serve(listener, router(relay)).with_graceful_shutdown(async { let _ = rx.await; }).await.unwrap();
+                // Not a graceful shutdown: that waits for open notification streams to end, which a
+                // client only notices at its read timeout. Stopping drops every connection at once,
+                // like a relay that crashed or was killed.
+                tokio::select! {
+                    r = axum::serve(listener, router(relay)) => r.unwrap(),
+                    _ = rx => {}
+                }
             });
         });
         ready_rx.recv().unwrap();

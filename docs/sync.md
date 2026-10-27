@@ -296,26 +296,58 @@ Each mutation on a connected board writes, **in the same transaction**, one chan
 
 ### When it happens
 
-All of it runs inside the MCP process, which already exists per session, so there is no daemon:
+All of it runs in a background thread of the MCP process (`src/remote/daemon.rs`), which exists
+per session already, so there is no daemon of its own. Nothing starts unless a remote is set
+and the run allows sync.
 
-- **Pull at startup.** **Pull before** any move into `doing` and before `task_add`, so the claim
-  warning and the duplicate hint see current data.
-- **Push after every write** (HTTP POST).
-- **The server notifies, the client pulls.** The MCP process holds one SSE stream per connected
-  room (`rooms/{r}/events`). It carries only "room changed, sequence N", and a heartbeat every
-  30s. On a notification, the client pulls everything since its last position. SSE rather than
-  WebSocket, because only server → client is needed, it is plain HTTP, and the codebase already
-  serves SSE (`src/http/stream.rs`). Behind nginx it needs `proxy_buffering off`.
-- **The pull stays the source of truth.** Streams drop, laptops sleep, proxies cut idle
-  connections. A missed notification only delays a pull, because the position is resumable.
-  With the stream down, the client falls back to pulling every 60s. The pull before a claim stays
-  too: it is the guarantee, and the stream makes it rarely necessary.
-- **One sync at a time per store** (several sessions share one file): a lock row taken with
-  `BEGIN IMMEDIATE`. The apply step is idempotent anyway.
-- Applied remote changes arrive with their events, so `tests/change_feed.rs` and the live page
-  see them like any other write.
-- **Offline:** the outbox keeps growing, and the board header says `@sbahn (offline, 4 unsent)`. Nothing
-  is refused.
+- **At startup**, in the background: never in the way of the session starting.
+- **Shortly after every write** the agent makes: writes in quick succession go out as one round.
+- **When a teammate pushes.** One SSE stream per connected room (`rooms/{r}/events`) carries only
+  "room changed, head N", plus a heartbeat every 30s. Each notification triggers a round that pulls
+  from the board's own cursor. SSE rather than WebSocket, because only server -> client is needed,
+  it is plain HTTP, and the codebase already serves SSE. Behind nginx it needs `proxy_buffering
+  off` and a `proxy_read_timeout` above 30s. Streams reconnect with backoff.
+- **Every 60s regardless.** Streams drop, laptops sleep, proxies cut idle connections, and a missed
+  notification may only delay a pull, never lose one. While the relay is unreachable or sync is
+  paused, rounds back off up to every five minutes.
+- **Before a claim** (`task_update` to `doing`) **and before `task_add`**: a round on the tool
+  call's own connection, so what the agent sees is current. It is bounded at 2.5s. When the relay
+  cannot be reached the claim still goes through, and the header says the board is offline.
+- **Several sessions on one store sync independently.** There is no lock held across the network:
+  retries are stored once per change id, an older clock never wins, and the cursor only moves
+  forward, so concurrent rounds agree (`tests/remote_sync.rs`).
+- **`AI_KANBAN_SYNC=off`** keeps one run local-only (set in the shell that starts Claude Code; not
+  yet verified to reach plugin MCP servers from `.claude/settings.json`). Connected boards keep
+  recording, and the next run that allows sync publishes the backlog.
+- Applied remote changes arrive with their events, so `tests/change_feed.rs` and the live page see
+  them like any other write.
+
+### What the board header says
+
+A shared board's header names its room, and adds one line only when there is something to say:
+
+```
+Board: sbb @sbahn  (5 open, 2 doing)
+team: b1 benny, v1 volker  (offline, 13 changes unsent)
+```
+
+The second line can also say `not synced yet`, `last sync 3h ago` (a stale local copy must say
+so), `N parked until ai-kanban is upgraded`, or replace everything with `sync paused: <why and
+what to do>`. A board that is not shared renders exactly as before.
+
+### When sync pauses
+
+Sync stops for the whole store, never local work, when continuing would corrupt the room:
+
+- the relay speaks a protocol this build does not (upgrade one side);
+- the key belongs to a different origin tag than the store publishes under;
+- **the relay already holds higher ids from this tag than the store would hand out next** -- a
+  store restored from a backup, or copied. Its next tasks would reuse numbers the room holds.
+  The way out: `ai-kanban room disconnect <room> --keep-foreign`, a key with a new tag from the
+  relay admin, `ai-kanban remote <url> --key <new key>`, then `ai-kanban room connect` again. Work
+  published under the old tag stays the store's own (`sync_own_tags`).
+
+A good check lifts the pause by itself; `ai-kanban remote` and `ai-kanban room status` show it.
 
 ### Hooks
 

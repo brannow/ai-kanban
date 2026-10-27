@@ -377,7 +377,10 @@ async fn run_mcp() -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open_default()?;
     eprintln!("ai-kanban: store at {}", Store::default_path()?.display());
 
-    let service = AiKanban::new(store).serve(stdio()).await?;
+    // Shared boards sync in a background thread of this process (`remote::daemon`); nothing
+    // starts unless a remote is set and this run allows sync.
+    let sync = ai_kanban::remote::daemon::Syncer::start();
+    let service = AiKanban::with_sync(store, sync).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

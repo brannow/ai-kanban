@@ -140,7 +140,11 @@ fn header(snap: &BoardSnapshot) -> String {
         Some(w) => format!("{} / {}", snap.project.name, w.name),
         None => snap.project.name.clone(),
     };
-    let mut out = format!("Board: {}  ({})\n", title, bits.join(", "));
+    let room = snap.sync.as_ref().map(|s| format!(" @{}", s.room)).unwrap_or_default();
+    let mut out = format!("Board: {title}{room}  ({})\n", bits.join(", "));
+    if let Some(s) = &snap.sync {
+        out.push_str(&sync_line(s, snap.now));
+    }
 
     if !snap.other_workstreams.is_empty() {
         let shown = snap.other_workstreams.iter().take(DIRECTORY_LIMIT)
@@ -154,6 +158,40 @@ fn header(snap: &BoardSnapshot) -> String {
         out.push_str(&format!("other workstreams: {shown}{more}\n"));
     }
     out
+}
+
+/// The shared board's second header line: who is in the room, and anything about its sync the
+/// agent should know before trusting what it sees. One line, because it is paid for on every
+/// board call; nothing at all when there is nothing to say.
+///
+/// Staleness is stated rather than hidden: the board is a local copy, and "last sync 3h ago"
+/// is the difference between "nobody is on this" and "nobody was on this three hours ago".
+fn sync_line(s: &crate::core::sync::SyncStatus, now: i64) -> String {
+    if let Some(why) = &s.paused {
+        return format!("sync paused: {why}\n");
+    }
+    let mut state = Vec::new();
+    match (&s.last_error, s.last_ok_at) {
+        (Some(_), _) => state.push("offline".to_string()),
+        (None, None) => state.push("not synced yet".to_string()),
+        (None, Some(t)) if now - t > 3600 => state.push(format!("last sync {}", ago(now, t))),
+        _ => {}
+    }
+    // Changes, not tasks: one new task is a dozen field changes, and "13 unsent" would read as
+    // thirteen tasks.
+    if s.unsent > 0 {
+        state.push(format!("{} change{} unsent", s.unsent, if s.unsent == 1 { "" } else { "s" }));
+    }
+    if s.parked > 0 {
+        state.push(format!("{} parked until ai-kanban is upgraded", s.parked));
+    }
+    let team = s.members.iter().map(|(tag, user)| format!("{tag} {user}")).collect::<Vec<_>>().join(", ");
+    match (team.is_empty(), state.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("sync: {}\n", state.join(", ")),
+        (false, true) => format!("team: {team}\n"),
+        (false, false) => format!("team: {team}  ({})\n", state.join(", ")),
+    }
 }
 
 /// One task, one line. The trailing parenthetical carries only what is *not* obvious from

@@ -243,3 +243,52 @@ fn a_note_number_in_generated_history_is_never_taken_for_a_task() {
     assert_eq!(h.text("note #3 \"x\" -- was: see #4", Some("v1")), "note #3 \"x\" -- was: see #4-v1");
     assert_eq!(h.text("Note #3", Some("v1")), "Note #3");
 }
+
+// ---------------------------------------------------------------------------
+// The shared board's header
+// ---------------------------------------------------------------------------
+
+fn header(s: &Store, pid: i64) -> String {
+    render::board(&s.board(pid, &BoardQuery::board()).unwrap()).lines().take(2).collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn a_shared_board_names_its_room_its_team_and_anything_wrong_with_its_sync() {
+    let s = Store::open_in_memory().unwrap();
+    s.set_origin_tag("b1").unwrap();
+    let pid = s.create_board("sbb").unwrap().id;
+    s.connect_board(pid, "sbahn").unwrap();
+    assert!(header(&s, pid).starts_with("Board: sbb @sbahn  ("), "{}", header(&s, pid));
+    assert!(header(&s, pid).contains("sync: not synced yet"), "{}", header(&s, pid));
+
+    let team = vec![("b1".to_string(), "benny".to_string()), ("v1".to_string(), "volker".to_string())];
+    s.flush().unwrap();
+    s.outbox_sent(pid, i64::MAX).unwrap();
+    s.sync_succeeded(pid, &team).unwrap();
+    assert!(header(&s, pid).ends_with("team: b1 benny, v1 volker"), "nothing wrong, nothing said: {}", header(&s, pid));
+
+    s.create_task(pid, TaskDraft::new("written offline")).unwrap();
+    s.flush().unwrap();
+    s.sync_failed(pid, "relay unreachable: connection refused").unwrap();
+    let h = header(&s, pid);
+    assert!(h.contains("team: b1 benny, v1 volker  (offline, ") && h.ends_with(" changes unsent)"), "{h}");
+
+    s.set_paused(Some("the relay speaks protocol 2-3, this ai-kanban speaks 1")).unwrap();
+    assert!(header(&s, pid).contains("sync paused: the relay speaks protocol 2-3"), "{}", header(&s, pid));
+    s.set_paused(None).unwrap();
+
+    s.sync_succeeded(pid, &team).unwrap();
+    s.conn.execute("UPDATE sync_room_status SET last_ok_at = last_ok_at - 3 * 3600", []).unwrap();
+    assert!(header(&s, pid).contains("last sync 3h"), "a stale copy says so: {}", header(&s, pid));
+}
+
+#[test]
+fn a_board_that_is_not_shared_has_the_same_header_as_ever() {
+    let s = Store::open_in_memory().unwrap();
+    s.set_origin_tag("b1").unwrap();
+    let private = s.create_board("private").unwrap().id;
+    let shared = s.create_board("shared").unwrap().id;
+    s.connect_board(shared, "room").unwrap();
+    assert_eq!(header(&s, private).lines().next().unwrap(), "Board: private  (0 open)");
+    assert!(!header(&s, private).contains("team") && !header(&s, private).contains("sync"));
+}

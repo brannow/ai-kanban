@@ -51,6 +51,9 @@ const ALL: &str = "all";
 
 pub struct AiKanban {
     store: Arc<Mutex<Store>>,
+    /// Keeps shared boards in sync while the session runs. `None` when no remote is set or
+    /// this run has sync off, and then no tool call touches the network.
+    sync: Option<Arc<crate::remote::daemon::Syncer>>,
     /// Captured once at startup. The server is spawned inside the project by the host, so
     /// this is the project context for the whole process.
     cwd: PathBuf,
@@ -58,7 +61,27 @@ pub struct AiKanban {
 
 impl AiKanban {
     pub fn new(store: Store) -> Self {
-        Self { store: Arc::new(Mutex::new(store)), cwd: project_dir() }
+        Self { store: Arc::new(Mutex::new(store)), sync: None, cwd: project_dir() }
+    }
+
+    /// `new`, syncing shared boards in the background (`remote::daemon`).
+    pub fn with_sync(store: Store, sync: Option<crate::remote::daemon::Syncer>) -> Self {
+        Self { store: Arc::new(Mutex::new(store)), sync: sync.map(Arc::new), cwd: project_dir() }
+    }
+
+    /// After a write: publish it soon, without making the agent wait.
+    fn wrote(&self) {
+        if let Some(s) = &self.sync {
+            s.kick();
+        }
+    }
+
+    /// Before the agent claims work or files a task on a shared board: catch up first, so a
+    /// teammate's claim from a minute ago is visible. Bounded, and never fails the call.
+    fn catch_up(&self, store: &Store, project_id: i64) {
+        if let Some(s) = &self.sync {
+            s.now(store, project_id);
+        }
     }
 
     fn store(&self) -> std::sync::MutexGuard<'_, Store> {
@@ -441,6 +464,7 @@ impl AiKanban {
     fn task_add(&self, Parameters(p): Parameters<TaskAddParams>) -> Result<String, ErrorData> {
         let store = self.store();
         let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
+        self.catch_up(&store, resolved.project.id);
         let repos = repo_ids(&store, resolved.project.id, &p.repos)?.unwrap_or_default();
 
         let draft = TaskDraft {
@@ -460,6 +484,7 @@ impl AiKanban {
             external_ref: p.external_ref.clone(),
         };
         let task = store.create_task(resolved.project.id, draft).map_err(fail)?;
+        self.wrote();
         let snap = store.board_after_mutation(resolved.project.id, task.id).map_err(fail)?;
         Ok(render::board(&snap))
     }
@@ -478,6 +503,10 @@ impl AiKanban {
         };
 
         let task = store.resolve_task_arg(resolved.project.id, &p.task.0).map_err(fail)?;
+        // Claiming work: catch up first, so a teammate who claimed it a minute ago is visible.
+        if p.status.as_deref().map(str::trim).is_some_and(|s| s.eq_ignore_ascii_case("doing")) {
+            self.catch_up(&store, resolved.project.id);
+        }
         let patch = TaskPatch {
             title: p.title.clone(),
             body: p.body.clone(),
@@ -523,6 +552,7 @@ impl AiKanban {
             None => resolved.project.id,
         };
         // The board the task is on now, so "did it land" is answered where it landed.
+        self.wrote();
         let snap = store.board_after_mutation(board, task).map_err(fail)?;
         Ok(render::board(&snap))
     }
@@ -554,6 +584,7 @@ impl AiKanban {
             task_id: p.task.as_ref().map(|t| store.resolve_task_arg(resolved.project.id, &t.0)).transpose().map_err(fail)?,
         };
         let note = store.create_note(resolved.project.id, draft, Actor::Agent).map_err(fail)?;
+        self.wrote();
         Ok(format!("Board: {}\n\nnote #{} \"{}\" recorded.\n", resolved.project.name, note.id, note.title))
     }
 
@@ -576,6 +607,7 @@ impl AiKanban {
             expected_version: None,
         };
         let note = store.update_note(resolved.project.id, p.note, patch).map_err(fail)?;
+        self.wrote();
         Ok(format!("Board: {}\n\nnote #{} \"{}\" updated. The previous version is in the project history.\n",
             resolved.project.name, note.id, note.title))
     }
@@ -638,6 +670,7 @@ impl AiKanban {
         let repo = store
             .add_repo(pid, &crate::expand_home(p.path.trim()), p.name.as_deref(), Actor::Agent)
             .map_err(fail)?;
+        self.wrote();
         let note = match before.iter().find(|r| r.id == repo.id) {
             Some(_) => format!("{} was already on this board.", repo.name),
             None if repo.home_project_id == pid => {
@@ -698,6 +731,7 @@ impl AiKanban {
         };
         let name = store.repo(pid, id).map_err(fail)?.name;
         let unlinked = store.remove_repo(pid, id, Actor::Agent).map_err(fail)?;
+        self.wrote();
         let menu = store.repo_summaries(pid).map_err(fail)?;
         Ok(format!("{}\n{name} removed from this board, off {unlinked} ticket{}.\n",
             render::repo_menu(&resolved.project.name, &menu),
@@ -714,6 +748,7 @@ impl AiKanban {
         let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
         let task = p.task.as_ref().map(|t| store.resolve_task_arg(resolved.project.id, &t.0)).transpose().map_err(fail)?;
         store.log_on(resolved.project.id, task, Actor::Agent, &p.body).map_err(fail)?;
+        self.wrote();
         Ok(format!("Board: {}\n\nrecorded.\n", resolved.project.name))
     }
 }

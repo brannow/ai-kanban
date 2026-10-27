@@ -67,6 +67,7 @@ impl Store {
             workstream,
             now: now(),
             handles: Default::default(),
+            sync: self.sync_status(project_id)?,
         })
         .and_then(|mut snap: BoardSnapshot| {
             let texts: Vec<(&str, i64)> = snap.recent.iter().map(|e| ("event", e.id)).collect();

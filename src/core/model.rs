@@ -371,6 +371,10 @@ pub struct BoardSnapshot {
     /// How tasks are named on this board. Empty unless it is connected to a room.
     #[serde(skip)]
     pub handles: Handles,
+    /// The room this board is shared through, and how its sync stands. `None` for a board that
+    /// is not shared, which then renders exactly as before.
+    #[serde(skip)]
+    pub sync: Option<crate::core::sync::SyncStatus>,
 }
 
 impl BoardSnapshot {
