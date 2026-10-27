@@ -158,12 +158,19 @@ pub struct Applied {
 }
 
 /// A connected board's sync state, for `room status` and the board header.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SyncStatus {
     pub room: String,
     pub cursor: i64,
     pub unsent: i64,
     pub parked: i64,
+    pub last_ok_at: Option<i64>,
+    /// Why the last attempt failed, until one succeeds.
+    pub last_error: Option<String>,
+    /// Why sync is stopped for this whole store, if it is.
+    pub paused: Option<String>,
+    /// (tag, user) of everyone in the room, as last reported.
+    pub members: Vec<(String, String)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -313,13 +320,80 @@ impl Store {
         Ok(())
     }
 
+    /// Tolerant like every other read the hook can reach: `None` on a store older than the
+    /// tables it reads.
     pub fn sync_status(&self, project_id: i64) -> Result<Option<SyncStatus>> {
-        let Some((room, cursor)) = self.conn
-            .query_row("SELECT room, cursor FROM sync_rooms WHERE project_id = ?1", [project_id], |r| Ok((r.get(0)?, r.get(1)?)))
-            .optional()? else { return Ok(None) };
+        let row = self.conn.query_row(
+            "SELECT room, cursor, last_ok_at, last_error, members FROM sync_rooms WHERE project_id = ?1",
+            [project_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, String>(4)?)),
+        );
+        let (room, cursor, last_ok_at, last_error, members) = match row.optional() {
+            Ok(Some(r)) => r,
+            Ok(None) => return Ok(None),
+            Err(e) if crate::core::workstream::is_missing_schema(&e) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
         let unsent = self.conn.query_row("SELECT COUNT(*) FROM sync_outbox WHERE project_id = ?1", [project_id], |r| r.get(0))?;
         let parked = self.conn.query_row("SELECT COUNT(*) FROM sync_parked WHERE project_id = ?1", [project_id], |r| r.get(0))?;
-        Ok(Some(SyncStatus { room, cursor, unsent, parked }))
+        let members: Vec<Value> = serde_json::from_str(&members).unwrap_or_default();
+        let members = members.iter().filter_map(|m| Some((m.get("tag")?.as_str()?.to_string(), m.get("user")?.as_str()?.to_string()))).collect();
+        Ok(Some(SyncStatus { room, cursor, unsent, parked, last_ok_at, last_error, paused: self.paused()?, members }))
+    }
+
+    /// Why sync is stopped for this store, if it is.
+    pub fn paused(&self) -> Result<Option<String>> {
+        match self.conn.query_row("SELECT paused FROM sync_node WHERE id = 1", [], |r| r.get(0)) {
+            Ok(p) => Ok(p),
+            Err(e) if crate::core::workstream::is_missing_schema(&e) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn set_paused(&self, reason: Option<&str>) -> Result<()> {
+        self.conn.execute("UPDATE sync_node SET paused = ?1 WHERE id = 1", [reason])?;
+        Ok(())
+    }
+
+    /// Records a successful round with the relay, and who is in the room.
+    pub fn sync_succeeded(&self, project_id: i64, members: &[(String, String)]) -> Result<()> {
+        let members: Vec<Value> = members.iter().map(|(t, u)| json!({ "tag": t, "user": u })).collect();
+        self.conn.execute(
+            "UPDATE sync_rooms SET last_ok_at = ?2, last_error = NULL, members = ?3 WHERE project_id = ?1",
+            params![project_id, now(), Value::Array(members).to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn sync_failed(&self, project_id: i64, why: &str) -> Result<()> {
+        self.conn.execute("UPDATE sync_rooms SET last_error = ?2 WHERE project_id = ?1", params![project_id, why])?;
+        Ok(())
+    }
+
+    /// The counters this store would hand out next, in the shape the relay reports its
+    /// high-water marks in. A relay that has seen higher ones from this tag means the store was
+    /// restored from a backup or copied: its next ids would collide with ones the room holds.
+    pub fn local_high_water(&self) -> Result<crate::sync::protocol::HighWater> {
+        let seq = |name: &str| -> Result<i64> {
+            Ok(self.conn.query_row("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = ?1), 0)", [name], |r| r.get(0))?)
+        };
+        let top = |table: &str| -> Result<i64> {
+            Ok(self.conn.query_row(
+                &format!("SELECT MAX(COALESCE((SELECT MAX(id) FROM {table}), 0), COALESCE((SELECT value FROM id_floor WHERE tbl = '{table}'), 0))"),
+                [], |r| r.get(0),
+            )?)
+        };
+        Ok(crate::sync::protocol::HighWater { outbox: seq("sync_outbox")?, task: top("tasks")?, note: top("notes")?, event: seq("events")? })
+    }
+
+    pub fn connected_boards(&self) -> Result<Vec<(i64, String)>> {
+        let mut st = match self.conn.prepare("SELECT project_id, room FROM sync_rooms ORDER BY project_id") {
+            Ok(st) => st,
+            Err(e) if crate::core::workstream::is_missing_schema(&e) => return Ok(vec![]),
+            Err(e) => return Err(e.into()),
+        };
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// The identity a local row has in every room, if it has one yet.

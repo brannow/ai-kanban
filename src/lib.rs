@@ -16,6 +16,7 @@ pub mod core;
 pub mod hook;
 pub mod http;
 pub mod mcp;
+pub mod remote;
 pub mod render;
 pub mod sync;
 

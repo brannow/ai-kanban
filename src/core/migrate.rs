@@ -62,6 +62,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration { version: 13, sql: include_str!("migrations/013_id_floor.sql") },
     Migration { version: 14, sql: include_str!("migrations/014_sync.sql") },
     Migration { version: 15, sql: include_str!("migrations/015_sync_repair.sql") },
+    Migration { version: 16, sql: include_str!("migrations/016_sync_status.sql") },
 ];
 
 /// The version this binary brings a store up to.
