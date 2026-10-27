@@ -21,6 +21,9 @@ env:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    # The Dockerfile's builder, so CI and the image compile with the same toolchain rather than
+    # whatever Rust the runner happens to have preinstalled.
+    container: rust:1.99-trixie
     steps:
       - uses: actions/checkout@v4
       - run: cargo test --locked

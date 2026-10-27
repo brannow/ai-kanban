@@ -165,6 +165,7 @@ async fn events(
 ) -> Result<impl IntoResponse, ServerError> {
     let p = r.auth(&headers)?;
     let (room_id, head) = r.db().member_head(&room, &p)?;
+    let (tag, key_id) = (p.tag.clone(), p.key_id);
     // Its own connection, opened per tick, like `http::stream`: a reader polling through the
     // shared mutex would contend with every push. In-memory databases (tests) have no path, so
     // they fall back to the shared handle.
@@ -176,11 +177,13 @@ async fn events(
         loop {
             tokio::time::sleep(POLL).await;
             let now = match &path {
-                Some(path) => read_head(path, room_id),
-                None => db.lock().ok().and_then(|d| d.head(room_id).ok()),
+                Some(path) => rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .ok()
+                    .and_then(|c| head_if_allowed(&c, room_id, &tag, key_id)),
+                None => db.lock().ok().and_then(|d| head_if_allowed(&d.conn, room_id, &tag, key_id)),
             };
-            // Gone means the room was deleted: end the stream, and the client's next pull
-            // reports why.
+            // None means the room was deleted, or the key, the user or the membership is gone:
+            // end the stream, and the client's next request says which.
             let Some(now) = now else { break };
             if now != last {
                 last = now;
@@ -193,12 +196,23 @@ async fn events(
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30))))
 }
 
-fn read_head(path: &std::path::Path, room_id: i64) -> Option<i64> {
-    let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
-    let exists: bool = conn
-        .query_row("SELECT EXISTS(SELECT 1 FROM rooms WHERE id = ?1)", [room_id], |r| r.get(0))
+/// The room's head, if the stream may still see it. Checked on every tick rather than once at
+/// connect, because every other route checks access per request: a stream that outlived a
+/// revoked key, a disabled user or a left room would be the one route that doesn't.
+fn head_if_allowed(conn: &rusqlite::Connection, room_id: i64, tag: &str, key_id: i64) -> Option<i64> {
+    let allowed: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM members m
+                             JOIN keys k ON k.tag = m.tag
+                             JOIN tags t ON t.tag = m.tag
+                             JOIN users u ON u.id = t.user_id
+                            WHERE m.room_id = ?1 AND m.tag = ?2 AND m.left_at IS NULL
+                              AND k.id = ?3 AND k.revoked_at IS NULL AND u.disabled_at IS NULL)",
+            rusqlite::params![room_id, tag, key_id],
+            |r| r.get(0),
+        )
         .ok()?;
-    if !exists {
+    if !allowed {
         return None;
     }
     conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM changes WHERE room_id = ?1", [room_id], |r| r.get(0))

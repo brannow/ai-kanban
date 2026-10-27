@@ -363,3 +363,49 @@ async fn the_event_stream_announces_changes_made_by_another_process() {
     assert!(seen.contains("data: 0"), "the first event is the head at connect: {seen}");
     assert!(seen.contains("data: 1"), "then the head after the other process wrote: {seen}");
 }
+
+/// The stream re-checks access on every tick, like every other route checks it per request.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_event_stream_ends_when_its_key_is_revoked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.db");
+    let (key, relay) = {
+        let db = ServerDb::open(&path).unwrap();
+        db.add_user("benny").unwrap();
+        let key = db.add_key("benny", "b1", "").unwrap();
+        (key, Relay::new(db))
+    };
+    let p = relay.db.lock().unwrap().authenticate(&key).unwrap();
+    relay.db.lock().unwrap().join("sbahn", &p).unwrap();
+    let key_id = p.key_id;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router(relay)).await.unwrap() });
+
+    let reader = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        write!(s, "GET /v1/rooms/sbahn/events HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: Bearer {key}\r\n\r\n").unwrap();
+        let mut seen = String::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) => return (true, seen),
+                Ok(n) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(_) => return (false, seen),
+            }
+            if seen.ends_with("\r\n0\r\n\r\n") {
+                return (true, seen);
+            }
+        }
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    ServerDb::open(&path).unwrap().revoke_key(key_id).unwrap();
+
+    let (ended, seen) = reader.await.unwrap();
+    assert!(seen.contains("event: head"), "{seen}");
+    assert!(ended, "the stream kept running after its key was revoked: {seen}");
+}
