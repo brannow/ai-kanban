@@ -6,13 +6,39 @@ version = 4
 name = "ai-kanban"
 version = "0.1.0"
 dependencies = [
+ "ai-kanban-protocol",
+ "ai-kanban-relay",
  "async-stream",
  "axum",
  "dirs",
- "getrandom 0.4.3",
  "rmcp",
  "rusqlite",
  "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tower",
+]
+
+[[package]]
+name = "ai-kanban-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ai-kanban-relay"
+version = "0.1.0"
+dependencies = [
+ "ai-kanban-protocol",
+ "async-stream",
+ "axum",
+ "getrandom 0.4.3",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

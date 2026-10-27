@@ -88,7 +88,7 @@ the honest answer is "it would look more complete", it does not belong.
 ## Why this can stay small
 
 One SQLite file, one static binary, no daemon, no server **required**, no per-project setup. A
-team that wants to share a board runs one relay (`ai-kanban server`). A solo user never has to. The entire
+team that wants to share a board runs one relay (`ai-kanban-relay`). A solo user never has to. The entire
 system is a schema, a few thousand lines of Rust, and the discipline to keep saying no.
 
 That is not modesty. Setup overhead is what kills tools like this: anything that needs

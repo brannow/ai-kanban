@@ -8,9 +8,16 @@
 //! own `application_id`, and it refuses a file that carries neither -- so pointing `--db` at a
 //! personal `kanban.db` fails at startup instead of writing server tables into it.
 
-use crate::core::now;
-use crate::sync::protocol::{self, Change, HighWater, Joined, Member, Page, Pulled, Pushed, Ref, RoomInfo};
+use ai_kanban_protocol::{self as protocol, Change, HighWater, Joined, Member, Page, Pulled, Pushed, Ref, RoomInfo};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+
+/// Unix epoch seconds, as everywhere in ai-kanban.
+pub fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 use std::path::{Path, PathBuf};
 
 /// Marks a file as a relay database. Arbitrary, fixed forever; `PRAGMA application_id` exists
@@ -114,7 +121,7 @@ impl ServerDb {
         let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table'", [], |r| r.get(0))?;
         if app != APPLICATION_ID && tables > 0 {
             return Err(ServerError::Other(
-                "this file is not an ai-kanban server database (is it a personal kanban.db?). \
+                "this file is not an ai-kanban-relay database (is it a personal kanban.db?). \
                  Point --db or AI_KANBAN_SERVER_DB at a new file."
                     .into(),
             ));
@@ -552,7 +559,7 @@ impl ServerDb {
                 Some(_) => {
                     return Err(ServerError::Conflict(format!(
                         "change id {} was already used for different content. This store looks restored \
-                         from a backup or copied: it needs a new tag (`ai-kanban server key add`)",
+                         from a backup or copied: it needs a new tag (`ai-kanban-relay key add`)",
                         ch.cid
                     )));
                 }

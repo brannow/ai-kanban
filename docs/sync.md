@@ -117,7 +117,7 @@ connected. Board header now shows: Board: sbb @sbahn
   whole history. A backup is written before anything leaves the machine.
 - **Connecting to a room that does not exist creates it.** Any user may, since a server is a team.
   The summary says `room "sbahnn" does not exist yet — it will be created`, so a typo is visible
-  before the confirmation. Only the admin deletes rooms (`ai-kanban server room delete`). The
+  before the confirmation. Only the admin deletes rooms (`ai-kanban-relay room delete`). The
   server removes **empty** rooms after 7 days: no tasks, notes or events, and no board connected.
 
 **`room disconnect sbahn`:**
@@ -260,7 +260,7 @@ Each mutation on a connected board writes, **in the same transaction**, one chan
 - **Events** are insert-only: one change carries the whole row, and duplicates are dropped by id.
 - **Forget** is a tombstone that beats every later field change and is **kept forever**.
   Otherwise a member who was offline pushes the forgotten rows back. **In a room, only the admin
-  forgets** (`ai-kanban server forget <room> <handle>`), because it is permanent for every member.
+  forgets** (`ai-kanban-relay forget <room> <handle>`), because it is permanent for every member.
   Locally, forget on a connected board is refused and the message names that command. On boards
   that aren't connected, forget works as today.
 - **Names that must be unique** (workstreams per board, repos) merge **by name**. Two machines
@@ -346,17 +346,17 @@ different reasons.
 
 ## Server
 
-`ai-kanban server`, same crate, as a Docker image with a `/data` volume. TLS goes on the reverse
+`ai-kanban-relay`, its own binary (`crates/relay`), as a Docker image with a `/data` volume. TLS goes on the reverse
 proxy. It has its own router with bearer auth on every route; `serve`'s loopback-only rules
 stay for `serve`.
 
 ```
-ai-kanban server user add volker
-ai-kanban server key add volker --label laptop --tag v1   # prints the key once
-ai-kanban server key list | revoke <id> | rotate <tag>
-ai-kanban server room list | delete <room>               # rooms are created by connecting
-ai-kanban server forget <room> <handle>                 # the only forget in a room
-ai-kanban server snapshot                              # also scheduled: --snapshot-every 6h --keep 28
+ai-kanban-relay user add volker
+ai-kanban-relay key add volker --label laptop --tag v1   # prints the key once
+ai-kanban-relay key list | revoke <id> | rotate <tag>
+ai-kanban-relay room list | delete <room>               # rooms are created by connecting
+ai-kanban-relay forget <room> <handle>                 # the only forget in a room
+ai-kanban-relay snapshot                              # also scheduled: --snapshot-every 6h --keep 28
 ```
 
 - **Keys:** 32 random bytes, prefixed `akb_`, stored as SHA-256. Not JWT: one server with a
@@ -401,8 +401,8 @@ The image is built by `Dockerfile` and published by `.github/workflows/relay-ima
 ```
 docker run -d --name kanban --restart unless-stopped \
   -v kanban-data:/data -p 127.0.0.1:7373:7373 ghcr.io/<owner>/ai-kanban-relay:latest
-docker exec kanban ai-kanban server user add benny
-docker exec kanban ai-kanban server key add benny --tag b1 --label laptop   # prints the key once
+docker exec kanban ai-kanban-relay user add benny
+docker exec kanban ai-kanban-relay key add benny --tag b1 --label laptop   # prints the key once
 ```
 
 - **Runs as non-root** (distroless, uid 65532) and owns `/data`. A bind mount instead of a named
@@ -412,7 +412,7 @@ docker exec kanban ai-kanban server key add benny --tag b1 --label laptop   # pr
 - **TLS goes on the proxy.** Publish the port on loopback only, as above, and let nginx (or
   similar) terminate TLS. The event stream needs `proxy_buffering off;` and a `proxy_read_timeout`
   above the 30s heartbeat.
-- `HEALTHCHECK` runs `ai-kanban server health`, a single request made with the standard library,
+- `HEALTHCHECK` runs `ai-kanban-relay health`, a single request made with the standard library,
   because the image has no shell or curl.
 
 ## Local schema

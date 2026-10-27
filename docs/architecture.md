@@ -28,7 +28,7 @@ ai-kanban serve [--port N]     Web UI + HTTP API on 127.0.0.1
 ```
 
 Subcommands rather than separate binaries because "little setup overhead" is the pitch: one
-file to install, one to update. `serve` landed here rather than in a second stack, and the
+file to install, one to update. (The sync relay is the one exception, below.) `serve` landed here rather than in a second stack, and the
 web UI is embedded in the binary for the same reason — a page that needs its assets beside it
 is no longer one file.
 
@@ -37,6 +37,14 @@ JSON out on stdout. `SessionStart` fires before the host finishes connecting to 
 so a hook on that event cannot call our own tools and has to be a command. Emitting the JSON
 from the binary also means the plugin needs no wrapper script and no `jq`, and works on
 Windows.
+
+## The relay is its own binary
+
+The sync relay (`docs/sync.md`) lives in `crates/relay` and builds `ai-kanban-relay`. It runs in
+a container on a server, the client on every laptop, and neither needs the other's code -- a
+person working alone never installs it, so "one file to install" still holds for them. The wire
+format the two share is a third crate, `crates/protocol`: one definition, so they cannot drift.
+The client's sync tests run against the real relay in-process, as a dev-dependency only.
 
 ## The store
 
@@ -145,8 +153,8 @@ Battle-tested crates by preference:
 | `dirs` | Platform data directory. More widely used than the `directories` alternative. |
 | `axum` | The HTTP server. Same maintainers as `tokio`, which was already a dependency, and the most-used Rust web framework. |
 | `async-stream` | Writing the SSE stream as a generator rather than a hand-rolled `Stream` impl. |
-| `sha2` | The relay stores SHA-256 of each access key, never the key (`docs/sync.md`). A slow password hash buys nothing for 256 random bits. RustCrypto, the standard. |
-| `getrandom` | Access keys need OS randomness. The crate the rest of the ecosystem's RNGs sit on; no full `rand` for 32 bytes. |
+| `sha2` | Relay only. The relay stores SHA-256 of each access key, never the key (`docs/sync.md`). A slow password hash buys nothing for 256 random bits. RustCrypto, the standard. |
+| `getrandom` | Relay only. Access keys need OS randomness. The crate the rest of the ecosystem's RNGs sit on; no full `rand` for 32 bytes. |
 | `schemars` | Tool input schemas, required by `rmcp`. |
 | `rmcp` | **The deliberate exception.** New and not widely used, but it is the official Rust MCP SDK and there is no mature alternative. The core/adapter split is what limits the blast radius if it churns. |
 

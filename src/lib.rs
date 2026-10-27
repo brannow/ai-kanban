@@ -17,7 +17,6 @@ pub mod hook;
 pub mod http;
 pub mod mcp;
 pub mod render;
-pub mod server;
 pub mod sync;
 
 /// `~/...` expanded against the home directory.

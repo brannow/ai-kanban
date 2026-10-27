@@ -558,7 +558,7 @@ fn a_connected_board_refuses_local_forgets_and_merges() {
     assert!(matches!(benny.store.merge_projects(other, benny.pid), Err(Error::SharedBoard { .. })));
     assert!(matches!(benny.store.merge_projects(benny.pid, other), Err(Error::SharedBoard { .. })));
     let msg = benny.store.forget_task(benny.pid, t.id).unwrap_err().to_string();
-    assert!(msg.contains("ai-kanban server forget sbahn task"), "the refusal says who can: {msg}");
+    assert!(msg.contains("ai-kanban-relay forget sbahn task"), "the refusal says who can: {msg}");
     assert!(benny.store.task(benny.pid, t.id).is_ok());
 }
 

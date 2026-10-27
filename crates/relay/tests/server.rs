@@ -2,8 +2,8 @@
 //! guards that keep a client from writing under someone else's name or reissuing ids after a
 //! restore. `docs/sync.md` is the design these assert.
 
-use ai_kanban::server::{router, Relay, ServerDb};
-use ai_kanban::sync::protocol::{Change, Clock, Ref};
+use ai_kanban_relay::{router, Relay, ServerDb};
+use ai_kanban_protocol::{Change, Clock, Ref};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
@@ -305,10 +305,10 @@ async fn empty_rooms_go_after_seven_days_but_never_a_room_with_content_or_member
     }
     {
         let db = f.relay.db.lock().unwrap();
-        let old = ai_kanban::core::now() - 8 * 86400;
+        let old = ai_kanban_relay::store::now() - 8 * 86400;
         db.conn.execute("UPDATE rooms SET created_at = ?1", [old]).unwrap();
         db.conn.execute("UPDATE members SET joined_at = ?1, left_at = CASE WHEN left_at IS NULL THEN NULL ELSE ?1 END", [old]).unwrap();
-        assert_eq!(db.remove_empty_rooms(ai_kanban::server::EMPTY_ROOM_AGE).unwrap(), ["typo"]);
+        assert_eq!(db.remove_empty_rooms(ai_kanban_relay::EMPTY_ROOM_AGE).unwrap(), ["typo"]);
     }
     let (_, rooms) = call(&f.relay, "GET", "/v1/rooms", Some(&f.benny), None).await;
     let names: Vec<&str> = rooms.as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
@@ -319,9 +319,11 @@ async fn empty_rooms_go_after_seven_days_but_never_a_room_with_content_or_member
 fn the_server_refuses_to_open_a_personal_store() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kanban.db");
-    ai_kanban::core::Store::open(&path).unwrap();
+    // Any SQLite file with tables that is not a relay database stands in for a kanban.db; the
+    // relay deliberately does not depend on the client crate.
+    rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT);").unwrap();
     let err = ServerDb::open(&path).err().expect("a kanban store must not open as a relay db").to_string();
-    assert!(err.contains("not an ai-kanban server database"), "{err}");
+    assert!(err.contains("not an ai-kanban-relay database"), "{err}");
 }
 
 /// Notifications come from polling, so a change made by another process -- an admin command
@@ -359,7 +361,7 @@ async fn the_event_stream_announces_changes_made_by_another_process() {
         seen
     });
 
-    // A second handle on the same file stands in for `docker exec ai-kanban server ...`.
+    // A second handle on the same file stands in for `docker exec ai-kanban-relay ...`.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let other = ServerDb::open(&path).unwrap();
     let p = other.authenticate(&key).unwrap();
@@ -663,7 +665,7 @@ fn snapshots_are_consistent_copies_and_only_the_newest_are_kept() {
         std::fs::write(snaps.join(format!("server-{t}.db")), b"old").unwrap();
     }
     std::fs::write(snaps.join("unrelated.txt"), b"keep me").unwrap();
-    let newest = ai_kanban::server::take_snapshot(&db, &snaps, 2).unwrap();
+    let newest = ai_kanban_relay::take_snapshot(&db, &snaps, 2).unwrap();
 
     let mut left: Vec<String> = std::fs::read_dir(&snaps).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
     left.sort();
@@ -683,9 +685,9 @@ async fn an_empty_room_survives_until_seven_days_after_it_was_last_used() {
         call(&f.relay, "POST", &format!("/v1/rooms/{room}/leave"), Some(&f.benny), None).await;
     }
     let db = f.relay.db.lock().unwrap();
-    let old = ai_kanban::core::now() - 30 * 86400;
+    let old = ai_kanban_relay::store::now() - 30 * 86400;
     db.conn.execute("UPDATE rooms SET created_at = ?1 WHERE name = 'recently-left'", [old]).unwrap();
-    assert!(db.remove_empty_rooms(ai_kanban::server::EMPTY_ROOM_AGE).unwrap().is_empty(),
+    assert!(db.remove_empty_rooms(ai_kanban_relay::EMPTY_ROOM_AGE).unwrap().is_empty(),
         "one is new, the other was left just now");
 }
 

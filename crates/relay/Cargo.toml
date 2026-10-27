@@ -1,0 +1,26 @@
+[package]
+name = "ai-kanban-relay"
+version = "0.1.0"
+edition = "2024"
+description = "The relay a team shares ai-kanban boards through. See docs/sync.md."
+license-file = "../../LICENSE"
+
+[[bin]]
+name = "ai-kanban-relay"
+path = "src/main.rs"
+
+[dependencies]
+ai-kanban-protocol = { path = "../protocol" }
+async-stream = "0.3.6"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+getrandom = "0.4.3"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.1"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }

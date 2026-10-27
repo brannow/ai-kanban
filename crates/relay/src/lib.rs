@@ -1,4 +1,5 @@
-//! `ai-kanban server` -- the relay a team shares boards through. `docs/sync.md` is the design.
+//! The relay a team shares boards through. `docs/sync.md` is the design; the binary is
+//! `ai-kanban-relay`.
 //!
 //! # Why it is not `serve`
 //!
@@ -16,7 +17,7 @@
 pub mod admin;
 pub mod store;
 
-use crate::sync::protocol::{self, Hello, Push, WhoAmI};
+use ai_kanban_protocol::{self as protocol, Hello, Push, WhoAmI};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -275,7 +276,7 @@ fn spawn_housekeeping(relay: Relay, snapshot_every: Option<u64>, dir: PathBuf, k
 
 /// Writes `server-<unix seconds>.db` into `dir` and prunes all but the newest `keep`.
 pub fn take_snapshot(db: &ServerDb, dir: &std::path::Path, keep: usize) -> Result<PathBuf, ServerError> {
-    let dest = dir.join(format!("server-{}.db", crate::core::now()));
+    let dest = dir.join(format!("server-{}.db", store::now()));
     db.snapshot(&dest)?;
     let mut snaps: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))

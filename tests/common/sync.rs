@@ -5,7 +5,7 @@
 
 use ai_kanban::core::model::*;
 use ai_kanban::core::Store;
-use ai_kanban::server::{Principal, ServerDb};
+use ai_kanban_relay::{Principal, ServerDb};
 use ai_kanban::sync::protocol::Change;
 
 pub const ROOM: &str = "sbahn";

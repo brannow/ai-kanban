@@ -1,4 +1,4 @@
-//! `ai-kanban server ...` -- running the relay and administering it.
+//! `ai-kanban-relay ...` -- running the relay and administering it.
 //!
 //! Admin commands open the database directly instead of going through the API. They are run
 //! with `docker exec` inside the container, so whoever can run them already holds the file;
@@ -6,30 +6,30 @@
 
 use super::store::{Removal, ServerDb};
 use super::{Options, EMPTY_ROOM_AGE};
-use crate::sync::protocol::{Handle, Ref};
+use ai_kanban_protocol::{Handle, Ref};
 use std::path::PathBuf;
 
 pub const USAGE: &str = "\
-ai-kanban server -- the relay a team shares boards through
+ai-kanban-relay -- the relay a team shares boards through
 
 USAGE:
-    ai-kanban server [--listen ADDR] [--snapshot-every DUR] [--keep N] [--snapshot-dir DIR]
+    ai-kanban-relay [--listen ADDR] [--snapshot-every DUR] [--keep N] [--snapshot-dir DIR]
         Run the relay. ADDR defaults to 127.0.0.1:7373; the container passes 0.0.0.0:7373.
         DUR is like 30m, 6h or 1d. Snapshots go to <db dir>/snapshots by default.
 
-    ai-kanban server user add <name>
-    ai-kanban server user list
-    ai-kanban server user disable <name>
-    ai-kanban server key add <user> --tag <tag> [--label <label>]   prints the key once
-    ai-kanban server key list [user]
-    ai-kanban server key revoke <id>
-    ai-kanban server key rotate <tag>             new key, same tag, old key revoked
-    ai-kanban server room list
-    ai-kanban server room delete <room> [--yes]   dry run without --yes
-    ai-kanban server room cleanup                 remove rooms empty for 7 days now
-    ai-kanban server forget <room> task|note <id>-<tag> [--yes]
-    ai-kanban server snapshot [--snapshot-dir DIR]
-    ai-kanban server health [--listen ADDR]       exit 0 if the relay answers
+    ai-kanban-relay user add <name>
+    ai-kanban-relay user list
+    ai-kanban-relay user disable <name>
+    ai-kanban-relay key add <user> --tag <tag> [--label <label>]   prints the key once
+    ai-kanban-relay key list [user]
+    ai-kanban-relay key revoke <id>
+    ai-kanban-relay key rotate <tag>             new key, same tag, old key revoked
+    ai-kanban-relay room list
+    ai-kanban-relay room delete <room> [--yes]   dry run without --yes
+    ai-kanban-relay room cleanup                 remove rooms empty for 7 days now
+    ai-kanban-relay forget <room> task|note <id>-<tag> [--yes]
+    ai-kanban-relay snapshot [--snapshot-dir DIR]
+    ai-kanban-relay health [--listen ADDR]       exit 0 if the relay answers
 
 Every command takes --db <file> (default: $AI_KANBAN_SERVER_DB, else /data/server.db).
 It never falls back to the personal store.
@@ -52,7 +52,7 @@ fn args() -> Result<Args, String> {
         pos: vec![], db: None, listen: None, tag: None, label: None,
         snapshot_every: None, snapshot_dir: None, keep: None, yes: false,
     };
-    let mut it = std::env::args().skip(2);
+    let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
         match arg.as_str() {
@@ -90,7 +90,7 @@ impl Args {
 }
 
 fn usage(line: &str) -> Box<dyn std::error::Error> {
-    format!("usage: ai-kanban server {line}").into()
+    format!("usage: ai-kanban-relay {line}").into()
 }
 
 /// `30m`, `6h`, `1d`, or plain seconds.
@@ -114,7 +114,7 @@ fn ago(ts: Option<i64>) -> String {
     match ts {
         None => "never".into(),
         Some(t) => {
-            let s = (crate::core::now() - t).max(0);
+            let s = (super::store::now() - t).max(0);
             match s {
                 0..=59 => format!("{s}s ago"),
                 60..=3599 => format!("{}m ago", s / 60),
@@ -156,7 +156,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Some("health") => health(a.listen.as_deref().unwrap_or("127.0.0.1:7373")),
-        Some(other) => Err(format!("unknown server command {other:?}\n\n{USAGE}").into()),
+        Some(other) => Err(format!("unknown command {other:?}\n\n{USAGE}").into()),
     }
 }
 
@@ -166,12 +166,12 @@ fn user(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
         Some("add") => {
             let name = a.arg(2).ok_or_else(|| usage("user add <name>"))?;
             db.add_user(name)?;
-            println!("user {name} added. Give them a key: ai-kanban server key add {name} --tag <tag> --label <machine>");
+            println!("user {name} added. Give them a key: ai-kanban-relay key add {name} --tag <tag> --label <machine>");
         }
         Some("list") | None => {
             let users = db.users()?;
             if users.is_empty() {
-                println!("no users yet. ai-kanban server user add <name>");
+                println!("no users yet. ai-kanban-relay user add <name>");
             }
             for u in users {
                 let state = if u.disabled_at.is_some() { "  (disabled)" } else { "" };
@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn tags_and_protocol_agree_on_the_server_tag() {
-        use crate::sync::protocol;
+        use ai_kanban_protocol as protocol;
         assert!(protocol::valid_tag(protocol::SERVER_TAG));
     }
 }

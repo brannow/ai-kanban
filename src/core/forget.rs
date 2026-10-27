@@ -46,7 +46,7 @@ impl Store {
     }
 
     /// A board connected to a room shares its history with every member, and a forget there
-    /// is permanent for all of them. So it is the relay admin's act (`ai-kanban server
+    /// is permanent for all of them. So it is the relay admin's act (`ai-kanban-relay
     /// forget`), and arrives here as a tombstone -- never a local decision. Checked in core
     /// rather than in each adapter, because the HTTP API calls these directly.
     fn refuse_in_room(&self, project_id: i64, what: &str) -> Result<()> {
@@ -54,7 +54,7 @@ impl Store {
             Some(room) => Err(Error::SharedBoard {
                 reason: format!(
                     "this board is shared through room {room}, where forgetting removes the {what} for every member. \
-                     Ask the relay admin: ai-kanban server forget {room} {what} <id>-<tag>"
+                     Ask the relay admin: ai-kanban-relay forget {room} {what} <id>-<tag>"
                 ),
                 room,
             }),
