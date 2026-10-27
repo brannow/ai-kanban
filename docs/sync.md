@@ -360,6 +360,29 @@ ai-kanban server snapshot                              # also scheduled: --snaps
   same reason `src/http/stream.rs` polls: admin commands run in another process (`docker exec`),
   and an admin forget must notify too.
 
+### Running the relay
+
+The image is built by `Dockerfile` and published by `.github/workflows/relay-image.yml` to
+`ghcr.io/<owner>/ai-kanban-relay`, for amd64 and arm64. Tags: `:edge` from main, `:1.2.3` and
+`:latest` from a `v1.2.3` tag.
+
+```
+docker run -d --name kanban --restart unless-stopped \
+  -v kanban-data:/data -p 127.0.0.1:7373:7373 ghcr.io/<owner>/ai-kanban-relay:latest
+docker exec kanban ai-kanban server user add benny
+docker exec kanban ai-kanban server key add benny --tag b1 --label laptop   # prints the key once
+```
+
+- **Runs as non-root** (distroless, uid 65532) and owns `/data`. A bind mount instead of a named
+  volume must be writable by that uid.
+- **Snapshots** every 6h into `/data/snapshots`, the newest 28 kept. That is the same volume, so
+  copy the volume off the host as well.
+- **TLS goes on the proxy.** Publish the port on loopback only, as above, and let nginx (or
+  similar) terminate TLS. The event stream needs `proxy_buffering off;` and a `proxy_read_timeout`
+  above the 30s heartbeat.
+- `HEALTHCHECK` runs `ai-kanban server health`, a single request made with the standard library,
+  because the image has no shell or curl.
+
 ## Local schema
 
 All sync state lives in **new side tables**. `tasks`, `notes` and `events` keep their shape, so

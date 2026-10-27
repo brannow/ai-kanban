@@ -1,0 +1,6 @@
+# The image builds from Cargo.toml, Cargo.lock and src/ only. Everything else -- above all
+# target/, which is gigabytes -- stays out of the build context.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
