@@ -265,8 +265,13 @@ Each mutation on a connected board writes, **in the same transaction**, one chan
   that aren't connected, forget works as today.
 - **Names that must be unique** (workstreams per board, repos) merge **by name**. Two machines
   creating `deploy` offline get one workstream, not a constraint failure.
-- Repos travel by **normalized git remote** (the `git:…` form of `projects.key`). The local checkout
-  path stays local. A repo with no remote cannot be linked to a task in a room.
+- **Repos travel as keys:** the normalized git remote (the `git:…` form of `projects.key`), or
+  `name:<name>` for a checkout without one. Each member's task links to their own checkout of
+  that remote, whatever it is called there. A key with no checkout on this machine is kept as
+  *unmapped* and shown ("no checkout on this machine"), so a local edit never drops a teammate's
+  link and the task does not read as "no repo set". Adding the checkout later adopts those links.
+- **Which checkouts a machine has is local setup.** Taking a repo off your board, or forgetting it,
+  keeps its links on shared tasks as unmapped instead of removing the repo from the team's tasks.
 
 ### How a write becomes a change, and which events travel
 

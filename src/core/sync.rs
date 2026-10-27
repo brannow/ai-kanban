@@ -42,6 +42,9 @@ pub enum Enc {
     Workstream,
     /// A note's paths, from `note_paths`, sent as one sorted list.
     Paths,
+    /// A task's repos, from `task_repos`, sent as one sorted list of repo keys
+    /// (`core::project::repo_key`), plus the ones with no checkout here.
+    Repos,
 }
 
 /// One synced field: its name on the wire, the column it lives in (empty for `Paths`), and how
@@ -72,6 +75,7 @@ pub const TASK_FIELDS: &[Spec] = &[
     spec("tags", "tags", Enc::Text),
     spec("external_ref", "external_ref", Enc::Text),
     spec("created_at", "created_at", Enc::Int),
+    spec("repos", "", Enc::Repos),
 ];
 /// Per machine: the row's local id and board, and bookkeeping each store keeps for itself.
 pub const TASK_LOCAL: &[&str] = &["id", "project_id", "updated_at", "version"];
@@ -357,6 +361,7 @@ impl Store {
     fn read_fields(&self, kind: &str, local_id: i64) -> Result<Option<(i64, BTreeMap<&'static str, Value>)>> {
         let specs = specs(kind);
         let cols: Vec<&str> = specs.iter().filter(|s| !s.column.is_empty()).map(|s| s.column).collect();
+        debug_assert!(specs.iter().all(|s| s.column.is_empty() == matches!(s.enc, Enc::Paths | Enc::Repos)));
         let sql = format!("SELECT project_id, {} FROM {} WHERE id = ?1", cols.join(", "), table(kind));
         let row: Option<(i64, Vec<Sql>)> = self.conn
             .query_row(&sql, [local_id], |r| {
@@ -378,6 +383,7 @@ impl Store {
                     let paths = st.query_map([local_id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
                     json!(paths)
                 }
+                Enc::Repos => json!(self.task_repo_keys(local_id)?),
                 enc => {
                     let v = raw.next().unwrap_or(Sql::Null);
                     match (enc, v) {
@@ -462,6 +468,11 @@ impl Store {
         let t = table(kind);
         let bad = || Error::Other(format!("{kind}.{}: unexpected value {v}", s.field));
         let sql_value: Sql = match s.enc {
+            Enc::Repos => {
+                let keys: Vec<String> = serde_json::from_value(v.clone()).map_err(|_| bad())?;
+                self.set_task_repo_keys(project_id, local_id, &keys)?;
+                return Ok(());
+            }
             Enc::Paths => {
                 let paths: Vec<String> = serde_json::from_value(v.clone()).map_err(|_| bad())?;
                 self.conn.execute("DELETE FROM note_paths WHERE note_id = ?1", [local_id])?;
@@ -965,5 +976,98 @@ impl Store {
             value: raw.trim().into(),
             valid: "a task number like 12, or a handle like 122-v1".into(),
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Repos on shared tasks
+// ---------------------------------------------------------------------------
+
+impl Store {
+    /// A task's repos as they travel: the key of every linked checkout, plus the keys kept for
+    /// repos this machine has no checkout of. Sorted, so the same set is the same value.
+    fn task_repo_keys(&self, task_id: i64) -> Result<Vec<String>> {
+        let mut keys = std::collections::BTreeSet::new();
+        let mut st = self.conn.prepare(
+            "SELECT r.path, r.name FROM task_repos tr JOIN repos r ON r.id = tr.repo_id WHERE tr.task_id = ?1",
+        )?;
+        for row in st.query_map([task_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (path, name) = row?;
+            keys.insert(crate::core::project::repo_key(&path, &name));
+        }
+        let mut st = self.conn.prepare("SELECT key FROM sync_unmapped_repos WHERE task_id = ?1")?;
+        for k in st.query_map([task_id], |r| r.get::<_, String>(0))? {
+            keys.insert(k?);
+        }
+        Ok(keys.into_iter().collect())
+    }
+
+    /// Links a received set of repo keys: each to the checkout on this board it names, and the
+    /// rest kept as unmapped.
+    fn set_task_repo_keys(&self, project_id: i64, task_id: i64, keys: &[String]) -> Result<()> {
+        let mut by_key = std::collections::HashMap::new();
+        for r in self.repos(project_id)? {
+            by_key.insert(crate::core::project::repo_key(&r.path, &r.name), r.id);
+        }
+        self.conn.execute("DELETE FROM task_repos WHERE task_id = ?1", [task_id])?;
+        self.conn.execute("DELETE FROM sync_unmapped_repos WHERE task_id = ?1", [task_id])?;
+        for k in keys {
+            match by_key.get(k) {
+                Some(repo) => self.conn.execute("INSERT OR IGNORE INTO task_repos (task_id, repo_id) VALUES (?1, ?2)", params![task_id, repo])?,
+                None => self.conn.execute("INSERT OR IGNORE INTO sync_unmapped_repos (task_id, key) VALUES (?1, ?2)", params![task_id, k])?,
+            };
+        }
+        Ok(())
+    }
+
+    /// Before a repo's links are removed on this machine -- taking it off a board, forgetting
+    /// it -- keeps the links of shared tasks as unmapped keys. Which checkouts this machine has
+    /// is local setup; it must not take a repo off the team's tasks.
+    pub(crate) fn keep_shared_repo_links(&self, repo_id: i64, project_id: Option<i64>) -> Result<()> {
+        let Some((path, name)) = self.conn
+            .query_row("SELECT path, name FROM repos WHERE id = ?1", [repo_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .optional()? else { return Ok(()) };
+        let key = crate::core::project::repo_key(&path, &name);
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sync_unmapped_repos (task_id, key)
+             SELECT tr.task_id, ?2 FROM task_repos tr
+               JOIN tasks t ON t.id = tr.task_id
+               JOIN sync_rooms s ON s.project_id = t.project_id
+              WHERE tr.repo_id = ?1 AND (?3 IS NULL OR t.project_id = ?3)",
+            params![repo_id, key, project_id],
+        )?;
+        Ok(())
+    }
+
+    /// A checkout just added to a board takes over the links teammates made to the same repo
+    /// while this machine had no checkout of it.
+    pub(crate) fn adopt_unmapped_links(&self, project_id: i64, repo_id: i64) -> Result<()> {
+        let Some((path, name)) = self.conn
+            .query_row("SELECT path, name FROM repos WHERE id = ?1", [repo_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .optional()? else { return Ok(()) };
+        let key = crate::core::project::repo_key(&path, &name);
+        self.conn.execute(
+            "INSERT OR IGNORE INTO task_repos (task_id, repo_id)
+             SELECT u.task_id, ?1 FROM sync_unmapped_repos u JOIN tasks t ON t.id = u.task_id
+              WHERE u.key = ?2 AND t.project_id = ?3",
+            params![repo_id, key, project_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM sync_unmapped_repos WHERE key = ?1 AND task_id IN (SELECT id FROM tasks WHERE project_id = ?2)",
+            params![key, project_id],
+        )?;
+        Ok(())
+    }
+
+    /// Labels of the repos on a task that have no checkout here. Empty on a store too old to
+    /// have the table, which the read-only hook can meet.
+    pub fn unmapped_repos(&self, task_id: i64) -> Result<Vec<String>> {
+        let mut st = match self.conn.prepare("SELECT key FROM sync_unmapped_repos WHERE task_id = ?1 ORDER BY key") {
+            Ok(st) => st,
+            Err(e) if crate::core::workstream::is_missing_schema(&e) => return Ok(vec![]),
+            Err(e) => return Err(e.into()),
+        };
+        let keys = st.query_map([task_id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(keys.iter().map(|k| crate::core::project::repo_key_label(k).to_string()).collect())
     }
 }

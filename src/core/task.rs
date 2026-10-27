@@ -504,6 +504,7 @@ impl Store {
         Ok(TaskDetail {
             tags: self.task_tags(project_id, id)?,
             repos: self.task_repos(project_id, id)?,
+            unmapped_repos: self.unmapped_repos(id)?,
             external_ref: self.task_external_ref(project_id, id)?,
             board_has_repos: self.repo_count(project_id)? > 0,
             blocking: self.tasks_blocked_by(project_id, id)?,

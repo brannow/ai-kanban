@@ -408,6 +408,9 @@ pub struct TaskDetail {
     /// With their paths: task_show is where an agent commits to the work, so it is where it
     /// learns which checkouts that work is in.
     pub repos: Vec<Repo>,
+    /// Repos on this (shared) task that a teammate linked and this machine has no checkout of,
+    /// by label.
+    pub unmapped_repos: Vec<String>,
     pub external_ref: Option<String>,
     /// Whether the board tracks repos at all, so an empty `repos` can be told apart from a
     /// board where the question does not arise.

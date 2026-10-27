@@ -117,6 +117,7 @@ impl Store {
         // Explicit for the reason stated in the module header. Left behind, a link would keep
         // counting in the repos menu for a ticket that no longer exists.
         self.conn.execute("DELETE FROM task_repos WHERE task_id = ?1", [id])?;
+        self.conn.execute("DELETE FROM sync_unmapped_repos WHERE task_id = ?1", [id])?;
         self.conn.execute("DELETE FROM tasks WHERE id = ?1 AND project_id = ?2", params![id, project_id])?;
         Ok(())
         })?;
@@ -142,6 +143,7 @@ impl Store {
         };
 
         let tx = self.conn.unchecked_transaction()?;
+        self.keep_shared_repo_links(id, None)?;
         tx.execute("DELETE FROM task_repos WHERE repo_id = ?1", [id])?;
         tx.execute("DELETE FROM board_repos WHERE repo_id = ?1", [id])?;
         tx.execute("DELETE FROM repos WHERE id = ?1", [r.id])?;

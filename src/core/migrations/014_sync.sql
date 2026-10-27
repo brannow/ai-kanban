@@ -90,6 +90,15 @@ CREATE TABLE IF NOT EXISTS sync_forgotten (
     PRIMARY KEY (room, kind, origin, origin_id)
 );
 
+-- Repos on a shared task that have no checkout on this machine, by key (`git:<remote>` or
+-- `name:<name>`). Kept so the next local edit of the task publishes them back rather than
+-- silently dropping a teammate's link, and so the task does not read as "no repo set".
+CREATE TABLE IF NOT EXISTS sync_unmapped_repos (
+    task_id  INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    key      TEXT    NOT NULL,
+    PRIMARY KEY (task_id, key)
+);
+
 -- ---------------------------------------------------------------------------
 -- Dirty marking. Cheap on boards that are not connected: one indexed EXISTS.
 -- ---------------------------------------------------------------------------

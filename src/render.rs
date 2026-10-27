@@ -285,12 +285,15 @@ pub fn task_detail(d: &TaskDetail) -> String {
     meta.push(format!("filed {}", since(d.now, t.created_at)));
     out.push_str(&format!("  {}\n", meta.join(", ")));
 
-    if !d.repos.is_empty() {
+    if !d.repos.is_empty() || !d.unmapped_repos.is_empty() {
         // With paths: this is the response an agent reads when it commits to the work, and
         // the path is what tells it where that work is.
         out.push_str("\nrepos\n");
         for r in &d.repos {
             out.push_str(&format!("  {}  {}\n", r.name, r.path));
+        }
+        for label in &d.unmapped_repos {
+            out.push_str(&format!("  {label}  (no checkout on this machine)\n"));
         }
     } else if d.board_has_repos && t.status.is_open() {
         // The board only flags it; here, at the moment of starting, it says what to do.

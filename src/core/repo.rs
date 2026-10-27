@@ -243,6 +243,7 @@ impl Store {
             let home = self.project(r.home_project_id)?;
             let tx = self.conn.unchecked_transaction()?;
             self.attach_repo(project_id, r.id)?;
+            self.adopt_unmapped_links(project_id, r.id)?;
             self.write_event(
                 project_id, None, actor, "repo_added",
                 &format!("{} ({}), which opens on board \"{}\"", r.name, r.path, home.name),
@@ -272,6 +273,7 @@ impl Store {
         )?;
         let id = self.conn.last_insert_rowid();
         self.attach_repo(project_id, id)?;
+        self.adopt_unmapped_links(project_id, id)?;
         // The half that makes an agent opening this repo land on this board.
         self.add_path_alias(project_id, &canon)?;
         // Not housekeeping: "eee-web joined this board" is history a cold agent can use, and
@@ -370,6 +372,7 @@ impl Store {
     pub fn remove_repo(&self, project_id: i64, id: i64, actor: Actor) -> Result<usize> {
         let r = self.repo(project_id, id)?;
         let tx = self.conn.unchecked_transaction()?;
+        self.keep_shared_repo_links(id, Some(project_id))?;
         // Explicit rather than left to ON DELETE CASCADE, for the reason `forget.rs` gives:
         // `foreign_keys` is per-connection state, and a link left behind would keep a ticket
         // naming a repo its board no longer has.
@@ -560,6 +563,24 @@ impl Store {
             }
             Ok(repos)
         })())?;
+        // Repos a teammate linked that have no checkout here (`sync_unmapped_repos`). Listed by
+        // label, so a shared task does not read as "no repo set" on this machine. Tolerant: the
+        // table is newer than stores the hook may read.
+        let unmapped = tolerant((|| -> rusqlite::Result<HashMap<i64, Vec<String>>> {
+            let mut st = self.conn.prepare(&format!(
+                "SELECT u.task_id, u.key FROM sync_unmapped_repos u JOIN tasks t ON t.id = u.task_id
+                  WHERE t.project_id = ? AND u.task_id IN ({holes}) ORDER BY u.key"
+            ))?;
+            let mut out: HashMap<i64, Vec<String>> = HashMap::new();
+            for row in st.query_map(rusqlite::params_from_iter(&ids), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+                let (task, key) = row?;
+                out.entry(task).or_default().push(crate::core::project::repo_key_label(&key).to_string());
+            }
+            Ok(out)
+        })())?;
+        for (task, labels) in unmapped {
+            repos.entry(task).or_default().extend(labels);
+        }
         Ok(tasks.iter().filter_map(|t| {
             let r = repos.remove(&t.id).unwrap_or_default();
             let e = refs.get(&t.id).cloned();

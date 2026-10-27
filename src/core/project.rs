@@ -375,6 +375,25 @@ fn git_remote(repo_root: &Path) -> Option<String> {
     None
 }
 
+/// How a repo is known across machines: its normalized remote, the same form a board key
+/// takes, or its name when the checkout has no remote. Paths differ per machine and local ids
+/// mean nothing elsewhere, so neither can travel.
+pub(crate) fn repo_key(path: &str, name: &str) -> String {
+    match git_remote(Path::new(path)) {
+        Some(url) => format!("git:{}", normalize_remote(&url)),
+        None => format!("name:{name}"),
+    }
+}
+
+/// What a repo key is called where no checkout exists to name it: the remote's last path
+/// segment, or the name.
+pub fn repo_key_label(key: &str) -> &str {
+    match key.strip_prefix("git:") {
+        Some(remote) => remote.rsplit('/').next().unwrap_or(remote),
+        None => key.strip_prefix("name:").unwrap_or(key),
+    }
+}
+
 /// Collapses the many spellings of one remote into a single key.
 ///
 /// `git@github.com:me/repo.git` and `https://github.com/me/repo` are the same project.
