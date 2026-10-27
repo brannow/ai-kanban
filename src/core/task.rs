@@ -161,7 +161,7 @@ impl Store {
                 crate::core::note::join_tags(&draft.tags), external_ref
             ],
         )?;
-        let id = self.conn.last_insert_rowid();
+        let id = self.fresh_id("tasks", self.conn.last_insert_rowid())?;
         if !draft.repos.is_empty() {
             self.set_task_repos(id, &draft.repos)?;
         }

@@ -1,6 +1,6 @@
 use crate::core::error::{Error, Result};
 use crate::core::migrate;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
 /// Owns the connection and the schema. One global DB; projects are rows, not files.
@@ -87,6 +87,30 @@ impl Drop for Store {
             return;
         }
         self.checkpoint();
+    }
+}
+
+impl Store {
+    /// The id a row just inserted into `tasks` or `notes` keeps, moved above every id ever
+    /// deleted from that table if SQLite handed back a forgotten one (migration 013).
+    ///
+    /// Called straight after the INSERT, before anything references the row. The insert already
+    /// holds the write lock, so no other writer can claim the moved-to id in between. The id
+    /// change itself reaches the FTS index through the table's update trigger.
+    pub(crate) fn fresh_id(&self, table: &'static str, id: i64) -> Result<i64> {
+        debug_assert!(table == "tasks" || table == "notes");
+        // A store between 012 and 013 cannot exist here (migrations run before any write),
+        // but a missing row would mean "nothing forgotten yet", which is the right answer.
+        let floor: i64 = self.conn
+            .query_row("SELECT value FROM id_floor WHERE tbl = ?1", [table], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
+        if id > floor {
+            return Ok(id);
+        }
+        let moved = floor + 1;
+        self.conn.execute(&format!("UPDATE {table} SET id = ?1 WHERE id = ?2"), rusqlite::params![moved, id])?;
+        Ok(moved)
     }
 }
 

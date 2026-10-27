@@ -93,7 +93,7 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
             params![project_id, draft.task_id, draft.title, draft.body, join_tags(&draft.tags), ts],
         )?;
-        let id = self.conn.last_insert_rowid();
+        let id = self.fresh_id("notes", self.conn.last_insert_rowid())?;
         self.set_note_paths(id, &draft.paths)?;
         self.write_event_for(project_id, draft.task_id, Some(id), actor, "note_added", &draft.title)?;
         self.note(project_id, id)

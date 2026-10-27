@@ -542,7 +542,7 @@ impl Store {
                 params![pid, t.title, t.body, t.status, t.r#type, t.origin, t.priority, ws, t.created_at, t.updated_at,
                         crate::core::note::join_tags(&t.tags), t.external_ref],
             )?;
-            let tid = self.conn.last_insert_rowid();
+            let tid = self.fresh_id("tasks", self.conn.last_insert_rowid())?;
             task_ids.insert(t.id, tid);
             // A repo that was skipped above is dropped from the task, same rule as workstreams.
             for rid in t.repos.iter().filter_map(|n| repo_ids.get(n)) {
@@ -574,7 +574,7 @@ impl Store {
                     n.title, n.body, n.tags, n.created_at, n.updated_at
                 ],
             )?;
-            let nid = self.conn.last_insert_rowid();
+            let nid = self.fresh_id("notes", self.conn.last_insert_rowid())?;
             note_ids.insert(n.id, nid);
             for path in &n.paths {
                 self.conn.execute(
