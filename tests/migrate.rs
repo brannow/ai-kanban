@@ -298,7 +298,7 @@ fn a_store_migrated_by_the_draft_of_014_is_repaired_by_015() {
         ).unwrap();
     }
     let s = ai_kanban::core::Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 15);
+    assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
     assert!(s.is_own_tag("b1").unwrap(), "a tag the draft set is recorded as this store's own");
 
     let pid = s.create_board("b").unwrap().id;

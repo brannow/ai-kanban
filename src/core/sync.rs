@@ -286,6 +286,7 @@ impl Store {
             )?;
         }
         tx.execute("DELETE FROM sync_rooms WHERE project_id = ?1", [project_id])?;
+        tx.execute("DELETE FROM sync_room_status WHERE project_id = ?1", [project_id])?;
         tx.execute("DELETE FROM sync_outbox WHERE project_id = ?1", [project_id])?;
         tx.execute("DELETE FROM sync_parked WHERE project_id = ?1", [project_id])?;
         tx.commit()?;
@@ -324,7 +325,9 @@ impl Store {
     /// tables it reads.
     pub fn sync_status(&self, project_id: i64) -> Result<Option<SyncStatus>> {
         let row = self.conn.query_row(
-            "SELECT room, cursor, last_ok_at, last_error, members FROM sync_rooms WHERE project_id = ?1",
+            "SELECT r.room, r.cursor, s.last_ok_at, s.last_error, COALESCE(s.members, '[]')
+               FROM sync_rooms r LEFT JOIN sync_room_status s ON s.project_id = r.project_id
+              WHERE r.project_id = ?1",
             [project_id],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, String>(4)?)),
         );
@@ -343,7 +346,7 @@ impl Store {
 
     /// Why sync is stopped for this store, if it is.
     pub fn paused(&self) -> Result<Option<String>> {
-        match self.conn.query_row("SELECT paused FROM sync_node WHERE id = 1", [], |r| r.get(0)) {
+        match self.conn.query_row("SELECT reason FROM sync_pause WHERE id = 1", [], |r| r.get(0)).optional() {
             Ok(p) => Ok(p),
             Err(e) if crate::core::workstream::is_missing_schema(&e) => Ok(None),
             Err(e) => Err(e.into()),
@@ -351,7 +354,10 @@ impl Store {
     }
 
     pub fn set_paused(&self, reason: Option<&str>) -> Result<()> {
-        self.conn.execute("UPDATE sync_node SET paused = ?1 WHERE id = 1", [reason])?;
+        match reason {
+            Some(r) => self.conn.execute("INSERT INTO sync_pause (id, reason) VALUES (1, ?1) ON CONFLICT (id) DO UPDATE SET reason = excluded.reason", [r])?,
+            None => self.conn.execute("DELETE FROM sync_pause", [])?,
+        };
         Ok(())
     }
 
@@ -359,14 +365,19 @@ impl Store {
     pub fn sync_succeeded(&self, project_id: i64, members: &[(String, String)]) -> Result<()> {
         let members: Vec<Value> = members.iter().map(|(t, u)| json!({ "tag": t, "user": u })).collect();
         self.conn.execute(
-            "UPDATE sync_rooms SET last_ok_at = ?2, last_error = NULL, members = ?3 WHERE project_id = ?1",
+            "INSERT INTO sync_room_status (project_id, last_ok_at, last_error, members) VALUES (?1, ?2, NULL, ?3)
+             ON CONFLICT (project_id) DO UPDATE SET last_ok_at = excluded.last_ok_at, last_error = NULL, members = excluded.members",
             params![project_id, now(), Value::Array(members).to_string()],
         )?;
         Ok(())
     }
 
     pub fn sync_failed(&self, project_id: i64, why: &str) -> Result<()> {
-        self.conn.execute("UPDATE sync_rooms SET last_error = ?2 WHERE project_id = ?1", params![project_id, why])?;
+        self.conn.execute(
+            "INSERT INTO sync_room_status (project_id, last_error) VALUES (?1, ?2)
+             ON CONFLICT (project_id) DO UPDATE SET last_error = excluded.last_error",
+            params![project_id, why],
+        )?;
         Ok(())
     }
 
