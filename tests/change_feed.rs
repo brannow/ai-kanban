@@ -232,3 +232,60 @@ fn event_ids_are_never_reused_after_a_delete() {
     let next = s.log(pid, Actor::Agent, "written after the delete").unwrap();
     assert!(next > high, "id {next} was reused after deleting {high}; the cursor would stall");
 }
+
+/// On a board connected to a room, every change to shared content must also become a change
+/// for the room. Recording is done by triggers (migration 014), so this pins the coverage the
+/// way `every_mutation_moves_the_change_cursor` pins the event feed.
+#[test]
+fn every_shared_mutation_on_a_connected_board_is_recorded_for_the_room() {
+    let s = Store::open_in_memory().unwrap();
+    s.set_origin_tag("b1").unwrap();
+    let pid = s.create_board("shared").unwrap().id;
+    let private = s.create_board("private").unwrap().id;
+    s.connect_board(pid, "room").unwrap();
+    s.flush().unwrap();
+    let recorded = |s: &Store, what: &str| assert!(s.flush().unwrap() > 0, "{what} produced no change for the room");
+
+    let t = s.create_task(pid, TaskDraft::new("a task")).unwrap();
+    recorded(&s, "creating a task");
+    for (what, p) in [
+        ("status", TaskPatch { status: Some(Status::Doing), ..Default::default() }),
+        ("title", TaskPatch { title: Some("renamed".into()), ..Default::default() }),
+        ("body", TaskPatch { body: Some("details".into()), ..Default::default() }),
+        ("priority", TaskPatch { priority: Some(Priority::High), ..Default::default() }),
+        ("type", TaskPatch { task_type: Some(TaskType::Bug), ..Default::default() }),
+        ("tags", TaskPatch { tags: Some(vec!["x".into()]), ..Default::default() }),
+        ("external ref", TaskPatch { external_ref: Some(Some("48213".into())), ..Default::default() }),
+    ] {
+        s.update_task(pid, t.id, p).unwrap();
+        recorded(&s, what);
+    }
+    let w = s.ensure_workstream(pid, "deploy").unwrap();
+    s.update_task(pid, t.id, TaskPatch { workstream: Some(Some(w.id)), ..Default::default() }).unwrap();
+    recorded(&s, "moving to a workstream");
+    let other = s.create_task(pid, TaskDraft::new("blocker")).unwrap();
+    s.update_task(pid, t.id, TaskPatch { blocked_by: Some(Some(other.id)), ..Default::default() }).unwrap();
+    recorded(&s, "setting a blocker");
+
+    let dir = tempfile::tempdir().unwrap();
+    let r = s.add_repo(pid, dir.path(), Some("svc"), Actor::User).unwrap();
+    s.update_task(pid, t.id, TaskPatch { repos: Some(vec![r.id]), ..Default::default() }).unwrap();
+    recorded(&s, "linking a repo");
+
+    let n = s.create_note(pid, NoteDraft { task_id: Some(t.id), ..NoteDraft::new("a note") }, Actor::Agent).unwrap();
+    recorded(&s, "creating a note");
+    s.update_note(pid, n.id, NotePatch { body: Some("more".into()), ..Default::default() }).unwrap();
+    recorded(&s, "updating a note");
+    s.update_note(pid, n.id, NotePatch { paths: Some(vec!["src/a.rs".into()]), ..Default::default() }).unwrap();
+    recorded(&s, "changing a note's paths");
+
+    s.log(pid, Actor::Agent, "a decision").unwrap();
+    recorded(&s, "logging");
+
+    let elsewhere = s.create_task(private, TaskDraft::new("from a private board")).unwrap();
+    assert_eq!(s.flush().unwrap(), 0, "a private board records nothing");
+    s.move_task(private, elsewhere.id, pid, Actor::User, None, None).unwrap();
+    recorded(&s, "moving a task onto the shared board");
+    s.move_task(pid, elsewhere.id, private, Actor::User, None, None).unwrap();
+    recorded(&s, "moving a task off the shared board");
+}

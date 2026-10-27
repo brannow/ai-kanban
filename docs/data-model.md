@@ -408,6 +408,38 @@ Agent input is never passed to `MATCH` raw. FTS5's syntax is a query language: `
 is a NOT expression and a stray quote is a syntax error. Every token is quoted and ANDed,
 and bare `AND`/`OR`/`NOT`/`NEAR` are dropped as noise.
 
+### `id_floor` (migration 013)
+
+Task and note ids are never handed out twice. Both are plain INTEGER PRIMARY KEYs, so a forgotten
+newest row used to give its id to the next one, and every old reference to it ("blocked by #812")
+silently named an unrelated task (#1064). Under sync it would issue one handle twice. `AFTER
+DELETE` triggers record the highest id ever deleted; `Store::fresh_id` moves a new row above it
+right after the INSERT. Not an AUTOINCREMENT rebuild: dropping `tasks` cascades into its history,
+the rebuild 010 avoided.
+
+### `sync_*` (migration 014)
+
+Sharing a board through a room (`docs/sync.md`). Everything sync knows lives in side tables, so
+`tasks`, `notes` and `events` keep their shape and `TASK_COLS` / `MIN_READABLE_VERSION` are
+untouched. Every read of them on the hook path is tolerant: a store older than 014 simply has
+nothing shared.
+
+| Table | Holds |
+|---|---|
+| `sync_node` | this store's origin tag and hybrid clock |
+| `sync_own_tags` | every tag the store has published under, so work from before a restore stays its own |
+| `sync_rooms` | board ↔ room, pull cursor |
+| `sync_ids` | (kind, local id) ↔ (origin tag, origin id): a row's identity on every machine |
+| `sync_fields` | last value per field published to or received from a room, with its clock |
+| `sync_dirty` | rows changed on a connected board since the last flush, filled by triggers |
+| `sync_outbox` | changes waiting to be pushed (AUTOINCREMENT: the seq is half of a change's id) |
+| `sync_parked` | received changes this binary cannot store yet |
+| `sync_forgotten` | entities a room forgot, kept forever |
+| `sync_unmapped_repos` | repo keys on shared tasks with no checkout on this machine |
+
+Every column of `tasks`, `notes` and `events` is classified as synced or local in
+`src/core/sync.rs`; `tests/sync_core.rs` fails on a column in neither list.
+
 ---
 
 ## Response volume is part of the model

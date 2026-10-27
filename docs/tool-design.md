@@ -325,12 +325,19 @@ One canonical format per domain, and every one of them is valid input somewhere 
 | Form | Means | Accepted by |
 |---|---|---|
 | `#12` | Task | `task`, `blocked_by` |
+| `#122-v1` | Task on a board shared through a room: the creator's id and origin tag (`docs/sync.md`) | `task`, `blocked_by` |
 | `#7` (note context) | Note | `note` |
 | `backlog\|doing\|blocked\|done\|archived` | Status | `status` |
 | `low\|normal\|high\|urgent` | Priority | `priority` |
 | `"all"` | Every board | `project` |
 | `0` | Clear `blocked_by` | `blocked_by` |
 | `""` | Clear `tags` / `repos` / `workstream` / `external_ref` | `tags`, `repos`, `workstream`, `external_ref` |
+
+`task` and `blocked_by` are strings in the schema (`"12"`, `"122-v1"`), because a handle is
+not a number; a JSON integer is still accepted, so an agent that learned the older schema keeps
+working. A board only ever shows one spelling per task, and that spelling is what resolves: a
+plain number means a task created on this machine, and the hidden local number of a teammate's
+task is refused with its handle rather than resolved to the wrong thing.
 
 That last one is a compromise worth naming: JSON has no way to say "set this to null" that
 survives an optional field, and inventing a magic string would be worse than a documented

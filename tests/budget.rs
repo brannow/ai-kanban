@@ -248,3 +248,28 @@ fn full_recall_costs_the_bodies_and_little_else() {
     assert!(r.omitted > 0, "the hand-offs left out must be reported");
     assert!(tokens(&text) - bodies < 120, "full recall overhead {} tokens", tokens(&text) - bodies);
 }
+
+#[test]
+fn a_shared_board_with_handles_on_every_line_stays_affordable() {
+    // Connected to a room, every task reference grows by its origin tag (`#12` -> `#12-b1`),
+    // and a blocker is named the same way. Measured at its worst: the year-old board, every
+    // listed row blocked by another task, all of it shared.
+    let (s, pid) = year_old_project();
+    let open = s.board(pid, &BoardQuery::board().with_limit(usize::MAX)).unwrap().tasks;
+    for pair in open.windows(2) {
+        s.update_task(pid, pair[1].id, TaskPatch { blocked_by: Some(Some(pair[0].id)), ..Default::default() }).unwrap();
+    }
+    s.set_origin_tag("b1").unwrap();
+    s.connect_board(pid, "budget-room").unwrap();
+    s.flush().unwrap();
+
+    let text = render::board(&s.board(pid, &BoardQuery::board()).unwrap());
+    eprintln!("\n=== shared board() with handles and blockers -- ~{} tokens ===\n{}", tokens(&text), text);
+    assert!(text.contains("-b1") && text.contains("blocked by #"), "the fixture must actually render handles");
+    assert!(tokens(&text) < 1000, "shared board cost {} tokens", tokens(&text));
+
+    let t = s.create_task(pid, TaskDraft::new("side quest on the shared board")).unwrap();
+    let text = render::board(&s.board_after_mutation(pid, t.id).unwrap());
+    eprintln!("\n=== task_add on a shared board -- ~{} tokens ===\n{}", tokens(&text), text);
+    assert!(tokens(&text) < 250, "task_add on a shared board cost {} tokens", tokens(&text));
+}
