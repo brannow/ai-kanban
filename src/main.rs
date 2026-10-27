@@ -31,6 +31,7 @@ USAGE:
     ai-kanban repo forget <repo>   Remove a repo from every board (dry run without --yes)
     ai-kanban merge <keep> <gone>  Repair a board that split into two
     ai-kanban where                Print the path to the store
+    ai-kanban server ...           Run or administer a sync relay (see `ai-kanban server help`)
     ai-kanban --help
 
 Everything you have recorded lives in one SQLite file outside version control. Keep it
@@ -70,6 +71,8 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("mcp") => run_mcp().await,
+        // The relay a team shares boards through. Its own database, never the personal store.
+        Some("server") => ai_kanban::server::admin::run().await,
         Some("serve") => {
             // Loopback only, and no flag to change that: the store is global and there is no
             // auth. See `http::serve`.

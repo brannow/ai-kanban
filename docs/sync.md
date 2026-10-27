@@ -227,8 +227,24 @@ Each mutation on a connected board writes, **in the same transaction**, one chan
 **changed field** (never a whole row) into a local outbox:
 
 ```
-{ id, entity: task|note|event|task_tag|task_repo|note_path, field, value, clock }
+{ cid:     "b1:5012",                               change id: origin tag + outbox seq
+  entity:  { kind: "task", origin: "v1", id: 122 },  what changed (kind: task | note | event)
+  subject: { kind: "task", origin: "v1", id: 122 },  what a forget of it removes, if anything
+  field:   "status",                                 absent for insert-only entities (events)
+  value:   "doing",                                  never read by the server
+  clock:   { wall_ms, counter, tag: "b1" } }
 ```
+
+- **`cid`** makes a retried push harmless: the server stores each `cid` once. The outbox seq is
+  AUTOINCREMENT, because a drained outbox would otherwise reuse seqs (the bug #1064 describes for
+  tasks).
+- **`subject`** mirrors what a local forget deletes (`src/core/forget.rs`). Task fields, task links
+  and a task's own events have the task as subject. Note fields, note paths and **any event about a
+  note** have the note as subject, because forgetting a task detaches its notes and their history
+  rather than deleting them. Board-level events have no subject. The kind is part of it because
+  task and note ids are separate sequences.
+- Task repos, tags and note paths are **fields holding the whole list** (`repos`, `tags`, `paths`),
+  so the newest write wins per list. That avoids adding set semantics to the protocol.
 
 - **Clock:** a hybrid logical clock (wall time, then a counter, then the origin tag as the
   tie-break). Not `updated_at`, which is whole seconds, so ties are routine (note #3).
@@ -318,9 +334,31 @@ ai-kanban server snapshot                              # also scheduled: --snaps
 - **Routes:** `hello`, `whoami`, `rooms`, `rooms/{r}/join` (creates if missing), `rooms/{r}/changes`
   (POST to push, GET `?since=` to pull), `rooms/{r}/events` (SSE notifications).
 - **Housekeeping:** empty rooms are removed after 7 days.
-- **Storage:** the change log, in order, plus room metadata. The log is the source a new member
-  replays. Snapshots of the server database cover mistakes, and off-site backup is the operator's
-  job. No board materialized on the server in v1. A web UI for rooms comes later, if ever.
+- **Storage: its own SQLite file and schema** (`--db`, default `/data/server.db`), never the
+  kanban store. It holds users, keys, rooms, members and the change log, in order. The server only
+  relays, so tying it to core's frozen schema would couple it to every core migration. It never
+  falls back to `AI_KANBAN_DB`, so a server started on a laptop cannot open the personal store, and
+  it refuses to open a file that isn't a server database. The log is what a new member replays.
+  Snapshots of it cover mistakes, and off-site backup is the operator's job. No board is
+  materialized on the server in v1.
+- **What the relay still validates without reading values:** the author comes from the key; the
+  clock's `tag` must equal the key's tag, or a client could win conflicts under someone else's name;
+  `cid` must start with the key's tag. Tags match `^[a-z][a-z0-9]{0,7}$` (no `-`, because handles
+  are parsed from strings), and `srv` is reserved for the server's own changes. Request bodies and
+  batch sizes are capped.
+- **Forget in a room** (`server forget <room> task 122-v1`) deletes every change whose entity or
+  subject is that task, appends a content-free tombstone authored by `srv`, and remembers the
+  subject, so a member who was offline cannot push it back.
+- **Restoring a client from backup rewinds its counters.** A restored store would reissue task ids
+  (`#812-b1` twice in a room) and outbox seqs (new changes dropped as "retries"). So the server
+  tracks, per tag, the highest outbox seq and the highest origin id per kind it has accepted.
+  `whoami` returns them, and a client whose local counters are lower **stops syncing** and asks
+  for a new tag. As a second net, a `cid` that arrives again with different content is refused.
+- **Bind:** `--listen` defaults to `127.0.0.1:7373`. The container passes `0.0.0.0:7373`. `hello`
+  is the only route without a key.
+- **SSE notifications come from polling** `MAX(seq)` per room, not from the push handler, for the
+  same reason `src/http/stream.rs` polls: admin commands run in another process (`docker exec`),
+  and an admin forget must notify too.
 
 ## Local schema
 

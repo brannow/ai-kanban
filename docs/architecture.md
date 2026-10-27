@@ -145,6 +145,8 @@ Battle-tested crates by preference:
 | `dirs` | Platform data directory. More widely used than the `directories` alternative. |
 | `axum` | The HTTP server. Same maintainers as `tokio`, which was already a dependency, and the most-used Rust web framework. |
 | `async-stream` | Writing the SSE stream as a generator rather than a hand-rolled `Stream` impl. |
+| `sha2` | The relay stores SHA-256 of each access key, never the key (`docs/sync.md`). A slow password hash buys nothing for 256 random bits. RustCrypto, the standard. |
+| `getrandom` | Access keys need OS randomness. The crate the rest of the ecosystem's RNGs sit on; no full `rand` for 32 bytes. |
 | `schemars` | Tool input schemas, required by `rmcp`. |
 | `rmcp` | **The deliberate exception.** New and not widely used, but it is the official Rust MCP SDK and there is no mature alternative. The core/adapter split is what limits the blast radius if it churns. |
 
