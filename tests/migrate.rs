@@ -282,3 +282,31 @@ fn a_planio_number_becomes_an_external_ref_without_touching_the_rest_of_the_row(
     assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), [task], "recall must index the migrated ref");
     assert!(s.conn.prepare("SELECT planio FROM tasks").is_err(), "the vendor column is gone");
 }
+
+/// A real store ran a draft of migration 014 that lacked two tables added later. 015 must bring
+/// such a store to the same shape a fresh one has, and the code that uses those tables must work
+/// on it -- forget, repo removal and setting a tag run on every board, shared or not.
+#[test]
+fn a_store_migrated_by_the_draft_of_014_is_repaired_by_015() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kanban.db");
+    {
+        let s = ai_kanban::core::Store::open(&path).unwrap();
+        s.conn.execute_batch(
+            "DROP TABLE sync_own_tags; DROP TABLE sync_unmapped_repos; PRAGMA user_version = 14;
+             UPDATE sync_node SET tag = 'b1' WHERE id = 1;",
+        ).unwrap();
+    }
+    let s = ai_kanban::core::Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 15);
+    assert!(s.is_own_tag("b1").unwrap(), "a tag the draft set is recorded as this store's own");
+
+    let pid = s.create_board("b").unwrap().id;
+    let t = s.create_task(pid, ai_kanban::core::task::TaskDraft::new("t")).unwrap();
+    s.forget_task(pid, t.id).unwrap();
+    let checkout = dir.path().join("svc");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let r = s.add_repo(pid, &checkout, None, ai_kanban::core::model::Actor::User).unwrap();
+    s.remove_repo(pid, r.id, ai_kanban::core::model::Actor::User).unwrap();
+    s.set_origin_tag("b1").unwrap();
+}

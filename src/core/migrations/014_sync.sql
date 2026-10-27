@@ -1,5 +1,8 @@
 -- Sync state for boards connected to a room. `docs/sync.md` is the design.
 --
+-- FROZEN: it has run on real stores. Two tables were added after a draft of it ran once;
+-- 015 repeats them for those stores. Changes go in a new migration.
+--
 -- Everything lives in side tables, so `tasks`, `notes` and `events` keep their shape and
 -- `TASK_COLS` / `MIN_READABLE_VERSION` are untouched (notes #13, #17, #71). A board that is not
 -- connected never gets a row in any of them.
