@@ -13,7 +13,15 @@ pub enum Error {
 
     /// Carries what *does* exist, so the caller can render a correcting message.
     #[error("no task #{id}")]
-    TaskNotFound { id: i64, project: String, existing: Vec<(i64, String)> },
+    TaskNotFound {
+        id: i64,
+        project: String,
+        existing: Vec<(i64, String)>,
+        /// How each of `existing` is named on this board (`#12`, or `#122-v1` when it is
+        /// shared), in the same order. The agent copies these, so they must be the spelling
+        /// that resolves.
+        refs: Vec<String>,
+    },
 
     #[error("no note #{id}")]
     NoteNotFound { id: i64, project: String },

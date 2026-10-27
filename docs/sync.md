@@ -181,6 +181,12 @@ what agents and people see and pass to tools. Only the handle crosses machines.
   schema will send one. The precedent for accepting either form is `834cf23`.
 - **Core-generated prose** ("blocked by #122-v1", "moved from …") uses the handle on a
   connected board. Agents copy what they see, so their own text follows.
+- **Notes keep their local ids.** A note id is only ever passed back to `note_update` on the
+  same machine, and nobody tells a teammate a note number, so a second handle namespace would
+  cost tokens for nothing.
+- **Unknown handles and mixed-up numbers fail loudly.** A plain number that is the hidden local
+  id of a teammate's task is refused with that task's handle, because the number is never shown
+  and the likeliest way to arrive at it is someone's "#40" meaning *their* #40.
 - **(origin tag, origin id) is also the sync identity.** No hidden random id is needed.
 - **Arriving tasks get a local rowid,** as today, so the insert paths and the live feed's
   `MAX(events.id)` cursor are unchanged. That rowid is internal and **never rendered** for a task

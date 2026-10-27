@@ -368,6 +368,9 @@ pub struct BoardSnapshot {
     /// then a task with none is not worth flagging: every task on it would say so.
     pub repo_count: usize,
     pub now: i64,
+    /// How tasks are named on this board. Empty unless it is connected to a room.
+    #[serde(skip)]
+    pub handles: Handles,
 }
 
 impl BoardSnapshot {
@@ -389,6 +392,8 @@ pub struct ProjectSummary {
     pub open: usize,
     pub doing: Vec<Task>,
     pub last_activity: Option<i64>,
+    #[serde(skip)]
+    pub handles: Handles,
 }
 
 /// One task with everything needed to resume it: full history and the notes attached to it.
@@ -412,6 +417,8 @@ pub struct TaskDetail {
     pub events: Vec<Event>,
     pub notes: Vec<Note>,
     pub now: i64,
+    #[serde(skip)]
+    pub handles: Handles,
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +478,8 @@ pub struct RecallResult {
     /// away believing the store holds nothing more.
     pub omitted: usize,
     pub now: i64,
+    #[serde(skip)]
+    pub handles: Handles,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -479,4 +488,80 @@ pub struct StoreOverview {
     pub tasks: usize,
     pub events: usize,
     pub projects: usize,
+}
+
+/// How tasks are named where a board is shared through a room (`docs/sync.md`, Identity).
+///
+/// A task on a connected board is shown as `#<creator's id>-<creator's tag>`, the same on
+/// every member's machine, so "I'm on #122-v1" means one thing to everyone. Everywhere else,
+/// and on any store with no connected board, it is the plain `#id` it always was -- `Default`
+/// is that, which keeps every unconnected board's output byte-identical.
+#[derive(Debug, Clone, Default)]
+pub struct Handles {
+    /// This store's origin tag, when any board is connected.
+    pub tag: Option<String>,
+    /// Local id -> (creator's tag, creator's id), for every task on a connected board.
+    pub tasks: std::collections::HashMap<i64, (String, i64)>,
+    /// `"event:12"`, `"task:5"`, `"note:7"` -> the tag of the machine that wrote that text, for
+    /// text from another member.
+    pub origins: std::collections::HashMap<String, String>,
+}
+
+impl Handles {
+    /// How a local task is named here.
+    pub fn task(&self, id: i64) -> String {
+        match self.tasks.get(&id) {
+            Some((origin, n)) => format!("#{n}-{origin}"),
+            None => format!("#{id}"),
+        }
+    }
+
+    /// Where a piece of text came from, if another member wrote it.
+    pub fn origin_of(&self, kind: &str, id: i64) -> Option<&str> {
+        self.origins.get(&format!("{kind}:{id}")).map(String::as_str)
+    }
+
+    /// `text` with every plain `#N` qualified for display. Stored text is never rewritten.
+    ///
+    /// In text another member wrote, a plain `#N` meant *their* #N, so it becomes `#N-<their
+    /// tag>` -- always, even when no such task is known here, because reading it as one of
+    /// this machine's own tasks is the worse mistake. In this machine's own text it is the
+    /// local task, shown by its handle. `#12-v1`, `&#12;` and `abc#12` are left alone.
+    pub fn text<'a>(&self, text: &'a str, origin: Option<&str>) -> std::borrow::Cow<'a, str> {
+        if self.tag.is_none() || !text.contains('#') {
+            return std::borrow::Cow::Borrowed(text);
+        }
+        let foreign = origin.filter(|o| Some(*o) != self.tag.as_deref());
+        let b = text.as_bytes();
+        let (mut out, mut last, mut i) = (String::new(), 0, 0);
+        while i < b.len() {
+            let starts = b[i] == b'#' && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'&'));
+            if starts {
+                let mut j = i + 1;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let qualified = j < b.len() && (b[j] == b'-' || b[j].is_ascii_alphanumeric());
+                if j > i + 1 && !qualified {
+                    let replacement = text[i + 1..j].parse::<i64>().ok().and_then(|n| match foreign {
+                        Some(o) => Some(format!("#{n}-{o}")),
+                        None => self.tasks.get(&n).map(|(o, id)| format!("#{id}-{o}")),
+                    });
+                    if let Some(r) = replacement {
+                        out.push_str(&text[last..i]);
+                        out.push_str(&r);
+                        last = j;
+                    }
+                }
+                i = j.max(i + 1);
+                continue;
+            }
+            i += 1;
+        }
+        if last == 0 {
+            return std::borrow::Cow::Borrowed(text);
+        }
+        out.push_str(&text[last..]);
+        std::borrow::Cow::Owned(out)
+    }
 }

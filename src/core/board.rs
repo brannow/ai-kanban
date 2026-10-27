@@ -66,6 +66,12 @@ impl Store {
             repo_count: self.repo_count(project_id)?,
             workstream,
             now: now(),
+            handles: Default::default(),
+        })
+        .and_then(|mut snap: BoardSnapshot| {
+            let texts: Vec<(&str, i64)> = snap.recent.iter().map(|e| ("event", e.id)).collect();
+            snap.handles = self.handles(&texts)?;
+            Ok(snap)
         })
     }
 
@@ -261,6 +267,7 @@ impl Store {
                 last_activity: self.last_activity(project.id)?,
                 open,
                 project,
+                handles: self.handles(&[])?,
             });
         }
         // Most recently touched first -- "what was I working on" is the question this

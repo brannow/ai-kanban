@@ -160,6 +160,49 @@ pub struct BoardParams {
     pub workstream: Option<String>,
 }
 
+/// A task as the board shows it: `12`, or on a shared board a handle like `122-v1`.
+///
+/// A string in the schema, because a handle is not a number. A JSON integer is still
+/// accepted: agents that learned the old schema send one, and refusing it would break them
+/// over a spelling.
+#[derive(Debug, Clone, Default)]
+pub struct TaskArg(pub String);
+
+impl<'de> Deserialize<'de> for TaskArg {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Number(i64),
+            Text(String),
+        }
+        Ok(TaskArg(match Raw::deserialize(d)? {
+            Raw::Number(n) => n.to_string(),
+            Raw::Text(s) => s,
+        }))
+    }
+}
+
+impl JsonSchema for TaskArg {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TaskArg".into()
+    }
+    // Inline, so every tool schema stays self-contained instead of pointing at a definition.
+    fn inline_schema() -> bool {
+        true
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string" })
+    }
+}
+
+impl TaskArg {
+    /// "0" clears a reference (`blocked_by`), as the integer 0 always has.
+    fn is_clear(&self) -> bool {
+        self.0.trim().trim_start_matches('#') == "0"
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema, Default)]
 pub struct TaskAddParams {
     /// What needs doing, in one line.
@@ -175,8 +218,8 @@ pub struct TaskAddParams {
     pub status: Option<String>,
     /// Pass "user" when filing something the user asked for. Defaults to "agent".
     pub origin: Option<String>,
-    /// Task id this one is waiting on.
-    pub blocked_by: Option<i64>,
+    /// Task this one is waiting on, as the board shows it.
+    pub blocked_by: Option<TaskArg>,
     /// Freeform labels, comma separated -- "in review", "waiting-on-vendor", "frontend".
     /// For the person's filtering: they carry no meaning you have to act on, and they are
     /// not shown on the board.
@@ -191,8 +234,8 @@ pub struct TaskAddParams {
 
 #[derive(Debug, Deserialize, JsonSchema, Default)]
 pub struct TaskUpdateParams {
-    /// The task id, as shown on the board.
-    pub task: i64,
+    /// The task, as shown on the board: 12, or a handle like 122-v1.
+    pub task: TaskArg,
     /// backlog, doing, blocked, testing, done or archived. Use testing for work that is
     /// written but not yet verified -- it stays open, so it is still there next session.
     pub status: Option<String>,
@@ -207,8 +250,8 @@ pub struct TaskUpdateParams {
     pub task_type: Option<String>,
     pub title: Option<String>,
     pub body: Option<String>,
-    /// Task id this one is waiting on. Pass 0 to clear it.
-    pub blocked_by: Option<i64>,
+    /// Task this one is waiting on, as the board shows it. Pass 0 to clear it.
+    pub blocked_by: Option<TaskArg>,
     /// Replaces the labels, comma separated. Pass "" to clear them.
     pub tags: Option<String>,
     /// Replaces the repos this touches, by name, comma separated. Pass "" to clear them.
@@ -227,7 +270,8 @@ pub struct TaskUpdateParams {
 
 #[derive(Debug, Deserialize, JsonSchema, Default)]
 pub struct TaskShowParams {
-    pub task: i64,
+    /// The task, as shown on the board: 12, or a handle like 122-v1.
+    pub task: TaskArg,
     pub project: Option<String>,
 }
 
@@ -243,7 +287,7 @@ pub struct NoteAddParams {
     /// surface when someone opens those files.
     pub paths: Option<String>,
     /// Task this was learned while working on.
-    pub task: Option<i64>,
+    pub task: Option<TaskArg>,
     pub project: Option<String>,
 }
 
@@ -275,7 +319,7 @@ pub struct LogParams {
     /// What happened or what was decided, and why.
     pub body: String,
     /// Attach to a task. Omit for project-level history.
-    pub task: Option<i64>,
+    pub task: Option<TaskArg>,
     pub project: Option<String>,
 }
 
@@ -406,7 +450,10 @@ impl AiKanban {
             origin: parse_enum("origin", &p.origin, Origin::parse)?.unwrap_or_default(),
             priority: parse_enum("priority", &p.priority, Priority::parse)?.unwrap_or_default(),
             status: parse_enum("status", &p.status, Status::parse)?.unwrap_or_default(),
-            blocked_by: p.blocked_by.filter(|b| *b > 0),
+            blocked_by: match &p.blocked_by {
+                Some(b) if !b.is_clear() => Some(store.resolve_task_arg(resolved.project.id, &b.0).map_err(fail)?),
+                _ => None,
+            },
             tags: csv(&p.tags).unwrap_or_default(),
             repos,
             // Blank means none; core normalizes the rest, so the error can say what is valid.
@@ -430,6 +477,7 @@ impl AiKanban {
             None => None,
         };
 
+        let task = store.resolve_task_arg(resolved.project.id, &p.task.0).map_err(fail)?;
         let patch = TaskPatch {
             title: p.title.clone(),
             body: p.body.clone(),
@@ -438,7 +486,11 @@ impl AiKanban {
             task_type: parse_enum("type", &p.task_type, TaskType::parse)?,
             // 0 is the clear signal: JSON has no way to say "set this to null" that
             // survives an optional field, and inventing a magic string would be worse.
-            blocked_by: p.blocked_by.map(|b| if b > 0 { Some(b) } else { None }),
+            blocked_by: match &p.blocked_by {
+                None => None,
+                Some(b) if b.is_clear() => Some(None),
+                Some(b) => Some(Some(store.resolve_task_arg(resolved.project.id, &b.0).map_err(fail)?)),
+            },
             // Empty string clears, matching how 0 clears `blocked_by` just above: an
             // optional JSON field cannot express "set this to null" on its own.
             workstream: match p.workstream.as_deref().map(str::trim) {
@@ -462,16 +514,16 @@ impl AiKanban {
             expected_version: None,
             actor: Actor::Agent,
         };
-        store.update_task(resolved.project.id, p.task, patch).map_err(fail)?;
+        store.update_task(resolved.project.id, task, patch).map_err(fail)?;
         let board = match &target {
             Some(t) => {
-                store.move_task(resolved.project.id, p.task, t.id, Actor::Agent, p.log.as_deref(), None).map_err(fail)?;
+                store.move_task(resolved.project.id, task, t.id, Actor::Agent, p.log.as_deref(), None).map_err(fail)?;
                 t.id
             }
             None => resolved.project.id,
         };
         // The board the task is on now, so "did it land" is answered where it landed.
-        let snap = store.board_after_mutation(board, p.task).map_err(fail)?;
+        let snap = store.board_after_mutation(board, task).map_err(fail)?;
         Ok(render::board(&snap))
     }
 
@@ -481,7 +533,8 @@ impl AiKanban {
     fn task_show(&self, Parameters(p): Parameters<TaskShowParams>) -> Result<String, ErrorData> {
         let store = self.store();
         let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
-        let detail = store.task_detail(resolved.project.id, p.task).map_err(fail)?;
+        let task = store.resolve_task_arg(resolved.project.id, &p.task.0).map_err(fail)?;
+        let detail = store.task_detail(resolved.project.id, task).map_err(fail)?;
         Ok(render::task_detail(&detail))
     }
 
@@ -498,7 +551,7 @@ impl AiKanban {
             body: p.body.clone().unwrap_or_default(),
             tags: csv(&p.tags).unwrap_or_default(),
             paths: csv(&p.paths).unwrap_or_default(),
-            task_id: p.task,
+            task_id: p.task.as_ref().map(|t| store.resolve_task_arg(resolved.project.id, &t.0)).transpose().map_err(fail)?,
         };
         let note = store.create_note(resolved.project.id, draft, Actor::Agent).map_err(fail)?;
         Ok(format!("Board: {}\n\nnote #{} \"{}\" recorded.\n", resolved.project.name, note.id, note.title))
@@ -659,7 +712,8 @@ impl AiKanban {
     fn log(&self, Parameters(p): Parameters<LogParams>) -> Result<String, ErrorData> {
         let store = self.store();
         let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
-        store.log_on(resolved.project.id, p.task, Actor::Agent, &p.body).map_err(fail)?;
+        let task = p.task.as_ref().map(|t| store.resolve_task_arg(resolved.project.id, &t.0)).transpose().map_err(fail)?;
+        store.log_on(resolved.project.id, task, Actor::Agent, &p.body).map_err(fail)?;
         Ok(format!("Board: {}\n\nrecorded.\n", resolved.project.name))
     }
 }

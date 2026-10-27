@@ -67,7 +67,7 @@ pub fn board(snap: &BoardSnapshot) -> String {
         }
         out.push_str(&task_line(
             t, snap.highlight == Some(t.id), &snap.blocker_status,
-            snap.links_of(t.id), snap.repo_count > 0,
+            snap.links_of(t.id), snap.repo_count > 0, &snap.handles,
         ));
     }
 
@@ -106,7 +106,7 @@ pub fn board(snap: &BoardSnapshot) -> String {
     if !snap.recent.is_empty() {
         out.push_str("\nrecent\n");
         for e in &snap.recent {
-            out.push_str(&event_line(e, snap.now));
+            out.push_str(&event_line(e, snap.now, &snap.handles));
         }
     }
     out
@@ -169,7 +169,7 @@ fn header(snap: &BoardSnapshot) -> String {
 /// same thing is one a reader learns to skip.
 fn task_line(
     t: &Task, highlighted: bool, blockers: &[(i64, Status)],
-    links: Option<&TaskLinks>, flag_missing: bool,
+    links: Option<&TaskLinks>, flag_missing: bool, h: &Handles,
 ) -> String {
     let mark = if highlighted { "*" } else { " " };
     let mut meta = vec![t.origin.to_string()];
@@ -182,8 +182,8 @@ fn task_line(
         // why the task is sitting in backlog instead of in flight, which a bare line does
         // not. An unknown status (another board's id, or a forgotten task) prints as before.
         meta.push(match blockers.iter().find(|(id, _)| *id == b) {
-            Some((_, s)) if !s.is_open() => format!("blocked by #{b} ({s})"),
-            _ => format!("blocked by #{b}"),
+            Some((_, s)) if !s.is_open() => format!("blocked by {} ({s})", h.task(b)),
+            _ => format!("blocked by {}", h.task(b)),
         });
     }
     let mut tail = String::new();
@@ -195,37 +195,41 @@ fn task_line(
     if let Some(r) = links.and_then(|l| l.external_ref.as_deref()) {
         tail.push_str(&format!(" ref {r}"));
     }
-    format!("{mark} #{:<4} {:<40} ({}){tail}\n", t.id, truncate(&t.title, 40), meta.join(", "))
+    // `{:<5}` on "#12" is exactly the `#{:<4}` on 12 this used to be, so a board that is not
+    // connected renders byte for byte as before.
+    format!("{mark} {:<5} {:<40} ({}){tail}\n", h.task(t.id), truncate(&t.title, 40), meta.join(", "))
 }
 
 /// Events render by *kind*, because a status change and a recorded decision are different
 /// news. A uniform "something happened" line would make the section skippable, and a
 /// section nobody reads is a log nobody consumes.
-fn event_line(e: &Event, now: i64) -> String {
+fn event_line(e: &Event, now: i64, h: &Handles) -> String {
     let when = ago(now, e.ts);
+    let body = h.text(&e.body, h.origin_of("event", e.id));
+    let body = body.as_ref();
     let what = match (status_transition(&e.kind), e.task_id) {
-        (Some(to), Some(id)) => format!("#{id} -> {to}{}", reason(&e.body)),
+        (Some(to), Some(id)) => format!("{} -> {to}{}", h.task(id), reason(body)),
         (Some(to), None) => format!("-> {to}"),
         (None, _) => match e.kind.as_str() {
-            "created"      => format!("#{} filed: {}", e.task_id.unwrap_or(0), truncate(&e.body, 50)),
-            "note_added"   => format!("note \"{}\"", truncate(&e.body, 50)),
-            "note_updated" => format!("note revised: {}", truncate(&e.body, 60)),
-            "log"          => truncate(&e.body, 70),
+            "created"      => format!("{} filed: {}", h.task(e.task_id.unwrap_or(0)), truncate(body, 50)),
+            "note_added"   => format!("note \"{}\"", truncate(body, 50)),
+            "note_updated" => format!("note revised: {}", truncate(body, 60)),
+            "log"          => truncate(body, 70),
             // Kept out of HOUSEKEEPING_KINDS on purpose -- starting or finishing a slice of
             // work is project history a cold agent benefits from. That decision only pays
             // off if the line says so: the body is just the name, so the generic fallback
             // below would render a bare "contact-form" with no indication of what happened
             // to it.
-            "workstream_created" => format!("started workstream \"{}\"", truncate(&e.body, 50)),
-            "workstream_closed"  => format!("closed workstream \"{}\"", truncate(&e.body, 50)),
+            "workstream_created" => format!("started workstream \"{}\"", truncate(body, 50)),
+            "workstream_closed"  => format!("closed workstream \"{}\"", truncate(body, 50)),
             // Same reasoning as the workstream kinds: history worth the line, but the body
             // alone ("eee-web (/Users/…)") would not say what happened to it.
-            "repo_added"   => format!("added repo {}", truncate(&e.body, 60)),
-            "repo_renamed" => format!("renamed repo {}", truncate(&e.body, 60)),
-            "repo_removed" => format!("removed repo {}", truncate(&e.body, 60)),
+            "repo_added"   => format!("added repo {}", truncate(body, 60)),
+            "repo_renamed" => format!("renamed repo {}", truncate(body, 60)),
+            "repo_removed" => format!("removed repo {}", truncate(body, 60)),
             _ => match e.task_id {
-                Some(id) => format!("#{id} {}", truncate(&e.body, 55)),
-                None => truncate(&e.body, 70),
+                Some(id) => format!("{} {}", h.task(id), truncate(body, 55)),
+                None => truncate(body, 70),
             },
         },
     };
@@ -236,11 +240,12 @@ fn event_line(e: &Event, now: i64) -> String {
 /// print whole: they are the "why" the agent resumes a task for, and cut at 55 characters a
 /// "USER DECISION ..." or a "DONE, commit ..." survives only as its first clause. Every
 /// other kind keeps the one-line board rendering -- a `created` body only repeats the title.
-fn history_line(e: &Event, now: i64) -> String {
-    let body = e.body.trim_end();
+fn history_line(e: &Event, now: i64, h: &Handles) -> String {
+    let qualified = h.text(&e.body, h.origin_of("event", e.id));
+    let body = qualified.trim_end();
     let what = match (status_transition(&e.kind), e.kind.as_str()) {
         (Some(to), _) if !body.is_empty() => match e.task_id {
-            Some(id) => format!("#{id} -> {to}: {body}"),
+            Some(id) => format!("{} -> {to}: {body}", h.task(id)),
             None => format!("-> {to}: {body}"),
         },
         (None, "log") => body.to_string(),
@@ -248,10 +253,10 @@ fn history_line(e: &Event, now: i64) -> String {
         // because the kind records whether the status changed. Without a log the body
         // is a short generated summary, so printing it whole costs nothing.
         (None, "updated" | "moved") => match e.task_id {
-            Some(id) => format!("#{id} {body}"),
+            Some(id) => format!("{} {body}", h.task(id)),
             None => body.to_string(),
         },
-        _ => return event_line(e, now),
+        _ => return event_line(e, now, h),
     };
     // Continuation lines hang under the text, so a multi-line entry stays visibly one entry.
     let mut text = String::new();
@@ -273,7 +278,8 @@ fn reason(body: &str) -> String {
 /// One task, everything needed to resume it cold.
 pub fn task_detail(d: &TaskDetail) -> String {
     let t = &d.task;
-    let mut out = format!("Board: {}\n\n#{} {}\n", d.project.name, t.id, t.title);
+    let h = &d.handles;
+    let mut out = format!("Board: {}\n\n{} {}\n", d.project.name, h.task(t.id), t.title);
     let mut meta = vec![t.status.to_string(), t.task_type.to_string(), format!("{} priority", t.priority), t.origin.to_string()];
     if let Some(r) = &d.external_ref { meta.push(format!("tracks issue {r}")); }
     meta.push(format!("filed {}", since(d.now, t.created_at)));
@@ -302,10 +308,10 @@ pub fn task_detail(d: &TaskDetail) -> String {
         out.push_str(&format!("\ntags: {}\n", d.tags.join(", ")));
     }
     if !t.body.is_empty() {
-        out.push_str(&format!("\n{}\n", t.body));
+        out.push_str(&format!("\n{}\n", h.text(&t.body, h.origin_of("task", t.id))));
     }
     if let Some(b) = &d.blocker {
-        out.push_str(&format!("\nblocked by #{} {} ({})\n", b.id, b.title, b.status));
+        out.push_str(&format!("\nblocked by {} {} ({})\n", h.task(b.id), b.title, b.status));
     } else if t.status == Status::Blocked {
         // status is authoritative; blocked_by is only annotation. Say so rather than
         // leaving the reader to wonder whether something is missing.
@@ -314,7 +320,7 @@ pub fn task_detail(d: &TaskDetail) -> String {
     if !d.blocking.is_empty() {
         out.push_str("\nblocking\n");
         for b in &d.blocking {
-            out.push_str(&format!("  #{} {} ({})\n", b.id, truncate(&b.title, 45), b.status));
+            out.push_str(&format!("  {} {} ({})\n", h.task(b.id), truncate(&b.title, 45), b.status));
         }
     }
     if !d.notes.is_empty() {
@@ -326,7 +332,7 @@ pub fn task_detail(d: &TaskDetail) -> String {
     if !d.events.is_empty() {
         out.push_str("\nhistory\n");
         for e in &d.events {
-            out.push_str(&history_line(e, d.now));
+            out.push_str(&history_line(e, d.now, h));
         }
     }
     out
@@ -349,23 +355,29 @@ pub fn recall(r: &RecallResult, cross_project: bool, missing: &MissingSubjects) 
         // result is speculative in exactly the way the board header exists to prevent.
         if cross_project { tail.insert(0, h.project.clone()); }
 
+        // Notes keep their local id: one is only ever passed back to note_update on the same
+        // machine, so a teammate-facing handle would buy nothing.
         let id = match (h.kind, h.task_id) {
-            (HitKind::Event, Some(t)) => format!("#{t}"),
+            (HitKind::Event, Some(t)) => r.handles.task(t),
             (HitKind::Event, None) => "  --".to_string(),
-            _ => format!("#{}", h.id),
+            (HitKind::Task, _) => r.handles.task(h.id),
+            (HitKind::Note, _) => format!("#{}", h.id),
         };
+        let origin = r.handles.origin_of(match h.kind {
+            HitKind::Event => "event", HitKind::Task => "task", HitKind::Note => "note",
+        }, h.id);
         if let Some(body) = &h.body {
             // Full mode: the text the agent asked to read, unindented and with its own line
             // breaks, because a hand-off is structured by them. The title is not cut either.
             out.push_str(&format!("\n{kind} {:<5} {}  ({})\n", id, h.title, tail.join(", ")));
             if !body.is_empty() {
-                out.push_str(&format!("{}\n", body.trim_end()));
+                out.push_str(&format!("{}\n", r.handles.text(body, origin).trim_end()));
             }
         } else {
             out.push_str(&format!("\n{kind} {:<5} {}  ({})\n", id, truncate(&h.title, 46), tail.join(", ")));
         }
         if h.body.is_none() && !h.snippet.is_empty() {
-            out.push_str(&format!("       {}\n", h.snippet.replace('\n', " ")));
+            out.push_str(&format!("       {}\n", r.handles.text(&h.snippet, origin).replace('\n', " ")));
         }
         // Only ever on note hits, and only when the check was calibrated -- see
         // `core::staleness`. Phrased as the fact ("the file is not there") rather than as a
@@ -421,7 +433,7 @@ pub fn project_summaries(sums: &[ProjectSummary], total: usize, now: i64) -> Str
         let when = s.last_activity.map(|t| since(now, t)).unwrap_or_else(|| "never".into());
         out.push_str(&format!("\n{}  ({} open, last active {})\n", s.project.name, s.open, when));
         for t in &s.doing {
-            out.push_str(&format!("  doing  #{} {}\n", t.id, truncate(&t.title, 45)));
+            out.push_str(&format!("  doing  {} {}\n", s.handles.task(t.id), truncate(&t.title, 45)));
         }
     }
     if total > sums.len() {
@@ -546,14 +558,15 @@ pub fn import_report(r: &crate::core::transfer::ImportReport) -> String {
 pub fn error(e: &crate::core::Error) -> String {
     use crate::core::Error as E;
     match e {
-        E::TaskNotFound { id, project, existing } => {
+        E::TaskNotFound { id, project, existing, refs } => {
             let mut s = format!("No task #{id} on board \"{project}\".\n");
             if existing.is_empty() {
                 s.push_str("\nThis board has no tasks yet.\n");
             } else {
                 s.push_str("\nOn this board:\n");
-                for (tid, title) in existing {
-                    s.push_str(&format!("  #{tid} {}\n", truncate(title, 50)));
+                for (i, (tid, title)) in existing.iter().enumerate() {
+                    let r = refs.get(i).cloned().unwrap_or_else(|| format!("#{tid}"));
+                    s.push_str(&format!("  {r} {}\n", truncate(title, 50)));
                 }
             }
             s

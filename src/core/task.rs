@@ -239,7 +239,8 @@ impl Store {
             })
             .unwrap_or_default();
         let project = self.project(project_id).map(|p| p.name).unwrap_or_default();
-        Error::TaskNotFound { id, project, existing }
+        let refs = existing.iter().map(|(tid, _)| self.task_ref(*tid).unwrap_or_else(|_| format!("#{tid}"))).collect();
+        Error::TaskNotFound { id, project, existing, refs }
     }
 
     /// Applies a change and records why. Returns the updated task.
@@ -378,8 +379,10 @@ impl Store {
                 None => "ref cleared".to_string(),
             });
         }
+        // Named the way teammates can look it up when the board is shared: this text reaches them.
+        let blocker = blocked_by.map(|b| self.task_ref(b)).transpose()?;
         let summary = patch.log.clone()
-            .unwrap_or_else(|| describe_change(&before, &title, &body, status, priority, blocked_by, lead));
+            .unwrap_or_else(|| describe_change(&before, &title, &body, status, priority, blocked_by, blocker, lead));
         self.write_event(before.project_id, Some(id), patch.actor, &kind, &summary)?;
 
         self.task(project_id, id)
@@ -411,9 +414,12 @@ impl Store {
         let target_repos: Vec<i64> = self.repos(to)?.into_iter().map(|r| r.id).collect();
         let dropped: Vec<Repo> = self.task_repos(project_id, id)?
             .into_iter().filter(|r| !target_repos.contains(&r.id)).collect();
+        // Before the move: afterwards the task may sit on a board that is not shared, and
+        // the text names it the way the board it is leaving knew it.
+        let me_ref = self.task_ref(id)?;
         let mut lost = Vec::new();
         if let Some(b) = before.blocked_by {
-            lost.push(format!("blocked by #{b}"));
+            lost.push(format!("blocked by {}", self.task_ref(b)?));
         }
         if let Some(w) = self.task_workstream(project_id, id)? {
             lost.push(format!("workstream \"{}\"", self.workstream(project_id, w)?.name));
@@ -462,12 +468,12 @@ impl Store {
         let unblocked = if blocking.is_empty() {
             String::new()
         } else {
-            let ids: Vec<String> = blocking.iter().map(|t| format!("#{}", t.id)).collect();
+            let ids: Vec<String> = blocking.iter().map(|t| self.task_ref(t.id)).collect::<Result<_>>()?;
             format!("; {} no longer blocked by it", ids.join(", "))
         };
         self.write_event(
             project_id, None, actor, "moved_out",
-            &format!("#{id} {} moved to board \"{}\"{unblocked}", before.title, target.name),
+            &format!("{me_ref} {} moved to board \"{}\"{unblocked}", before.title, target.name),
         )?;
         tx.commit()?;
         self.task(to, id)
@@ -507,6 +513,13 @@ impl Store {
             task,
             blocker,
             now: now(),
+            handles: Default::default(),
+        })
+        .and_then(|mut d: TaskDetail| {
+            let mut texts: Vec<(&str, i64)> = d.events.iter().map(|e| ("event", e.id)).collect();
+            texts.push(("task", id));
+            d.handles = self.handles(&texts)?;
+            Ok(d)
         })
     }
 }
@@ -541,7 +554,7 @@ pub fn check_external_ref(raw: Option<String>) -> Result<Option<String>> {
 /// without "why" is the weaker half.
 fn describe_change(
     before: &Task, title: &str, body: &str, status: Status, priority: Priority,
-    blocked_by: Option<i64>, lead: Vec<String>,
+    blocked_by: Option<i64>, blocker: Option<String>, lead: Vec<String>,
 ) -> String {
     // First: changes resolved to names by the caller -- a workstream move, new repos, an
     // external ref. They are the most significant things that can happen to a task without its
@@ -550,8 +563,8 @@ fn describe_change(
     if status != before.status { parts.push(format!("{} -> {}", before.status, status)); }
     if priority != before.priority { parts.push(format!("priority {} -> {}", before.priority, priority)); }
     if blocked_by != before.blocked_by {
-        parts.push(match blocked_by {
-            Some(b) => format!("blocked by #{b}"),
+        parts.push(match blocker {
+            Some(b) => format!("blocked by {b}"),
             None => "unblocked".to_string(),
         });
     }

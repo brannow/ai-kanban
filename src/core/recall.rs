@@ -95,6 +95,7 @@ impl Store {
         let Some(match_expr) = fts_query(q.text) else {
             return Ok(RecallResult {
                 query: q.text.into(), hits: vec![], scope, available, omitted: 0, now: now(),
+                handles: Default::default(),
             });
         };
 
@@ -123,7 +124,11 @@ impl Store {
         hits.truncate(q.limit);
 
         let omitted = total.saturating_sub(hits.len());
-        Ok(RecallResult { query: q.text.into(), hits, scope, available, omitted, now: now() })
+        let texts: Vec<(&str, i64)> = hits.iter().map(|h| (match h.kind {
+            HitKind::Event => "event", HitKind::Task => "task", HitKind::Note => "note",
+        }, h.id)).collect();
+        let handles = self.handles(&texts)?;
+        Ok(RecallResult { query: q.text.into(), hits, scope, available, omitted, now: now(), handles })
     }
 
     /// Total rows matching, so a truncated result can say what it left out.

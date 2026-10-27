@@ -21,6 +21,7 @@
 use crate::core::error::{Error, Result};
 use crate::core::store::{now, Store};
 use crate::sync::protocol::{Change, Clock, Pulled, Ref, SERVER_TAG};
+use crate::core::model::Handles;
 use rusqlite::types::Value as Sql;
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
@@ -834,5 +835,135 @@ impl Store {
             params![room, e.kind, e.origin, e.id],
         )?;
         Ok(Outcome::Applied)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handles: how tasks are named on connected boards
+// ---------------------------------------------------------------------------
+
+impl Store {
+    /// Whether any board is connected. `false` on a store older than migration 014 too: the
+    /// SessionStart hook reads stores it must not migrate, and naming a missing table is an
+    /// error there that would silently blank the board (notes #13, #17).
+    fn any_connected(&self) -> Result<bool> {
+        match self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sync_rooms)", [], |r| r.get(0)) {
+            Ok(b) => Ok(b),
+            Err(e) if crate::core::workstream::is_missing_schema(&e) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Handles for every task on a connected board, and the origin of each listed text that
+    /// another member wrote. `texts` names them as (`"event"` | `"task"` | `"note"`, local id);
+    /// for a task or note it is the body, whose origin is whoever last wrote it.
+    pub fn handles(&self, texts: &[(&str, i64)]) -> Result<Handles> {
+        if !self.any_connected()? {
+            return Ok(Handles::default());
+        }
+        let tag = self.origin_tag()?;
+        let mut h = Handles { tag: tag.clone(), ..Default::default() };
+        let mut st = self.conn.prepare(
+            "SELECT s.local_id, s.origin, s.origin_id FROM sync_ids s
+               JOIN tasks t ON t.id = s.local_id
+               JOIN sync_rooms r ON r.project_id = t.project_id
+              WHERE s.kind = 'task'",
+        )?;
+        for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))? {
+            let (local, origin, id) = row?;
+            h.tasks.insert(local, (origin, id));
+        }
+        let me = tag.unwrap_or_default();
+        for &(kind, local) in texts {
+            let origin: Option<String> = match kind {
+                "event" => self.conn
+                    .query_row("SELECT origin FROM sync_ids WHERE kind = 'event' AND local_id = ?1", [local], |r| r.get(0))
+                    .optional()?,
+                _ => {
+                    let Some(r) = self.identity(kind, local)? else { continue };
+                    self.conn
+                        .query_row(
+                            "SELECT tag FROM sync_fields WHERE kind = ?1 AND origin = ?2 AND origin_id = ?3 AND field = 'body'
+                              ORDER BY wall_ms DESC, counter DESC LIMIT 1",
+                            params![kind, r.origin, r.id],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .filter(|t: &String| !t.is_empty())
+                        .or(Some(r.origin))
+                }
+            };
+            if let Some(o) = origin.filter(|o| *o != me) {
+                h.origins.insert(format!("{kind}:{local}"), o);
+            }
+        }
+        Ok(h)
+    }
+
+    /// How a task is referred to in text this machine generates ("blocked by #12-b1"). That
+    /// text reaches teammates, so it must name the task the way they can look it up.
+    pub fn task_ref(&self, id: i64) -> Result<String> {
+        if !self.any_connected()? {
+            return Ok(format!("#{id}"));
+        }
+        let synced: Option<(String, i64)> = self.conn
+            .query_row(
+                "SELECT s.origin, s.origin_id FROM sync_ids s
+                   JOIN tasks t ON t.id = s.local_id JOIN sync_rooms r ON r.project_id = t.project_id
+                  WHERE s.kind = 'task' AND s.local_id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(match synced {
+            Some((origin, n)) => format!("#{n}-{origin}"),
+            None => format!("#{id}"),
+        })
+    }
+
+    /// The local task an agent named: a handle (`122-v1`, `#122-v1`), or a plain number
+    /// meaning a task created on this machine.
+    ///
+    /// A plain number that is the hidden local id of a teammate's task is refused with its
+    /// handle. That number is never shown, so the only way to arrive at it is a mix-up -- most
+    /// likely someone's "#40" meant their own #40 -- and resolving it would act on the wrong task.
+    pub fn resolve_task_arg(&self, project_id: i64, raw: &str) -> Result<i64> {
+        let s = raw.trim().trim_start_matches('#');
+        if let Ok(n) = s.parse::<i64>() {
+            if self.any_connected()? {
+                if let Some(r) = self.identity("task", n)? {
+                    if Some(r.origin.as_str()) != self.origin_tag()?.as_deref() {
+                        return Err(Error::InvalidValue {
+                            field: "task",
+                            value: raw.trim().into(),
+                            valid: format!(
+                                "#{n} is not a task created on this machine. The task with local number {n} is {} -- \
+                                 pass that handle if it is the one you mean",
+                                self.task_ref(n)?
+                            ),
+                        });
+                    }
+                }
+            }
+            return Ok(n);
+        }
+        if let Some(h) = crate::sync::protocol::Handle::parse(s) {
+            if self.any_connected()? {
+                if let Some(id) = self.local_id(&Ref { kind: "task".into(), origin: h.origin.clone(), id: h.id })? {
+                    self.task(project_id, id)?;
+                    return Ok(id);
+                }
+            }
+            return Err(Error::InvalidValue {
+                field: "task",
+                value: raw.trim().into(),
+                valid: format!("a task on this board -- no task {h} is here. The board lists every task's handle"),
+            });
+        }
+        Err(Error::InvalidValue {
+            field: "task",
+            value: raw.trim().into(),
+            valid: "a task number like 12, or a handle like 122-v1".into(),
+        })
     }
 }
