@@ -68,7 +68,9 @@ ecosystems, to solve "remember what happened last week".
   states beyond the ones that carry meaning — a status earns its place by changing what an
   agent does, never by labelling a stage. Board-management ceremony serves humans managing
   humans.
-- **Not a team planning tool.** One person and their agents.
+- **Not a team planning tool.** One person and their agents, optionally sharing a board with a
+  team through a self-hosted room (`docs/sync.md`). Sharing exists so nobody solves the same
+  problem twice. It brings no assignees, sprints or workflow ceremony.
 - **Not a chat log.** Events record what happened and why, not a transcript.
 - **Not cross-platform.** macOS and Linux. Windows support means platform code written
   blind on a machine that cannot run it, and shipping that is worse than not claiming it.
@@ -85,7 +87,8 @@ the honest answer is "it would look more complete", it does not belong.
 
 ## Why this can stay small
 
-One SQLite file, one static binary, no daemon, no server, no per-project setup. The entire
+One SQLite file, one static binary, no daemon, no server **required**, no per-project setup. A
+team that wants to share a board runs one relay (`ai-kanban server`). A solo user never has to. The entire
 system is a schema, a few thousand lines of Rust, and the discipline to keep saying no.
 
 That is not modesty. Setup overhead is what kills tools like this: anything that needs

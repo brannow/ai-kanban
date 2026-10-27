@@ -39,6 +39,7 @@ Apply it to every change to the tool surface. Details and worked examples in
 | `docs/adoption.md` | Hooks and the plugin — the load-bearing risk. |
 | `docs/http-api.md` | The human-facing API, the web UI, and live updates. |
 | `docs/architecture.md` | Layering, the store, durability, dependencies. |
+| `docs/sync.md` | Sharing a board through a room on a self-hosted relay. Draft, being built. |
 | `docs/plan.md` | Founding record. Superseded by the above where they disagree. |
 
 ## Conventions

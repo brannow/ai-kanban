@@ -127,10 +127,10 @@ than something discovered after a disk failure.
   and is a genuinely different problem: ids collide meaninglessly and "both sides edited
   task #7" has no answer in the data.
 
-- **Multi-machine sync: deliberately out of scope for v1.** A desktop and a laptop are two
-  disjoint memories — the same split-memory failure `project_paths` prevents within a
-  machine, recurring at machine level. Naming it is not solving it, but an unnamed version of
-  this problem is the one that bites.
+- **Multi-machine sync: designed in `docs/sync.md`, not built yet.** Until it lands, a desktop and
+  a laptop are two disjoint memories: the same split-memory failure `project_paths` prevents
+  within a machine, recurring at machine level. The design shares a board through a room on a
+  self-hosted relay. A person on two machines is just two members of one room.
 
 ## Dependencies
 

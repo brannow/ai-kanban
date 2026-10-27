@@ -1,0 +1,391 @@
+# Sync rooms: DRAFT PROPOSAL
+
+Status: **proposal, nothing built.** Task #1050 holds the reasoning, including the options
+considered and dropped. If accepted, it amends `docs/vision.md` (see
+[Vision amendment](#vision-amendment)) before any code lands.
+
+## What this is for
+
+| # | Requirement |
+|---|---|
+| R1 | A team's agents share work, so nobody solves the same problem twice. "Who is on it" must be fresh **at the moment an agent claims work**. |
+| R2 | The store is a valuable asset. Losing a disk must not lose the memory. |
+| R3 | Most work is solo, and a board that syncs nowhere must keep working exactly as today. |
+| R4 | Existing local boards and their history can join the team. |
+| R5 | No setup per repo for the agent. The agent needs no knowledge of sync to use the board (the design law). |
+| R6 | Offline keeps working: writes are local first and sync later. |
+| R7 | One person on two machines is not a special case. |
+
+## Terms
+
+```
+store (one SQLite file per machine)
+└── board (a row in `projects`), e.g. "sbb"   identity: git remote, folder or name
+    ├── repos          local checkout paths
+    ├── workstreams    named slices of work; a task is in at most one
+    ├── tasks
+    │   └── events     history plus `log` lines (the task's comments)
+    ├── notes          durable knowledge, attached to a task or to the board
+    └── board events   decisions and summaries not tied to a task
+```
+
+- **Room:** the shared copy of one board's content on a server. A board is **connected** to at
+  most one room. Connected means **all** of the board is shared.
+- **Workstreams are not affected.** They stay a grouping inside the board and sync by name.
+  Considered and dropped: one protected "remote" workstream as the entrance to the room. A task
+  holds one workstream, so shared tasks could not also be in "deploy" or "db-migration".
+
+## The idea in one paragraph
+
+Every machine keeps its full local store, exactly as today. A **room** lives on a self-hosted
+server and holds a shared set of tasks with their history and notes. A local board can be
+**connected** to one room. From then on, everything written on that board is published to
+the room, and everything others publish into the room arrives on the board. The board stays
+local: its name, folders, repos and current workstream are each person's own. Benny's
+"sbahn v13" and Volker's "sbahn upgrade" can be the same room.
+
+Why this shape:
+
+- **Local first.** Hooks keep reading a local file and never touch the network. Offline is full
+  speed. Every member holds a full copy of the room, which covers R2 better than any single server.
+- **The room is the unit, not the store.** Private boards never leave the machine, so there is no
+  access-control system to build.
+- **The server relays.** It authenticates, orders changes and serves "changes since X". It does
+  not run board logic, so it seldom needs upgrading in step with clients.
+
+Considered and dropped (reasons on #1050): a central server as the only copy (no offline
+work, and the hooks would need the network), literal git files in the repo (tasks would follow
+branch switches; a board that spans several repos has no single repo), libSQL/Turso (a vendor
+rewrite and a single writer), cr-sqlite (last push 2024-10, native extension). The cr-sqlite
+*approach* is borrowed: for each field, the newest write wins.
+
+## Rules
+
+| Rule | Why |
+|---|---|
+| A local board connects to **at most one room**, and on each machine a room connects to **at most one local board**. | Several rooms per board would make every `task_add` choose a room, which breaks the design law. Two local boards in one room would put two copies of the same room on one machine. |
+| **Everything on a connected board publishes.** No per-task privacy. | Per-task privacy means the agent decides what is private. Private work goes on a board that isn't connected. |
+| A room carries **tasks, their events, notes (including board-level notes) and board-level events**. | Notes and decisions are the knowledge half. A teammate's `recall` finding your root cause is the double work avoided most often. |
+| Sync is **both ways for every task, your own included.** | Teammates log evidence and findings on your tasks, and you need that back. Publishing without receiving would leave your copy behind the room's. |
+| Synced per room: workstream **membership**, by name. Local only: `current_workstream`, `project_paths`, `repos.path`. | Which workstream a task belongs to is shared. Which one *you* are in is your context. This also prevents one person's workstream switch from changing everyone's view. |
+| **Connecting is a CLI step,** never the agent's: `ai-kanban room join <server>/<room>`. | Joining publishes the board's whole history to others, and that is a human decision. |
+| A first connect publishes the board's existing tasks, history and notes. When two existing boards join one room, the result is the **union**. | That is what R4 asks for. Duplicates get reconciled by people, by forgetting or merging one, since only people know two tasks are the same. |
+| `task_update(move_to)` **onto** a connected board publishes the task. **Off** one, the task leaves the room: others keep a frozen, archived copy with "moved off the team board by benny". | The agent can move tasks, so both directions need a defined result. Deleting the task on others' machines would destroy their history of it. |
+
+## Connecting a board
+
+Terminal commands only, never the agent's. **One remote per client** in v1: a store has one
+origin tag, and no command ever has to say which server it means.
+
+```
+ai-kanban remote https://sync.board.rannow.de --key akb_…   set the remote, check the key
+ai-kanban remote                                            show it: URL, user, origin tag, protocol
+ai-kanban room list                                         rooms on the remote, and which local board each is connected to
+ai-kanban room connect sbahn [--board sbb] [--yes]          connect a local board to a room
+ai-kanban room disconnect sbahn [--keep-foreign|--wipe-foreign] [--yes]
+ai-kanban remote --disconnect [...same flags]               disconnect every room, then forget the key
+```
+
+**`remote <url> --key`** checks the key at once (`/v1/hello` and `/v1/whoami`), so a typo fails
+here and not mid-session. The key is stored in `servers.json` in the data directory (mode 0600),
+never in SQLite, so `backup` and `export` never carry it. `AI_KANBAN_SERVER_URL` and
+`AI_KANBAN_SERVER_KEY` cover CI. Setting a different URL while rooms are connected is refused:
+disconnect first. Moving the domain is `remote --move <new-url>`, the same server under a new name.
+
+**`room connect sbahn`:**
+
+```
+$ ai-kanban room connect sbahn
+Connect which local board to room "sbahn"?
+  1) sbb            (this folder)
+  2) ai-kanban
+  3) eee-web
+Board [1]:
+board "sbb" -> room "sbahn"
+  will publish:  42 tasks, 130 events, 18 notes   (as #N-b1)
+  will receive:  11 tasks from volker (v1)
+Connect? [y/N]: y
+backup written: ~/…/kanban-before-connect-sbahn.db
+connected. Board header now shows: Board: sbb @sbahn
+```
+
+- **The picker is a numbered list read from stdin**, so no crate is needed. The board found from the
+  current folder is preselected. Boards already in a room are not listed.
+- A board connects to at most one room, and a room to at most one board on this client. Both are
+  enforced, and the refusal names the existing link.
+- The publish summary and the confirmation are mandatory, because connecting publishes the board's
+  whole history. A backup is written before anything leaves the machine.
+- **Connecting to a room that does not exist creates it.** Any user may, since a server is a team.
+  The summary says `room "sbahnn" does not exist yet — it will be created`, so a typo is visible
+  before the confirmation. Only the admin deletes rooms (`ai-kanban server room delete`). The
+  server removes **empty** rooms after 7 days: no tasks, notes or events, and no board connected.
+
+**`room disconnect sbahn`:**
+
+```
+$ ai-kanban room disconnect sbahn
+Board "sbb" and room "sbahn" will be uncoupled.
+  3 local changes are not pushed yet.  [s]ync now / [d]iscard / [c]ancel: s
+  synced.
+  11 tasks on this board came from other members (v1).
+  Wipe them locally? They stay in the room.  [k]eep / [w]ipe [k]: k
+disconnected. Board "sbb" is local again.
+```
+
+- **Unsent changes come first.** Disconnecting silently would withhold them from the team.
+- **Keep is the default for foreign tasks.** Wiping saves only space, and the server still has them.
+  Kept ones stay readable with their `#N-v1` handles and stop changing.
+- **Reconnecting resumes cleanly:** identity is (origin, id), so kept tasks are matched again rather
+  than duplicated.
+- Nothing is deleted on the server, and your own published tasks stay in the room for the others.
+
+**`remote --disconnect`** runs the disconnect for every connected room, with the same questions
+for each, then removes the key. The first prompt says so: "All connected boards will be uncoupled
+from <url> and the key removed."
+
+**Without a terminal** (scripts, `tests/cli.rs`), every prompt needs its flag. Missing flags fail with
+the list of them, and nothing is half-done.
+
+**Later: a repo names its room.** A checked-in `.ai-kanban.json` with `{ "room": "sbahn" }`. If the
+board is new and empty and the remote is set, it connects automatically, because nothing local is
+published. If the board has content, the header shows a hint instead. It only ever names a room on
+the remote this client already trusts.
+
+## Identity: what the agent sees
+
+The deciding constraint: people and agents pass task references to each other ("I'm doing
+#122, #423 and #433 today"), write them into logs, note bodies and commits, and core generates
+`#N` prose itself (`describe_change`, `move_task`). A reference to a shared task must
+therefore be **the same on every machine, valid the moment the task is created (offline
+included), and recognisable by the person who created it.**
+
+**The handle is the creator's own id plus the creator's origin tag: `#122-v1`.**
+
+Two different things are called "id" here. The **stored id** stays an INTEGER rowid, per machine,
+exactly as today. The **handle** is a string, made from that integer and the origin tag, and it is
+what agents and people see and pass to tools. Only the handle crosses machines.
+
+- **The origin tag** belongs to one store, which in practice means one machine. It is chosen
+  when that machine's key is created (`v1` = Volker's laptop, `b1` and `b2` = Benny's laptop and
+  desktop) and is unique on the server. It survives key rotation. The board header of a
+  connected board lists who each tag is: `team: b1 benny, v1 volker`.
+- **The number is the creator's local id, unchanged.** Volker's "#122" is the same number on
+  your machine. Nothing is leased from the server and nothing is assigned at sync time.
+  Connecting a board renames nothing: your `#775` becomes `#775-b1`, and the number in old logs
+  still matches.
+- **On a connected board, every task shows its handle, on the creator's machine too.** Volker
+  sees `#122-v1`, not `#122`. Otherwise his "#122" means your local #122 on your machine. So a
+  plain `#N` always means a task created on this machine.
+- **The `task` param becomes a string** in the tool schema: `122-v1`, `#122-v1`, or `122` meaning
+  "created on this machine". A JSON integer is still accepted, because agents that learned the old
+  schema will send one. The precedent for accepting either form is `834cf23`.
+- **Core-generated prose** ("blocked by #122-v1", "moved from …") uses the handle on a
+  connected board. Agents copy what they see, so their own text follows.
+- **(origin tag, origin id) is also the sync identity.** No hidden random id is needed.
+- **Arriving tasks get a local rowid,** as today, so the insert paths and the live feed's
+  `MAX(events.id)` cursor are unchanged. That rowid is internal and **never rendered** for a task
+  from another origin.
+
+Collisions cannot happen:
+
+| | Benny's store (b1) | Volker's store (v1) | Everyone sees |
+|---|---|---|---|
+| Benny files a task | local 812 | arrives as local 40 (hidden) | `#812-b1` |
+| Volker files a task | arrives as local 813 (hidden) | local 122 | `#122-v1` |
+| Benny, on a board that isn't connected | local 814 | does not exist | `#814` (Benny only) |
+
+**Requires that ids are never reused.** Tasks and notes are a plain `INTEGER PRIMARY KEY`, and
+`forget` deletes the row (`forget.rs:54`, `:87`). So forgetting the newest task hands its id to
+the next one. Under sync, that issues `#122-v1` twice, and the second task collides with the
+first one's forget tombstone on every machine. Migration 004 fixed exactly this for events.
+Phase 1 does the same for tasks and notes: either rebuild them as AUTOINCREMENT, or keep a
+high-water mark that the two insert paths respect. The rebuild is heavier, because of the FTS
+triggers and the cascades that 010 avoided.
+
+**Text from another origin is qualified for display.** A plain `#N` inside text that came from
+another origin (an event body, a note, a task body) is rendered as `#N-<origin>`. The stored text is
+never rewritten, and the origin of every synced row is already known from its identity. This
+happens **always**, even if no such task is known in the room. Misreading Volker's `#775` as your own
+#775 is the worse error. A GitHub issue `#12` showing as `#12-b1` is cosmetic. This covers text
+written before the board connected, and agents that write a plain number.
+
+## People, not sessions
+
+- The server derives the **author** from the key. A client never sends it. One **user**, many keys:
+  **one key per machine**, labelled (`benny/laptop`). R7 needs nothing more. Both machines'
+  boards join the same room, and both appear as "benny".
+- Agent sessions stay local. `events.actor` (`user | agent | system`) is unchanged.
+- "Who is on it" = the author of the change that last set `doing`. **No assignee column.** On a
+  connected board the header gains one line: `doing: volker 3, benny 6`. Its token cost is measured in
+  `tests/budget.rs`.
+
+## How sync works
+
+### Changes
+
+Each mutation on a connected board writes, **in the same transaction**, one change per
+**changed field** (never a whole row) into a local outbox:
+
+```
+{ id, entity: task|note|event|task_tag|task_repo|note_path, field, value, clock }
+```
+
+- **Clock:** a hybrid logical clock (wall time, then a counter, then the origin tag as the
+  tie-break). Not `updated_at`, which is whole seconds, so ties are routine (note #3).
+- **Apply:** for each field, apply if the incoming clock beats the stored clock for that field,
+  else ignore. Order-independent and idempotent, so a change applied twice or late lands the
+  same way. Tested as a property: any order of the same change set gives the same state.
+- **Events** are insert-only: one change carries the whole row, and duplicates are dropped by id.
+- **Forget** is a tombstone that beats every later field change and is **kept forever**.
+  Otherwise a member who was offline pushes the forgotten rows back. **In a room, only the admin
+  forgets** (`ai-kanban server forget <room> <handle>`), because it is permanent for every member.
+  Locally, forget on a connected board is refused and the message names that command. On boards
+  that aren't connected, forget works as today.
+- **Names that must be unique** (workstreams per board, repos) merge **by name**. Two machines
+  creating `deploy` offline get one workstream, not a constraint failure.
+- Repos travel by **normalized git remote** (the `git:…` form of `projects.key`). The local checkout
+  path stays local. A repo with no remote cannot be linked to a task in a room.
+
+### When it happens
+
+All of it runs inside the MCP process, which already exists per session, so there is no daemon:
+
+- **Pull at startup.** **Pull before** any move into `doing` and before `task_add`, so the claim
+  warning and the duplicate hint see current data.
+- **Push after every write** (HTTP POST).
+- **The server notifies, the client pulls.** The MCP process holds one SSE stream per connected
+  room (`rooms/{r}/events`). It carries only "room changed, sequence N", and a heartbeat every
+  30s. On a notification, the client pulls everything since its last position. SSE rather than
+  WebSocket, because only server → client is needed, it is plain HTTP, and the codebase already
+  serves SSE (`src/http/stream.rs`). Behind nginx it needs `proxy_buffering off`.
+- **The pull stays the source of truth.** Streams drop, laptops sleep, proxies cut idle
+  connections. A missed notification only delays a pull, because the position is resumable.
+  With the stream down, the client falls back to pulling every 60s. The pull before a claim stays
+  too: it is the guarantee, and the stream makes it rarely necessary.
+- **One sync at a time per store** (several sessions share one file): a lock row taken with
+  `BEGIN IMMEDIATE`. The apply step is idempotent anyway.
+- Applied remote changes arrive with their events, so `tests/change_feed.rs` and the live page
+  see them like any other write.
+- **Offline:** the outbox keeps growing, and the board header says `@sbahn (offline, 4 unsent)`. Nothing
+  is refused.
+
+### Hooks
+
+Unchanged. They read the local file, read-only, and never touch the network. The cost: the
+SessionStart view is as fresh as the last sync, which may be the previous session. Freshness
+at claim time comes from the pull before `doing`, not from the hook.
+
+## Versioning
+
+Yes, and separately from the schema version. `transfer.rs` already sets the precedent:
+`FORMAT_VERSION` is deliberately not the schema version, because the two change for
+different reasons.
+
+- **Protocol version** in every request. `GET /v1/hello` returns the range the server supports.
+  On a mismatch **sync pauses and local work continues**: `@sbahn (sync paused: the server
+  needs ai-kanban ≥ 0.9 — run make install)`. Local-first means a version problem never blocks
+  work.
+- **Changes are per field, so unknown fields are harmless.** An older client receiving a field
+  it does not have **parks** the change instead of dropping it.
+- **Unknown values are the real trap.** Migration 010 added `testing` by rewriting a CHECK
+  constraint, so a client one version behind cannot apply `status = testing`. Rule: a change
+  that fails to apply is **parked** (kept in a local table, counted in the header), and re-applied
+  after an upgrade. Late application is correct because the field clock decides, not arrival order.
+- **The server does not validate values.** It checks the envelope (room, id, clock, protocol)
+  and auth, and stores the rest unread. So a new status or field needs only client upgrades, and
+  members upgrade at their own pace.
+- Breaking the envelope means `/v2`, served alongside `/v1` for a transition.
+
+## Server
+
+`ai-kanban server`, same crate, as a Docker image with a `/data` volume. TLS goes on the reverse
+proxy. It has its own router with bearer auth on every route; `serve`'s loopback-only rules
+stay for `serve`.
+
+```
+ai-kanban server user add volker
+ai-kanban server key add volker --label laptop --tag v1   # prints the key once
+ai-kanban server key list | revoke <id> | rotate <tag>
+ai-kanban server room list | delete <room>               # rooms are created by connecting
+ai-kanban server forget <room> <handle>                 # the only forget in a room
+ai-kanban server snapshot                              # also scheduled: --snapshot-every 6h --keep 28
+```
+
+- **Keys:** 32 random bytes, prefixed `akb_`, stored as SHA-256. Not JWT: one server with a
+  database gains nothing from stateless tokens, and revoking a key is a row delete.
+- **v1:** every user on a server may join every room. A team is a server. Need separation? Run
+  a second container.
+- **Routes:** `hello`, `whoami`, `rooms`, `rooms/{r}/join` (creates if missing), `rooms/{r}/changes`
+  (POST to push, GET `?since=` to pull), `rooms/{r}/events` (SSE notifications).
+- **Housekeeping:** empty rooms are removed after 7 days.
+- **Storage:** the change log, in order, plus room metadata. The log is the source a new member
+  replays. Snapshots of the server database cover mistakes, and off-site backup is the operator's
+  job. No board materialized on the server in v1. A web UI for rooms comes later, if ever.
+
+## Local schema
+
+All sync state lives in **new side tables**. `tasks`, `notes` and `events` keep their shape, so
+`TASK_COLS` and `MIN_READABLE_VERSION` are untouched (notes #13, #17, #71):
+
+| Table | Holds |
+|---|---|
+| `sync_rooms` | board ↔ room, pull cursor |
+| `sync_ids` | (entity, local id) ↔ (origin tag, origin id) |
+| `sync_clocks` | (sync id, field) → clock |
+| `sync_outbox` | changes not yet pushed |
+| `sync_parked` | received changes that could not be applied, and why |
+| `sync_node` | this store's origin tag, as issued with its key |
+
+The read-only hook reads `sync_rooms` and `sync_ids` (for the header and the handles) with
+tolerant queries, so an unmigrated store shows the board without them.
+
+## Costs that remain
+
+- **Every write path on a connected board records field changes.** It is the same discipline as
+  "every mutation writes an event", enforced the same way: `tests/change_feed.rs` grows an
+  assertion that every mutation also writes its changes.
+- **Rendering handles** touches every place a task reference is printed, prose included.
+- **Concurrent edits of one field:** the newest clock wins. Nothing is lost (history and the
+  previous note body keep the other version), but the visible value can be the loser's.
+  **Accepted** (2026-10-28): the last write wins, and the history shows both.
+- **Two people claim the same task within one sync window:** both succeed, and the next sync
+  shows two names. The claim warning makes this rare.
+
+## Phases
+
+0. **Now, independent of all of this:** a scheduled `ai-kanban backup` copied off the machine.
+1. **Core, no network:** node id and clock, side tables, recording field changes, the apply
+   function and its order-independence test, ids that are never reused (tasks, notes),
+   handles in rendering and in tool params.
+2. **Server:** relay, users and keys with origin tags, rooms, `hello`, snapshots, Docker image.
+3. **Client:** `remote`, `room list|connect|disconnect`, push/pull and the SSE stream in the MCP
+   process, lock, parking, header line, pull before claim.
+4. **Coordination:** `doing: volker 3`, a duplicate hint on `task_add`, a warning when claiming a task someone else has in `doing`.
+
+## Decided (2026-10-28)
+
+- A room carries notes and board-level events as well as tasks.
+- In a room, only the admin forgets.
+- Any user creates a room by connecting to it. The admin deletes rooms, and empty rooms go after 7 days.
+- Concurrent edits: the last write wins, and the history shows both.
+- The `task` param becomes a string (an integer is still accepted).
+- New dependencies approved: `ureq` (HTTP client with rustls, also reads the SSE stream),
+  `getrandom` (keys), `sha2` (hashing keys). Each needs a row in `architecture.md`.
+
+## Open decisions
+
+- **The vision amendment** below, which lands before any code.
+
+## Later, not v1
+
+- **A per-task "private" flag on a connected board.** Only a human may set it (terminal or UI),
+  or the agent ends up deciding what is private. Whatever points at a private task stays local
+  too: `blocked_by`, and notes attached to it.
+- **Several rooms per board.**
+
+## Vision amendment
+
+- "Not a team planning tool. One person and their agents." → "One person and their agents,
+  optionally sharing a board with a team through a self-hosted room. Still no assignees,
+  sprints or workflow ceremony."
+- "no server, no daemon" → "no server **required** and no daemon. A team may run one relay."
