@@ -31,6 +31,12 @@ USAGE:
     ai-kanban repo forget <repo>   Remove a repo from every board (dry run without --yes)
     ai-kanban merge <keep> <gone>  Repair a board that split into two
     ai-kanban where                Print the path to the store
+    ai-kanban remote <url> --key K Connect this machine to a sync relay (docs/sync.md)
+    ai-kanban remote               Show it; --move <url>, --disconnect
+    ai-kanban room list            Rooms on the relay
+    ai-kanban room connect <room>  Share a board through a room (--board <b>, --yes)
+    ai-kanban room disconnect <room>   Uncouple it again
+    ai-kanban room status | sync   What each shared board last did; sync them now
     ai-kanban --help
 
 Everything you have recorded lives in one SQLite file outside version control. Keep it
@@ -70,6 +76,9 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("mcp") => run_mcp().await,
+        // Sharing boards through a relay (docs/sync.md). A person's commands, never the agent's.
+        Some("remote") => ai_kanban::remote::cli::remote_cmd(),
+        Some("room") => ai_kanban::remote::cli::room_cmd(),
         Some("serve") => {
             // Loopback only, and no flag to change that: the store is global and there is no
             // auth. See `http::serve`.

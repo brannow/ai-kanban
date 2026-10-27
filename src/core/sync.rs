@@ -1199,3 +1199,39 @@ impl Store {
         Ok(keys.iter().map(|k| crate::core::project::repo_key_label(k).to_string()).collect())
     }
 }
+
+// ---------------------------------------------------------------------------
+// What connecting and disconnecting would touch, for the CLI's summaries
+// ---------------------------------------------------------------------------
+
+/// What connecting a board publishes: its tasks, notes, and the events a room receives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PublishSummary {
+    pub tasks: i64,
+    pub notes: i64,
+    pub events: i64,
+}
+
+impl Store {
+    pub fn publish_summary(&self, project_id: i64) -> Result<PublishSummary> {
+        let count = |sql: &str| -> Result<i64> { Ok(self.conn.query_row(sql, [project_id], |r| r.get(0))?) };
+        let kinds = PUBLISHED_KINDS.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(", ");
+        Ok(PublishSummary {
+            tasks: count("SELECT COUNT(*) FROM tasks WHERE project_id = ?1")?,
+            notes: count("SELECT COUNT(*) FROM notes WHERE project_id = ?1")?,
+            events: count(&format!(
+                "SELECT COUNT(*) FROM events WHERE project_id = ?1 AND (kind IN ({kinds}) OR kind LIKE 'status:%')"
+            ))?,
+        })
+    }
+
+    /// How many tasks on a board other members created: what a wiping disconnect removes.
+    pub fn foreign_task_count(&self, project_id: i64) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks t JOIN sync_ids s ON s.kind = 'task' AND s.local_id = t.id
+              WHERE t.project_id = ?1 AND s.origin NOT IN (SELECT tag FROM sync_own_tags)",
+            [project_id],
+            |r| r.get(0),
+        )?)
+    }
+}

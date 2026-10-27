@@ -6,6 +6,7 @@
 //! carries them, and never holds a write transaction open while waiting on the network: every
 //! agent session on the machine shares the store, and would queue behind it.
 
+pub mod cli;
 pub mod client;
 pub mod config;
 pub mod engine;
