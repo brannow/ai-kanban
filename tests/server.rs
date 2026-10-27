@@ -36,7 +36,12 @@ async fn call(relay: &Relay, method: &str, uri: &str, key: Option<&str>, body: O
     let res = router(relay.clone()).oneshot(req).await.unwrap();
     let status = res.status();
     let bytes = axum::body::to_bytes(res.into_body(), 16 * 1024 * 1024).await.unwrap();
-    let value = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() };
+    // Errors the router produces itself (413, 415) are plain text, not the relay's JSON.
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into()))
+    };
     (status, value)
 }
 
@@ -53,6 +58,7 @@ fn change(tag: &str, seq: i64, entity: Ref, subject: Option<Ref>, field: &str, v
         field: Some(field.into()),
         value,
         clock: Clock { wall_ms: 1_000 + seq, counter: 0, tag: tag.into() },
+        extra: Default::default(),
     }
 }
 
@@ -408,4 +414,287 @@ async fn the_event_stream_ends_when_its_key_is_revoked() {
     let (ended, seen) = reader.await.unwrap();
     assert!(seen.contains("event: head"), "{seen}");
     assert!(ended, "the stream kept running after its key was revoked: {seen}");
+}
+
+// ---------------------------------------------------------------------------
+// Edge cases
+// ---------------------------------------------------------------------------
+
+fn db_with_benny() -> (ServerDb, String) {
+    let db = ServerDb::open_in_memory().unwrap();
+    db.add_user("benny").unwrap();
+    let key = db.add_key("benny", "b1", "").unwrap();
+    (db, key)
+}
+
+#[test]
+fn admin_commands_refuse_what_does_not_exist_or_already_happened() {
+    let (db, _) = db_with_benny();
+    assert!(db.add_user("benny").unwrap_err().to_string().contains("exists"));
+    for bad in ["", "Benny", "a b", "-x"] {
+        assert!(db.add_user(bad).is_err(), "user name {bad:?}");
+    }
+    assert!(db.add_key("nobody", "n1", "").unwrap_err().to_string().contains("no user"));
+    assert!(db.rotate_key("zz").unwrap_err().to_string().contains("no tag"));
+
+    let key_id = db.keys(Some("benny")).unwrap()[0].id;
+    db.revoke_key(key_id).unwrap();
+    assert!(db.revoke_key(key_id).is_err(), "revoking twice");
+    db.disable_user("benny").unwrap();
+    assert!(db.disable_user("benny").is_err(), "disabling twice");
+    assert!(db.users().unwrap()[0].disabled_at.is_some());
+}
+
+#[test]
+fn a_key_lists_its_user_tag_label_and_state() {
+    let (db, key) = db_with_benny();
+    db.authenticate(&key).unwrap();
+    let k = &db.keys(None).unwrap()[0];
+    assert_eq!((k.user.as_str(), k.tag.as_str(), k.revoked_at), ("benny", "b1", None));
+    assert!(k.last_used_at.is_some(), "authenticating records when the key was last seen");
+    assert_eq!(db.users().unwrap()[0].tags, ["b1"]);
+}
+
+#[tokio::test]
+async fn the_bearer_scheme_is_case_insensitive_and_other_schemes_are_refused() {
+    let f = fixture();
+    for header in [format!("bearer {}", f.benny), format!("BEARER {}", f.benny), format!("Bearer  {} ", f.benny)] {
+        let req = Request::builder().uri("/v1/whoami").header("authorization", header.clone()).body(Body::empty()).unwrap();
+        let res = router(f.relay.clone()).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{header:?}");
+    }
+    let req = Request::builder().uri("/v1/whoami").header("authorization", format!("Basic {}", f.benny)).body(Body::empty()).unwrap();
+    assert_eq!(router(f.relay.clone()).oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn room_names_are_validated_and_have_one_spelling_everywhere() {
+    let f = fixture();
+    for bad in ["-bad", "a%20b", &"x".repeat(65)] {
+        let (s, _) = call(&f.relay, "POST", &format!("/v1/rooms/{bad}/join"), Some(&f.benny), None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "room {bad:?}");
+    }
+    join(&f, &f.benny, "sbahn").await;
+    let (s, v) = push(&f, &f.benny, "SBAHN", vec![change("b1", 1, task("b1", 1), None, "title", json!("x"))]).await;
+    assert_eq!(s, StatusCode::OK, "uppercase reaches the same room: {v}");
+    assert_eq!(pull(&f, &f.benny, "Sbahn", 0).await["changes"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn leaving_locks_a_member_out_and_rejoining_brings_the_history_back() {
+    let f = fixture();
+    join(&f, &f.benny, "sbahn").await;
+    push(&f, &f.benny, "sbahn", vec![change("b1", 1, task("b1", 1), None, "title", json!("x"))]).await;
+    let (s, _) = call(&f.relay, "POST", "/v1/rooms/sbahn/leave", Some(&f.benny), None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = call(&f.relay, "POST", "/v1/rooms/sbahn/leave", Some(&f.benny), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "leaving twice");
+    let (s, _) = push(&f, &f.benny, "sbahn", vec![change("b1", 2, task("b1", 2), None, "title", json!("y"))]).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "a member who left cannot push");
+
+    let again = join(&f, &f.benny, "sbahn").await;
+    assert_eq!(again["created"], false);
+    assert_eq!(pull(&f, &f.benny, "sbahn", 0).await["changes"].as_array().unwrap().len(), 1, "history survived the leave");
+}
+
+#[tokio::test]
+async fn a_deleted_room_is_gone_and_joining_its_name_starts_empty() {
+    let f = fixture();
+    join(&f, &f.benny, "sbahn").await;
+    push(&f, &f.benny, "sbahn", vec![change("b1", 1, task("b1", 1), None, "title", json!("x"))]).await;
+    {
+        let db = f.relay.db.lock().unwrap();
+        let r = db.room_removal("sbahn").unwrap();
+        assert_eq!((r.changes, r.members), (1, 1));
+        db.delete_room("sbahn").unwrap();
+        assert!(db.delete_room("sbahn").is_err());
+    }
+    let (s, _) = call(&f.relay, "GET", "/v1/rooms/sbahn/changes", Some(&f.benny), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let fresh = join(&f, &f.benny, "sbahn").await;
+    assert_eq!((fresh["created"].clone(), fresh["room"]["changes"].clone()), (json!(true), json!(0)));
+}
+
+#[tokio::test]
+async fn malformed_changes_are_refused_with_the_reason() {
+    let f = fixture();
+    join(&f, &f.benny, "sbahn").await;
+    let ok = || change("b1", 1, task("b1", 1), None, "title", json!("x"));
+    let cases: Vec<(&str, Change)> = vec![
+        ("unknown kind", { let mut c = ok(); c.entity.kind = "board".into(); c }),
+        ("zero id", { let mut c = ok(); c.entity.id = 0; c }),
+        ("bad origin", { let mut c = ok(); c.entity.origin = "B-1".into(); c }),
+        ("event subject", { let mut c = ok(); c.subject = Some(Ref { kind: "event".into(), origin: "b1".into(), id: 1 }); c }),
+        ("cid without seq", { let mut c = ok(); c.cid = "b1".into(); c }),
+        ("cid with text seq", { let mut c = ok(); c.cid = "b1:x".into(); c }),
+        ("cid with negative seq", { let mut c = ok(); c.cid = "b1:-3".into(); c }),
+    ];
+    for (what, c) in cases {
+        let (s, v) = push(&f, &f.benny, "sbahn", vec![c]).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{what}: {v}");
+        assert!(v["error"]["message"].as_str().unwrap().starts_with("change 0"), "{what}: the message names the change: {v}");
+    }
+    assert_eq!(pull(&f, &f.benny, "sbahn", 0).await["changes"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn batches_have_a_size_limit_and_an_empty_batch_is_fine() {
+    let f = fixture();
+    join(&f, &f.benny, "sbahn").await;
+    let (s, v) = push(&f, &f.benny, "sbahn", vec![]).await;
+    assert_eq!((s, v["accepted"].clone()), (StatusCode::OK, json!(0)));
+
+    let too_many: Vec<Change> = (1..=1001).map(|i| change("b1", i, task("b1", i), None, "t", json!(i))).collect();
+    let (s, v) = push(&f, &f.benny, "sbahn", too_many).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(v["error"]["message"].as_str().unwrap().contains("limit is 1000"), "{v}");
+
+    let huge = json!({ "changes": [], "padding": "x".repeat(9 * 1024 * 1024) });
+    let (s, _) = call(&f.relay, "POST", "/v1/rooms/sbahn/changes", Some(&f.benny), Some(huge)).await;
+    assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn the_same_change_twice_in_one_batch_is_one_retry_but_different_content_is_refused() {
+    let f = fixture();
+    join(&f, &f.benny, "sbahn").await;
+    let c = change("b1", 1, task("b1", 1), None, "title", json!("x"));
+    let (_, v) = push(&f, &f.benny, "sbahn", vec![c.clone(), c.clone()]).await;
+    assert_eq!((v["accepted"].clone(), v["duplicates"].clone()), (json!(1), json!(1)));
+
+    let mut other = change("b1", 2, task("b1", 2), None, "title", json!("a"));
+    let mut clash = other.clone();
+    clash.value = json!("b");
+    let (s, _) = push(&f, &f.benny, "sbahn", vec![other.clone(), clash]).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    other.cid = "b1:3".into();
+    assert_eq!(pull(&f, &f.benny, "sbahn", 0).await["changes"].as_array().unwrap().len(), 1, "the refused batch left nothing");
+}
+
+/// What a newer client adds must reach the other members through a relay that does not know it.
+#[tokio::test]
+async fn values_and_unknown_envelope_fields_pass_through_untouched() {
+    let f = fixture();
+    join(&f, &f.benny, "sbahn").await;
+    join(&f, &f.volker, "sbahn").await;
+    let mut c = change("b1", 1, task("b1", 1), None, "repos", json!({ "list": ["git:a", "git:b"], "nested": { "n": [1, 2.5, null, true] } }));
+    c.extra.insert("priority_hint".into(), json!("urgent"));
+    let (s, _) = push(&f, &f.benny, "sbahn", vec![c.clone()]).await;
+    assert_eq!(s, StatusCode::OK);
+    let got: Change = serde_json::from_value(pull(&f, &f.volker, "sbahn", 0).await["changes"][0]["change"].clone()).unwrap();
+    assert_eq!(got, c);
+
+    // And a retry of it is still recognised as one.
+    let (_, v) = push(&f, &f.benny, "sbahn", vec![c]).await;
+    assert_eq!(v["duplicates"], 1);
+}
+
+#[tokio::test]
+async fn pull_cursors_and_limits_are_clamped_not_rejected() {
+    let f = fixture();
+    join(&f, &f.benny, "sbahn").await;
+    push(&f, &f.benny, "sbahn", (1..=3).map(|i| change("b1", i, task("b1", i), None, "t", json!(i))).collect()).await;
+
+    let past = pull(&f, &f.benny, "sbahn", 999).await;
+    assert!(past["changes"].as_array().unwrap().is_empty());
+    assert_eq!(past["head"], 3, "the head is reported even past the end");
+    let (_, neg) = call(&f.relay, "GET", "/v1/rooms/sbahn/changes?since=-5", Some(&f.benny), None).await;
+    assert_eq!(neg["changes"].as_array().unwrap().len(), 3);
+    let (_, zero) = call(&f.relay, "GET", "/v1/rooms/sbahn/changes?limit=0", Some(&f.benny), None).await;
+    assert_eq!((zero["changes"].as_array().unwrap().len(), zero["more"].clone()), (1, json!(true)));
+}
+
+#[tokio::test]
+async fn high_water_never_goes_down() {
+    let f = fixture();
+    join(&f, &f.benny, "sbahn").await;
+    push(&f, &f.benny, "sbahn", vec![change("b1", 50, task("b1", 900), None, "t", json!(1))]).await;
+    // A lower seq for another room's backlog is legitimate and must not lower the marks.
+    push(&f, &f.benny, "sbahn", vec![change("b1", 3, task("b1", 4), None, "t", json!(2))]).await;
+    let (_, v) = call(&f.relay, "GET", "/v1/whoami", Some(&f.benny), None).await;
+    assert_eq!((v["high_water"]["outbox"].clone(), v["high_water"]["task"].clone()), (json!(50), json!(900)));
+}
+
+#[tokio::test]
+async fn forgetting_a_note_removes_it_and_its_history_but_not_the_task() {
+    let f = fixture();
+    join(&f, &f.benny, "sbahn").await;
+    let t = task("b1", 1);
+    let n = Ref { kind: "note".into(), origin: "b1".into(), id: 7 };
+    push(&f, &f.benny, "sbahn", vec![
+        change("b1", 1, t.clone(), Some(t.clone()), "title", json!("task stays")),
+        change("b1", 2, n.clone(), Some(n.clone()), "body", json!("note goes")),
+        change("b1", 3, Ref { kind: "event".into(), origin: "b1".into(), id: 9 }, Some(n.clone()), "body", json!("note history goes")),
+    ]).await;
+    let removed = f.relay.db.lock().unwrap().forget("sbahn", &n).unwrap();
+    assert_eq!(removed.changes, 2);
+    let bodies: Vec<String> = pull(&f, &f.benny, "sbahn", 0).await["changes"].as_array().unwrap()
+        .iter().map(|c| c["change"]["value"].to_string()).collect();
+    assert!(bodies.iter().any(|b| b.contains("task stays")));
+    assert!(!bodies.iter().any(|b| b.contains("note")), "{bodies:?}");
+
+    let (_, v) = push(&f, &f.benny, "sbahn", vec![change("b1", 4, Ref { kind: "event".into(), origin: "b1".into(), id: 10 }, Some(n), "body", json!("late"))]).await;
+    assert_eq!(v["forgotten"], 1, "a late change whose subject is the forgotten note is dropped too");
+}
+
+#[tokio::test]
+async fn forgetting_is_idempotent_and_refuses_what_cannot_be_forgotten() {
+    let f = fixture();
+    join(&f, &f.benny, "sbahn").await;
+    let t = task("b1", 1);
+    push(&f, &f.benny, "sbahn", vec![change("b1", 1, t.clone(), Some(t.clone()), "title", json!("x"))]).await;
+    let db = f.relay.db.lock().unwrap();
+    db.forget("sbahn", &t).unwrap();
+    let head = db.room_info(1).unwrap().head;
+    assert_eq!(db.forget("sbahn", &t).unwrap().changes, 0);
+    assert_eq!(db.room_info(1).unwrap().head, head, "no second tombstone");
+    assert!(db.forget("sbahn", &Ref { kind: "event".into(), origin: "b1".into(), id: 1 }).is_err());
+    assert!(db.forget("nope", &t).unwrap_err().to_string().contains("no room"));
+}
+
+#[test]
+fn snapshots_are_consistent_copies_and_only_the_newest_are_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = ServerDb::open(&dir.path().join("server.db")).unwrap();
+    db.add_user("benny").unwrap();
+    let snaps = dir.path().join("snapshots");
+    std::fs::create_dir_all(&snaps).unwrap();
+    for t in [100, 200, 300] {
+        std::fs::write(snaps.join(format!("server-{t}.db")), b"old").unwrap();
+    }
+    std::fs::write(snaps.join("unrelated.txt"), b"keep me").unwrap();
+    let newest = ai_kanban::server::take_snapshot(&db, &snaps, 2).unwrap();
+
+    let mut left: Vec<String> = std::fs::read_dir(&snaps).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    left.sort();
+    assert_eq!(left.len(), 3, "{left:?}");
+    assert!(left.contains(&"server-300.db".to_string()) && left.contains(&"unrelated.txt".to_string()), "{left:?}");
+    let copy = ServerDb::open(&newest).unwrap();
+    assert_eq!(copy.users().unwrap()[0].name, "benny", "the snapshot is a working relay database");
+    assert!(db.snapshot(&newest).is_err(), "never overwrites");
+}
+
+#[tokio::test]
+async fn an_empty_room_survives_until_seven_days_after_it_was_last_used() {
+    let f = fixture();
+    join(&f, &f.benny, "young").await;
+    join(&f, &f.benny, "recently-left").await;
+    for room in ["young", "recently-left"] {
+        call(&f.relay, "POST", &format!("/v1/rooms/{room}/leave"), Some(&f.benny), None).await;
+    }
+    let db = f.relay.db.lock().unwrap();
+    let old = ai_kanban::core::now() - 30 * 86400;
+    db.conn.execute("UPDATE rooms SET created_at = ?1 WHERE name = 'recently-left'", [old]).unwrap();
+    assert!(db.remove_empty_rooms(ai_kanban::server::EMPTY_ROOM_AGE).unwrap().is_empty(),
+        "one is new, the other was left just now");
+}
+
+#[tokio::test]
+async fn the_event_stream_needs_a_key_and_membership() {
+    let f = fixture();
+    join(&f, &f.benny, "sbahn").await;
+    let (s, _) = call(&f.relay, "GET", "/v1/rooms/sbahn/events", None, None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = call(&f.relay, "GET", "/v1/rooms/sbahn/events", Some(&f.volker), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
 }

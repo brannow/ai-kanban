@@ -644,6 +644,11 @@ impl ServerDb {
             return Err(ServerError::BadRequest("only a task or a note can be forgotten".into()));
         }
         let room_id = self.room_id(room)?;
+        // Forgetting twice is a no-op, not a second tombstone: nothing is left to remove, and
+        // every member already has the first one.
+        if self.is_forgotten(room_id, r)? {
+            return Ok(Removal::default());
+        }
         let removal = self.forget_removal(room, r)?;
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         tx.execute(
@@ -668,6 +673,7 @@ impl ServerDb {
                 counter: 0,
                 tag: protocol::SERVER_TAG.into(),
             },
+            extra: Default::default(),
         };
         let body = serde_json::to_string(&tomb).map_err(|e| ServerError::Other(e.to_string()))?;
         tx.execute(

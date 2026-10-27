@@ -106,6 +106,12 @@ pub struct Change {
     #[serde(default)]
     pub value: serde_json::Value,
     pub clock: Clock,
+    /// Envelope fields this build does not know, kept and passed on. Without this a relay older
+    /// than its clients would strip what a newer client added, and an additive envelope change
+    /// would need a new route like a breaking one. Maps serialize with sorted keys, so the
+    /// relay's duplicate check stays deterministic.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Change {
@@ -271,6 +277,7 @@ mod tests {
             field: None,
             value: serde_json::Value::Null,
             clock: Clock { wall_ms: 0, counter: 0, tag: "b1".into() },
+            extra: Default::default(),
         };
         assert_eq!(ch.cid_parts(), Some(("b1", 12)));
         ch.cid = "b1:0".into();

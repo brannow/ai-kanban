@@ -60,7 +60,9 @@ impl Relay {
         let key = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
+            // The scheme is case-insensitive (RFC 9110), so `bearer` from a hand-written client
+            // must work as well as `Bearer`.
+            .and_then(|v| v.split_once(' ').filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer")).map(|(_, k)| k))
             .ok_or(ServerError::Unauthorized)?;
         self.db().authenticate(key)
     }
@@ -275,16 +277,18 @@ fn spawn_housekeeping(relay: Relay, snapshot_every: Option<u64>, dir: PathBuf, k
 pub fn take_snapshot(db: &ServerDb, dir: &std::path::Path, keep: usize) -> Result<PathBuf, ServerError> {
     let dest = dir.join(format!("server-{}.db", crate::core::now()));
     db.snapshot(&dest)?;
-    let mut snaps: Vec<PathBuf> = std::fs::read_dir(dir)?
+    let mut snaps: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("server-") && n.ends_with(".db"))
+        .filter_map(|p| {
+            let n = p.file_name()?.to_str()?.strip_prefix("server-")?.strip_suffix(".db")?.parse().ok()?;
+            Some((n, p))
         })
         .collect();
-    // Unix seconds of equal width sort as text; that holds until the year 2286.
+    // By the number, not the name: sorting names only works while every timestamp has the same
+    // width, and a snapshot copied back in by hand under another name would get the newest one
+    // pruned instead of the oldest.
     snaps.sort();
+    let snaps: Vec<PathBuf> = snaps.into_iter().map(|(_, p)| p).collect();
     let excess = snaps.len().saturating_sub(keep.max(1));
     for old in snaps.into_iter().take(excess) {
         std::fs::remove_file(old)?;
