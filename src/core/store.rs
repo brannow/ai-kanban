@@ -91,6 +91,26 @@ impl Drop for Store {
 }
 
 impl Store {
+    /// Runs `f` all or nothing, inside whatever transaction is already open.
+    ///
+    /// A savepoint rather than `unchecked_transaction`: SQLite refuses a BEGIN inside a
+    /// transaction, and sync applies a room's tombstone through the same removal a local
+    /// forget uses, from inside its own write transaction. Outside one, a savepoint simply is
+    /// the transaction.
+    pub(crate) fn atomically<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("SAVEPOINT atomically")?;
+        match f() {
+            Ok(v) => {
+                self.conn.execute_batch("RELEASE atomically")?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO atomically; RELEASE atomically");
+                Err(e)
+            }
+        }
+    }
+
     /// The id a row just inserted into `tasks` or `notes` keeps, moved above every id ever
     /// deleted from that table if SQLite handed back a forgotten one (migration 013).
     ///

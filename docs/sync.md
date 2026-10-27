@@ -262,6 +262,27 @@ Each mutation on a connected board writes, **in the same transaction**, one chan
 - Repos travel by **normalized git remote** (the `git:…` form of `projects.key`). The local checkout
   path stays local. A repo with no remote cannot be linked to a task in a room.
 
+### How a write becomes a change, and which events travel
+
+- **Triggers, not calls in each write path.** Migration 014's triggers mark every inserted or
+  updated row on a connected board as dirty. `flush` compares each dirty row's synced fields
+  with the last value published to or received from the room (`sync_fields`), and writes a
+  change only for fields that differ. Forget, merge, import, the HTTP API and future write paths
+  are covered without having to remember to be. Every column is classified as synced or local
+  in `src/core/sync.rs`, and a test fails on a column in neither list.
+- **Received changes are written straight into the rows**, never through `create_task` or
+  `update_task`, which would write duplicate events. Each received change is recorded in
+  `sync_fields` too, so the next flush has nothing to echo back. Pending local writes are
+  flushed before applying, in the same transaction, so a received change can never overwrite
+  an unpublished local edit.
+- **Events travel by allow-list:** `created`, `updated`, `status:*`, `note_added`,
+  `note_updated`, `log`. Everything else stays on the machine, including kinds added later.
+  Several other kinds describe one machine's setup: `repo_added` carries a checkout path, and
+  `project_created`, `moved` and `moved_out` name local boards ("moved here from board
+  customer-x").
+- **Disconnecting drops unsent changes and unrecords them**, so reconnecting publishes those
+  edits after all instead of finding "nothing changed".
+
 ### When it happens
 
 All of it runs inside the MCP process, which already exists per session, so there is no daemon:

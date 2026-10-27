@@ -150,6 +150,12 @@ impl IntoResponse for ApiError {
                 "conflict",
                 serde_json::json!({ "expected": expected, "actual": actual }),
             ),
+            // A refusal, not a fault: the board is shared, and the message says who can act.
+            Error::SharedBoard { room, .. } => (
+                StatusCode::CONFLICT,
+                "shared",
+                serde_json::json!({ "room": room }),
+            ),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "error", serde_json::json!({})),
         };
         let mut body = serde_json::json!({ "code": code, "message": self.0.to_string() });

@@ -42,6 +42,16 @@ impl Store {
     /// the surviving `key` is what future directories resolve against. `merge_projects_auto`
     /// picks for the common case.
     pub fn merge_projects(&self, into: i64, from: i64) -> Result<MergeReport> {
+        // Merging reparents rows between boards; across a room boundary that would publish one
+        // board's private history, or pull rows out of a room behind its members' backs.
+        for id in [into, from] {
+            if let Some(room) = self.room_of(id)? {
+                return Err(crate::core::Error::SharedBoard {
+                    reason: format!("board {} is connected to room {room}. Disconnect it before merging", self.project(id)?.name),
+                    room,
+                });
+            }
+        }
         if into == from {
             return Err(Error::Other("a board cannot be merged into itself".into()));
         }

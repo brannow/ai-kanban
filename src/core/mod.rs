@@ -19,6 +19,7 @@ pub mod repo;
 pub mod task;
 pub mod staleness;
 pub mod store;
+pub mod sync;
 pub mod transfer;
 pub mod workstream;
 

@@ -31,7 +31,7 @@
 //! * **Forgetting a task is not forgetting what was learned doing it.** Notes attached to it
 //!   survive, detached, and so do their own histories.
 
-use crate::core::error::Result;
+use crate::core::error::{Error, Result};
 use crate::core::model::Actor;
 use crate::core::store::Store;
 use rusqlite::{params, OptionalExtension};
@@ -41,53 +41,89 @@ impl Store {
     ///
     /// Not recoverable. The only copy afterwards is whatever backup existed before the call.
     pub fn forget_note(&self, project_id: i64, id: i64) -> Result<()> {
+        self.refuse_in_room(project_id, "note")?;
+        self.forget_note_unchecked(project_id, id, true)
+    }
+
+    /// A board connected to a room shares its history with every member, and a forget there
+    /// is permanent for all of them. So it is the relay admin's act (`ai-kanban server
+    /// forget`), and arrives here as a tombstone -- never a local decision. Checked in core
+    /// rather than in each adapter, because the HTTP API calls these directly.
+    fn refuse_in_room(&self, project_id: i64, what: &str) -> Result<()> {
+        match self.room_of(project_id)? {
+            Some(room) => Err(Error::SharedBoard {
+                reason: format!(
+                    "this board is shared through room {room}, where forgetting removes the {what} for every member. \
+                     Ask the relay admin: ai-kanban server forget {room} {what} <id>-<tag>"
+                ),
+                room,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// The removal itself, for a local forget and for a room's tombstone alike. `tombstone`
+    /// writes the content-free "forgotten" event; a disconnect that wipes others' rows skips
+    /// it, since those rows were never this board's own history.
+    pub(crate) fn forget_note_unchecked(&self, project_id: i64, id: i64, tombstone: bool) -> Result<()> {
         // Proves the note exists *and* is on this board. The store is global, so an id alone
         // would let a caller destroy another project's note while naming this one.
         let note = self.note(project_id, id)?;
 
-        let tx = self.conn.unchecked_transaction()?;
+        self.atomically(|| {
         // The `note_updated` bodies live here, each embedding a previous version of the note.
         // This is the delete that actually matters; removing the note row alone would leave
         // every superseded body behind, indexed and searchable.
-        tx.execute("DELETE FROM events WHERE note_id = ?1", [id])?;
-        tx.execute("DELETE FROM note_paths WHERE note_id = ?1", [id])?;
-        tx.execute("DELETE FROM notes WHERE id = ?1 AND project_id = ?2", params![id, project_id])?;
-        tx.commit()?;
+        self.conn.execute("DELETE FROM events WHERE note_id = ?1", [id])?;
+        self.conn.execute("DELETE FROM note_paths WHERE note_id = ?1", [id])?;
+        self.conn.execute("DELETE FROM notes WHERE id = ?1 AND project_id = ?2", params![id, project_id])?;
+        Ok(())
+        })?;
 
         // Written after the delete so the cascade cannot take it. `task_id` is kept so the
         // removal shows up in the history of the task the note belonged to; there is no
         // `note_id`, because the note it would point at no longer exists.
-        self.write_event(project_id, note.task_id, Actor::User, "forgotten", &format!("note #{id}"))?;
+        if tombstone {
+            self.write_event(project_id, note.task_id, Actor::User, "forgotten", &format!("note #{id}"))?;
+        }
         Ok(())
     }
 
     /// Permanently removes a task and its history. Notes made while working on it survive.
     pub fn forget_task(&self, project_id: i64, id: i64) -> Result<()> {
+        self.refuse_in_room(project_id, "task")?;
+        self.forget_task_unchecked(project_id, id, true)
+    }
+
+    pub(crate) fn forget_task_unchecked(&self, project_id: i64, id: i64, tombstone: bool) -> Result<()> {
         self.task(project_id, id)?;
 
-        let tx = self.conn.unchecked_transaction()?;
+        self.atomically(|| {
 
         // Detach note history *first*. These events sit under this task's `task_id`, so the
         // delete below — or the FK cascade — would otherwise take a note's own history along
         // with the task, leaving a surviving note whose past silently vanished.
-        tx.execute(
+        self.conn.execute(
             "UPDATE events SET task_id = NULL WHERE task_id = ?1 AND note_id IS NOT NULL",
             [id],
         )?;
-        tx.execute("DELETE FROM events WHERE task_id = ?1", [id])?;
+        self.conn.execute("DELETE FROM events WHERE task_id = ?1", [id])?;
         // Knowledge outlives the task that produced it — the reason notes are a separate
         // entity in the first place.
-        tx.execute("UPDATE notes SET task_id = NULL WHERE task_id = ?1", [id])?;
+        self.conn.execute("UPDATE notes SET task_id = NULL WHERE task_id = ?1", [id])?;
         // `blocked_by` is an annotation, so a dangling reference would render as a blocker
         // that cannot be looked up rather than failing loudly.
-        tx.execute("UPDATE tasks SET blocked_by = NULL WHERE blocked_by = ?1", [id])?;
+        self.conn.execute("UPDATE tasks SET blocked_by = NULL WHERE blocked_by = ?1", [id])?;
         // Explicit for the reason stated in the module header. Left behind, a link would keep
         // counting in the repos menu for a ticket that no longer exists.
-        tx.execute("DELETE FROM task_repos WHERE task_id = ?1", [id])?;
-        tx.execute("DELETE FROM tasks WHERE id = ?1 AND project_id = ?2", params![id, project_id])?;
-        tx.commit()?;
+        self.conn.execute("DELETE FROM task_repos WHERE task_id = ?1", [id])?;
+        self.conn.execute("DELETE FROM tasks WHERE id = ?1 AND project_id = ?2", params![id, project_id])?;
+        Ok(())
+        })?;
 
-        self.write_event(project_id, None, Actor::User, "forgotten", &format!("task #{id}"))?;
+        if tombstone {
+            self.write_event(project_id, None, Actor::User, "forgotten", &format!("task #{id}"))?;
+        }
         Ok(())
     }
 
@@ -130,6 +166,12 @@ impl Store {
     /// live page.
     pub fn forget_board(&self, project_id: i64) -> Result<()> {
         self.project(project_id)?;
+        if let Some(room) = self.room_of(project_id)? {
+            return Err(Error::SharedBoard {
+                reason: format!("this board is connected to room {room}. Disconnect it first: ai-kanban room disconnect {room}"),
+                room,
+            });
+        }
         let homed: Vec<i64> = {
             let mut st = self.conn.prepare("SELECT id FROM repos WHERE home_project_id = ?1")?;
             let rows = st.query_map([project_id], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;

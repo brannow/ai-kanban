@@ -1,0 +1,838 @@
+//! The client half of sync, without any network: which board is connected to which room,
+//! turning local writes into changes (`flush`), and applying changes from a room (`apply`).
+//! `docs/sync.md` is the design; migration 014 holds the state.
+//!
+//! # How a local write becomes a change
+//!
+//! Triggers mark every row on a connected board that is inserted or updated as dirty. `flush`
+//! reads each dirty row's synced fields, compares them with the last value published to or
+//! received from the room (`sync_fields`), and writes a change for every field that differs.
+//! So no write path has to remember to record anything -- the failure note #17 describes,
+//! where a new field needed five homes and missed them silently.
+//!
+//! # How a received change lands
+//!
+//! Written straight into the rows, never through `create_task` or `update_task`: those write
+//! their own events (which arrive from the room separately) and their writes would be flushed
+//! back out as an echo. A received value is stored in `sync_fields` too, so the next flush
+//! sees nothing to publish. Each change applies in its own savepoint, so one this binary
+//! cannot store -- a status it does not know yet -- is parked and the rest still apply.
+
+use crate::core::error::{Error, Result};
+use crate::core::store::{now, Store};
+use crate::sync::protocol::{Change, Clock, Pulled, Ref, SERVER_TAG};
+use rusqlite::types::Value as Sql;
+use rusqlite::{params, OptionalExtension};
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+
+/// How a synced column travels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enc {
+    /// TEXT, or NULL.
+    Text,
+    /// INTEGER, or NULL.
+    Int,
+    /// A local task id, sent as the task's identity (`{origin, id}`).
+    TaskRef,
+    /// A local note id, sent as the note's identity.
+    NoteRef,
+    /// A local workstream id, sent as its name: workstreams merge by name.
+    Workstream,
+    /// A note's paths, from `note_paths`, sent as one sorted list.
+    Paths,
+}
+
+/// One synced field: its name on the wire, the column it lives in (empty for `Paths`), and how
+/// it is encoded.
+#[derive(Debug, Clone, Copy)]
+pub struct Spec {
+    pub field: &'static str,
+    pub column: &'static str,
+    pub enc: Enc,
+}
+
+const fn spec(field: &'static str, column: &'static str, enc: Enc) -> Spec {
+    Spec { field, column, enc }
+}
+
+/// Every column of `tasks` is in exactly one of these two lists. `tests/sync_core.rs` reads
+/// `PRAGMA table_info` and fails on a column in neither, so a new column cannot silently stay
+/// out of sync.
+pub const TASK_FIELDS: &[Spec] = &[
+    spec("title", "title", Enc::Text),
+    spec("body", "body", Enc::Text),
+    spec("status", "status", Enc::Text),
+    spec("type", "type", Enc::Text),
+    spec("origin", "origin", Enc::Text),
+    spec("priority", "priority", Enc::Text),
+    spec("blocked_by", "blocked_by", Enc::TaskRef),
+    spec("workstream", "workstream_id", Enc::Workstream),
+    spec("tags", "tags", Enc::Text),
+    spec("external_ref", "external_ref", Enc::Text),
+    spec("created_at", "created_at", Enc::Int),
+];
+/// Per machine: the row's local id and board, and bookkeeping each store keeps for itself.
+pub const TASK_LOCAL: &[&str] = &["id", "project_id", "updated_at", "version"];
+
+pub const NOTE_FIELDS: &[Spec] = &[
+    spec("task", "task_id", Enc::TaskRef),
+    spec("title", "title", Enc::Text),
+    spec("body", "body", Enc::Text),
+    spec("tags", "tags", Enc::Text),
+    spec("created_at", "created_at", Enc::Int),
+    spec("paths", "", Enc::Paths),
+];
+pub const NOTE_LOCAL: &[&str] = &["id", "project_id", "updated_at", "version"];
+
+/// Events are insert-only: these travel together as one change whose value is the whole row.
+pub const EVENT_FIELDS: &[Spec] = &[
+    spec("task", "task_id", Enc::TaskRef),
+    spec("note", "note_id", Enc::NoteRef),
+    spec("ts", "ts", Enc::Int),
+    spec("actor", "actor", Enc::Text),
+    spec("kind", "kind", Enc::Text),
+    spec("body", "body", Enc::Text),
+];
+pub const EVENT_LOCAL: &[&str] = &["id", "project_id"];
+
+/// The event kinds a room receives. An allow-list, so a kind added later stays on this
+/// machine until someone decides it belongs to the team.
+///
+/// What it leaves out, and why that is the safe side: `repo_added` carries a local checkout
+/// path; `project_created`, `moved` and `moved_out` name local boards ("moved here from board
+/// customer-x"); `repo_home`, `repo_renamed`, `repo_removed` and `workstream_closed` describe
+/// one machine's setup; `workstream_created` is written by each machine when a workstream
+/// first appears there; `forgotten` and `left_room` are written locally when a tombstone or a
+/// departure arrives; the housekeeping kinds say nothing about the work.
+pub const PUBLISHED_KINDS: &[&str] = &["created", "updated", "note_added", "note_updated", "log"];
+
+/// Whether events of `kind` are shared with a room. `status:<s>` is a task changing status.
+pub fn published_kind(kind: &str) -> bool {
+    PUBLISHED_KINDS.contains(&kind) || kind.starts_with("status:")
+}
+
+/// Marks an event as published to a room, in `sync_fields`.
+const ROW: &str = "_row";
+/// The field a task carries when it leaves a room.
+const LEFT_ROOM: &str = "left_room";
+/// The field of the relay's forget tombstone.
+const FORGOTTEN: &str = "forgotten";
+
+fn specs(kind: &str) -> &'static [Spec] {
+    match kind {
+        "task" => TASK_FIELDS,
+        "note" => NOTE_FIELDS,
+        _ => EVENT_FIELDS,
+    }
+}
+
+fn table(kind: &str) -> &'static str {
+    match kind {
+        "task" => "tasks",
+        "note" => "notes",
+        _ => "events",
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// What one `apply` did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Applied {
+    pub applied: usize,
+    /// Older than what is already here, or this store's own change coming back.
+    pub ignored: usize,
+    /// Could not be stored by this binary; kept for re-applying after an upgrade.
+    pub parked: usize,
+}
+
+/// A connected board's sync state, for `room status` and the board header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncStatus {
+    pub room: String,
+    pub cursor: i64,
+    pub unsent: i64,
+    pub parked: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Identity, clock, connection
+// ---------------------------------------------------------------------------
+
+impl Store {
+    /// The origin tag this store publishes under, once a key has been set up.
+    pub fn origin_tag(&self) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT tag FROM sync_node WHERE id = 1", [], |r| r.get(0))?)
+    }
+
+    /// Sets the origin tag. Refused while a board is connected: changes already published
+    /// carry the old tag, and rows this store created keep it (`sync_ids`), so changing it
+    /// mid-room would mix two identities for one machine.
+    pub fn set_origin_tag(&self, tag: &str) -> Result<()> {
+        if !crate::sync::protocol::valid_tag(tag) || tag == SERVER_TAG {
+            return Err(Error::InvalidValue { field: "tag", value: tag.into(), valid: "a tag issued with your key, like b1".into() });
+        }
+        let connected: i64 = self.conn.query_row("SELECT COUNT(*) FROM sync_rooms", [], |r| r.get(0))?;
+        if connected > 0 && self.origin_tag()?.as_deref() != Some(tag) {
+            return Err(Error::Other("disconnect every board before changing this store's origin tag".into()));
+        }
+        self.conn.execute("UPDATE sync_node SET tag = ?1 WHERE id = 1", [tag])?;
+        Ok(())
+    }
+
+    /// The next clock value: never behind the wall clock, never behind anything seen before.
+    fn tick(&self, tag: &str) -> Result<Clock> {
+        let (wall, counter): (i64, i64) =
+            self.conn.query_row("SELECT wall_ms, counter FROM sync_node WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let now = now_ms();
+        let (wall, counter) = if now > wall { (now, 0) } else { (wall, counter + 1) };
+        self.conn.execute("UPDATE sync_node SET wall_ms = ?1, counter = ?2 WHERE id = 1", params![wall, counter])?;
+        Ok(Clock { wall_ms: wall, counter: counter as u32, tag: tag.into() })
+    }
+
+    /// Moves the clock past a received one. Without this, an edit made here right after
+    /// receiving a teammate's could lose to it when their machine's clock runs ahead.
+    fn observe(&self, c: &Clock) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sync_node SET
+                counter = CASE WHEN ?1 > wall_ms THEN ?2 WHEN ?1 = wall_ms THEN MAX(counter, ?2) ELSE counter END,
+                wall_ms = MAX(wall_ms, ?1)
+              WHERE id = 1",
+            params![c.wall_ms, c.counter],
+        )?;
+        Ok(())
+    }
+
+    pub fn room_of(&self, project_id: i64) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT room FROM sync_rooms WHERE project_id = ?1", [project_id], |r| r.get(0)).optional()?)
+    }
+
+    pub fn board_of_room(&self, room: &str) -> Result<Option<i64>> {
+        Ok(self.conn.query_row("SELECT project_id FROM sync_rooms WHERE room = ?1", [room], |r| r.get(0)).optional()?)
+    }
+
+    /// Connects a board to a room: from here on everything on it is published, starting with
+    /// everything already there. One room per board and one board per room.
+    pub fn connect_board(&self, project_id: i64, room: &str) -> Result<()> {
+        let room = crate::sync::protocol::room_name(room)
+            .ok_or_else(|| Error::InvalidValue { field: "room", value: room.into(), valid: "lowercase letters, digits, '-' and '_'".into() })?;
+        self.project(project_id)?;
+        if self.origin_tag()?.is_none() {
+            return Err(Error::Other("no origin tag yet: set up the remote first".into()));
+        }
+        if let Some(r) = self.room_of(project_id)? {
+            return Err(Error::Other(format!("this board is already connected to room {r}")));
+        }
+        if let Some(other) = self.board_of_room(&room)? {
+            let name = self.project(other)?.name;
+            return Err(Error::Other(format!("room {room} is already connected to board {name} on this machine")));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("INSERT INTO sync_rooms (project_id, room, connected_at) VALUES (?1, ?2, ?3)", params![project_id, room, now()])?;
+        // The whole board is the first publish: the same path as any later edit.
+        for (kind, t) in [("task", "tasks"), ("note", "notes"), ("event", "events")] {
+            tx.execute(
+                &format!("INSERT OR IGNORE INTO sync_dirty (kind, local_id) SELECT '{kind}', id FROM {t} WHERE project_id = ?1"),
+                [project_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Uncouples a board from its room. Unsent changes are dropped -- the CLI asks to sync them
+    /// first. With `wipe_foreign`, rows other members created are removed from this machine;
+    /// the room still holds them. Rows that stay keep their identity, so connecting again
+    /// matches them rather than duplicating them.
+    pub fn disconnect_board(&self, project_id: i64, wipe_foreign: bool) -> Result<()> {
+        if self.room_of(project_id)?.is_none() {
+            return Err(Error::Other("this board is not connected to a room".into()));
+        }
+        let tag = self.origin_tag()?.unwrap_or_default();
+        let room = self.room_of(project_id)?.unwrap_or_default();
+        let tx = self.conn.unchecked_transaction()?;
+        // A dropped change was recorded as published. Unrecord it, as long as nothing newer has
+        // replaced it, or reconnecting would find "nothing changed" and the edit would never
+        // reach the room.
+        for (_, c) in self.outbox(project_id, usize::MAX)? {
+            let field = c.field.as_deref().unwrap_or(ROW);
+            tx.execute(
+                "DELETE FROM sync_fields WHERE room = ?1 AND kind = ?2 AND origin = ?3 AND origin_id = ?4 AND field = ?5
+                    AND wall_ms = ?6 AND counter = ?7 AND tag = ?8",
+                params![room, c.entity.kind, c.entity.origin, c.entity.id, field, c.clock.wall_ms, c.clock.counter, c.clock.tag],
+            )?;
+        }
+        tx.execute("DELETE FROM sync_rooms WHERE project_id = ?1", [project_id])?;
+        tx.execute("DELETE FROM sync_outbox WHERE project_id = ?1", [project_id])?;
+        tx.execute("DELETE FROM sync_parked WHERE project_id = ?1", [project_id])?;
+        tx.commit()?;
+        if wipe_foreign {
+            let foreign = |kind: &str| -> Result<Vec<i64>> {
+                let mut st = self.conn.prepare(&format!(
+                    "SELECT x.id FROM {} x JOIN sync_ids s ON s.kind = ?1 AND s.local_id = x.id
+                      WHERE x.project_id = ?2 AND s.origin != ?3 ORDER BY x.id",
+                    table(kind)
+                ))?;
+                let ids = st.query_map(params![kind, project_id, tag], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+                Ok(ids)
+            };
+            for id in foreign("task")? {
+                self.forget_task_unchecked(project_id, id, false)?;
+            }
+            for id in foreign("note")? {
+                self.forget_note_unchecked(project_id, id, false)?;
+            }
+            for id in foreign("event")? {
+                self.conn.execute("DELETE FROM events WHERE id = ?1", [id])?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn sync_status(&self, project_id: i64) -> Result<Option<SyncStatus>> {
+        let Some((room, cursor)) = self.conn
+            .query_row("SELECT room, cursor FROM sync_rooms WHERE project_id = ?1", [project_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()? else { return Ok(None) };
+        let unsent = self.conn.query_row("SELECT COUNT(*) FROM sync_outbox WHERE project_id = ?1", [project_id], |r| r.get(0))?;
+        let parked = self.conn.query_row("SELECT COUNT(*) FROM sync_parked WHERE project_id = ?1", [project_id], |r| r.get(0))?;
+        Ok(Some(SyncStatus { room, cursor, unsent, parked }))
+    }
+
+    /// The identity a local row has in every room, if it has one yet.
+    pub fn identity(&self, kind: &str, local_id: i64) -> Result<Option<Ref>> {
+        Ok(self.conn
+            .query_row("SELECT origin, origin_id FROM sync_ids WHERE kind = ?1 AND local_id = ?2", params![kind, local_id], |r| {
+                Ok(Ref { kind: kind.into(), origin: r.get(0)?, id: r.get(1)? })
+            })
+            .optional()?)
+    }
+
+    /// The local row an identity maps to on this machine.
+    pub fn local_id(&self, r: &Ref) -> Result<Option<i64>> {
+        Ok(self.conn
+            .query_row("SELECT local_id FROM sync_ids WHERE kind = ?1 AND origin = ?2 AND origin_id = ?3", params![r.kind, r.origin, r.id], |row| row.get(0))
+            .optional()?)
+    }
+
+    /// Changes waiting for `project_id`'s room, oldest first.
+    pub fn outbox(&self, project_id: i64, limit: usize) -> Result<Vec<(i64, Change)>> {
+        let mut st = self.conn.prepare("SELECT seq, body FROM sync_outbox WHERE project_id = ?1 ORDER BY seq LIMIT ?2")?;
+        let rows = st.query_map(params![project_id, limit as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, body) = row?;
+            out.push((seq, serde_json::from_str(&body).map_err(|e| Error::Other(format!("outbox {seq}: {e}")))?));
+        }
+        Ok(out)
+    }
+
+    /// Drops changes the relay has accepted, up to and including `seq`.
+    pub fn outbox_sent(&self, project_id: i64, seq: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM sync_outbox WHERE project_id = ?1 AND seq <= ?2", params![project_id, seq])?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reading and writing synced fields
+// ---------------------------------------------------------------------------
+
+impl Store {
+    fn ref_value(&self, kind: &str, local: Option<i64>) -> Result<Value> {
+        let Some(id) = local else { return Ok(Value::Null) };
+        Ok(match self.identity(kind, id)? {
+            Some(r) => json!({ "origin": r.origin, "id": r.id }),
+            None => Value::Null,
+        })
+    }
+
+    /// A row's synced fields, encoded for the wire, or `None` if the row is gone.
+    fn read_fields(&self, kind: &str, local_id: i64) -> Result<Option<(i64, BTreeMap<&'static str, Value>)>> {
+        let specs = specs(kind);
+        let cols: Vec<&str> = specs.iter().filter(|s| !s.column.is_empty()).map(|s| s.column).collect();
+        let sql = format!("SELECT project_id, {} FROM {} WHERE id = ?1", cols.join(", "), table(kind));
+        let row: Option<(i64, Vec<Sql>)> = self.conn
+            .query_row(&sql, [local_id], |r| {
+                let mut v = Vec::with_capacity(cols.len());
+                for i in 0..cols.len() {
+                    v.push(r.get::<_, Sql>(i + 1)?);
+                }
+                Ok((r.get(0)?, v))
+            })
+            .optional()?;
+        let Some((project_id, raw)) = row else { return Ok(None) };
+
+        let mut out = BTreeMap::new();
+        let mut raw = raw.into_iter();
+        for s in specs {
+            let value = match s.enc {
+                Enc::Paths => {
+                    let mut st = self.conn.prepare("SELECT path FROM note_paths WHERE note_id = ?1 ORDER BY path")?;
+                    let paths = st.query_map([local_id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    json!(paths)
+                }
+                enc => {
+                    let v = raw.next().unwrap_or(Sql::Null);
+                    match (enc, v) {
+                        (_, Sql::Null) => Value::Null,
+                        (Enc::Text, Sql::Text(t)) => Value::String(t),
+                        (Enc::Text, Sql::Integer(i)) => Value::String(i.to_string()),
+                        (Enc::Int, Sql::Integer(i)) => json!(i),
+                        (Enc::TaskRef, Sql::Integer(i)) => self.ref_value("task", Some(i))?,
+                        (Enc::NoteRef, Sql::Integer(i)) => self.ref_value("note", Some(i))?,
+                        (Enc::Workstream, Sql::Integer(i)) => self.conn
+                            .query_row("SELECT name FROM workstreams WHERE id = ?1", [i], |r| r.get::<_, String>(0))
+                            .optional()?
+                            .map(Value::String)
+                            .unwrap_or(Value::Null),
+                        (_, other) => return Err(Error::Other(format!("{kind}.{}: unexpected {other:?}", s.field))),
+                    }
+                }
+            };
+            out.insert(s.field, value);
+        }
+        Ok(Some((project_id, out)))
+    }
+
+    /// The local row for an identity, creating a minimal one if it has not arrived yet.
+    ///
+    /// References can arrive before what they point at -- an event before its task, a
+    /// `blocked_by` before the blocker. The minimal row gets every field recorded at clock zero,
+    /// so the first real value for each field wins and a flush in between publishes nothing.
+    fn local_or_placeholder(&self, room: &str, project_id: i64, r: &Ref) -> Result<i64> {
+        if let Some(id) = self.local_id(r)? {
+            return Ok(id);
+        }
+        let id = match r.kind.as_str() {
+            "task" => {
+                self.conn.execute(
+                    "INSERT INTO tasks (project_id, title, created_at, updated_at) VALUES (?1, '', ?2, ?2)",
+                    params![project_id, now()],
+                )?;
+                self.fresh_id("tasks", self.conn.last_insert_rowid())?
+            }
+            "note" => {
+                self.conn.execute(
+                    "INSERT INTO notes (project_id, title, created_at, updated_at) VALUES (?1, '', ?2, ?2)",
+                    params![project_id, now()],
+                )?;
+                self.fresh_id("notes", self.conn.last_insert_rowid())?
+            }
+            other => return Err(Error::Other(format!("cannot create a placeholder {other}"))),
+        };
+        self.conn.execute(
+            "INSERT INTO sync_ids (kind, local_id, origin, origin_id) VALUES (?1, ?2, ?3, ?4)",
+            params![r.kind, id, r.origin, r.id],
+        )?;
+        let (_, fields) = self.read_fields(&r.kind, id)?.ok_or_else(|| Error::Other("placeholder vanished".into()))?;
+        let zero = Clock { wall_ms: 0, counter: 0, tag: String::new() };
+        for (field, value) in fields {
+            self.store_field(room, r, field, &value, &zero)?;
+        }
+        Ok(id)
+    }
+
+    fn decode_ref(&self, room: &str, project_id: i64, kind: &str, v: &Value) -> Result<Option<i64>> {
+        if v.is_null() {
+            return Ok(None);
+        }
+        let origin = v.get("origin").and_then(Value::as_str);
+        let id = v.get("id").and_then(Value::as_i64);
+        match (origin, id) {
+            (Some(o), Some(i)) if crate::sync::protocol::valid_tag(o) && i > 0 => {
+                let r = Ref { kind: kind.into(), origin: o.into(), id: i };
+                if self.is_forgotten(room, &r)? {
+                    return Ok(None);
+                }
+                Ok(Some(self.local_or_placeholder(room, project_id, &r)?))
+            }
+            _ => Err(Error::Other(format!("not a {kind} reference: {v}"))),
+        }
+    }
+
+    /// Writes one received field into its row.
+    fn write_field(&self, room: &str, project_id: i64, kind: &str, local_id: i64, s: &Spec, v: &Value) -> Result<()> {
+        let t = table(kind);
+        let bad = || Error::Other(format!("{kind}.{}: unexpected value {v}", s.field));
+        let sql_value: Sql = match s.enc {
+            Enc::Paths => {
+                let paths: Vec<String> = serde_json::from_value(v.clone()).map_err(|_| bad())?;
+                self.conn.execute("DELETE FROM note_paths WHERE note_id = ?1", [local_id])?;
+                for p in paths {
+                    self.conn.execute("INSERT OR IGNORE INTO note_paths (note_id, path) VALUES (?1, ?2)", params![local_id, p])?;
+                }
+                return Ok(());
+            }
+            Enc::Text => match v {
+                Value::Null => Sql::Null,
+                Value::String(x) => Sql::Text(x.clone()),
+                _ => return Err(bad()),
+            },
+            Enc::Int => match v {
+                Value::Null => Sql::Null,
+                _ => Sql::Integer(v.as_i64().ok_or_else(bad)?),
+            },
+            Enc::TaskRef => self.decode_ref(room, project_id, "task", v)?.map(Sql::Integer).unwrap_or(Sql::Null),
+            Enc::NoteRef => self.decode_ref(room, project_id, "note", v)?.map(Sql::Integer).unwrap_or(Sql::Null),
+            // Merged by name: a workstream two members created offline is one workstream.
+            Enc::Workstream => match v {
+                Value::Null => Sql::Null,
+                Value::String(name) => Sql::Integer(self.ensure_workstream(project_id, name)?.id),
+                _ => return Err(bad()),
+            },
+        };
+        self.conn.execute(&format!("UPDATE {t} SET {} = ?1 WHERE id = ?2", s.column), params![sql_value, local_id])?;
+        Ok(())
+    }
+
+    fn stored_field(&self, room: &str, r: &Ref, field: &str) -> Result<Option<(String, Clock)>> {
+        Ok(self.conn
+            .query_row(
+                "SELECT value, wall_ms, counter, tag FROM sync_fields
+                  WHERE room = ?1 AND kind = ?2 AND origin = ?3 AND origin_id = ?4 AND field = ?5",
+                params![room, r.kind, r.origin, r.id, field],
+                |row| Ok((row.get(0)?, Clock { wall_ms: row.get(1)?, counter: row.get::<_, i64>(2)? as u32, tag: row.get(3)? })),
+            )
+            .optional()?)
+    }
+
+    fn store_field(&self, room: &str, r: &Ref, field: &str, value: &Value, c: &Clock) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sync_fields (room, kind, origin, origin_id, field, value, wall_ms, counter, tag)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT (room, kind, origin, origin_id, field) DO UPDATE SET
+                value = excluded.value, wall_ms = excluded.wall_ms, counter = excluded.counter, tag = excluded.tag",
+            params![room, r.kind, r.origin, r.id, field, value.to_string(), c.wall_ms, c.counter, c.tag],
+        )?;
+        Ok(())
+    }
+
+    fn is_forgotten(&self, room: &str, r: &Ref) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_forgotten WHERE room = ?1 AND kind = ?2 AND origin = ?3 AND origin_id = ?4)",
+            params![room, r.kind, r.origin, r.id],
+            |row| row.get(0),
+        )?)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Flush: local writes -> outbox
+// ---------------------------------------------------------------------------
+
+impl Store {
+    /// Turns everything written on connected boards since the last flush into changes in the
+    /// outbox, and returns how many. Safe to call from any process at any time.
+    pub fn flush(&self) -> Result<usize> {
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        let n = self.flush_inner()?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    fn flush_inner(&self) -> Result<usize> {
+        let dirty: Vec<(String, i64, Option<i64>)> = {
+            // Tasks, then notes, then events: a receiver then usually meets a thing before the
+            // things that point at it. Not required -- placeholders cover the other order.
+            let mut st = self.conn.prepare(
+                "SELECT kind, local_id, left_from FROM sync_dirty
+                  ORDER BY CASE kind WHEN 'task' THEN 0 WHEN 'note' THEN 1 ELSE 2 END, local_id",
+            )?;
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?
+        };
+        self.conn.execute("DELETE FROM sync_dirty", [])?;
+        let Some(tag) = self.origin_tag()? else { return Ok(0) };
+
+        // Identities first, so a reference between two rows published in the same flush
+        // resolves no matter which comes first.
+        for (kind, id, _) in &dirty {
+            let on_connected: bool = self.conn.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {} x JOIN sync_rooms r ON r.project_id = x.project_id WHERE x.id = ?1)", table(kind)),
+                [id],
+                |r| r.get(0),
+            )?;
+            if on_connected {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO sync_ids (kind, local_id, origin, origin_id) VALUES (?1, ?2, ?3, ?2)",
+                    params![kind, id, tag],
+                )?;
+            }
+        }
+
+        let mut written = 0;
+        for (kind, id, left_from) in dirty {
+            if let Some(from) = left_from {
+                if let (Some(room), Some(me)) = (self.room_of(from)?, self.identity("task", id)?) {
+                    let subject = Some(me.clone());
+                    written += self.emit(&tag, from, &room, &me, subject, Some(LEFT_ROOM), json!(true))?;
+                }
+            }
+            let Some((project_id, fields)) = self.read_fields(&kind, id)? else { continue };
+            let Some(room) = self.room_of(project_id)? else { continue };
+            let Some(me) = self.identity(&kind, id)? else { continue };
+            if self.is_forgotten(&room, &me)? {
+                continue;
+            }
+            if kind == "event" {
+                let ev_kind = fields.get("kind").and_then(Value::as_str).unwrap_or("");
+                if !published_kind(ev_kind) || self.stored_field(&room, &me, ROW)?.is_some() {
+                    continue;
+                }
+                let subject = self.event_subject(&fields);
+                let row: serde_json::Map<String, Value> = fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+                written += self.emit(&tag, project_id, &room, &me, subject, None, Value::Object(row))?;
+                continue;
+            }
+            for (field, value) in fields {
+                let same = self.stored_field(&room, &me, field)?.is_some_and(|(v, _)| v == value.to_string());
+                if !same {
+                    written += self.emit(&tag, project_id, &room, &me, Some(me.clone()), Some(field), value)?;
+                }
+            }
+        }
+        Ok(written)
+    }
+
+    /// An event's subject, as `core::forget` defines it: the note if it is about one (note
+    /// history survives forgetting the task), else its task, else none.
+    fn event_subject(&self, fields: &BTreeMap<&'static str, Value>) -> Option<Ref> {
+        let as_ref = |kind: &str, v: Option<&Value>| -> Option<Ref> {
+            let v = v?;
+            Some(Ref { kind: kind.into(), origin: v.get("origin")?.as_str()?.into(), id: v.get("id")?.as_i64()? })
+        };
+        as_ref("note", fields.get("note")).or_else(|| as_ref("task", fields.get("task")))
+    }
+
+    fn emit(&self, tag: &str, project_id: i64, room: &str, entity: &Ref, subject: Option<Ref>, field: Option<&str>, value: Value) -> Result<usize> {
+        let clock = self.tick(tag)?;
+        self.conn.execute("INSERT INTO sync_outbox (project_id, room, body) VALUES (?1, ?2, '')", params![project_id, room])?;
+        let seq = self.conn.last_insert_rowid();
+        let stored = match field {
+            Some(f) => f,
+            None => ROW,
+        };
+        self.store_field(room, entity, stored, &value, &clock)?;
+        let change = Change {
+            cid: format!("{tag}:{seq}"),
+            entity: entity.clone(),
+            subject,
+            field: field.map(String::from),
+            value,
+            clock,
+            extra: Default::default(),
+        };
+        let body = serde_json::to_string(&change).map_err(|e| Error::Other(e.to_string()))?;
+        self.conn.execute("UPDATE sync_outbox SET body = ?1 WHERE seq = ?2", params![body, seq])?;
+        Ok(1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Apply: room -> local rows
+// ---------------------------------------------------------------------------
+
+enum Outcome {
+    Applied,
+    Ignored,
+}
+
+impl Store {
+    /// Applies changes pulled from `project_id`'s room and moves its cursor past them.
+    ///
+    /// Pending local writes are flushed first, in the same transaction, so nothing received
+    /// can overwrite a local edit that has not been published yet.
+    pub fn apply(&self, project_id: i64, pulled: &[Pulled]) -> Result<Applied> {
+        let room = self.room_of(project_id)?.ok_or_else(|| Error::Other("this board is not connected to a room".into()))?;
+        let tag = self.origin_tag()?.unwrap_or_default();
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        self.flush_inner()?;
+        let mut out = Applied::default();
+        let mut cursor = None;
+        for p in pulled {
+            cursor = Some(cursor.map_or(p.seq, |c: i64| c.max(p.seq)));
+            self.apply_one(&tag, &room, project_id, p, &mut out)?;
+        }
+        if let Some(c) = cursor {
+            self.conn.execute("UPDATE sync_rooms SET cursor = MAX(cursor, ?2) WHERE project_id = ?1", params![project_id, c])?;
+        }
+        // What applying wrote is already in `sync_fields`; flushing it would find no difference.
+        // Clearing here just saves the next flush the reads.
+        self.conn.execute("DELETE FROM sync_dirty", [])?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Tries the parked changes again, after an upgrade taught this binary what they need.
+    pub fn reapply_parked(&self, project_id: i64) -> Result<Applied> {
+        let parked: Vec<(i64, String)> = {
+            let mut st = self.conn.prepare("SELECT id, body FROM sync_parked WHERE project_id = ?1 ORDER BY id")?;
+            st.query_map([project_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+        };
+        let mut pulled = Vec::new();
+        for (id, body) in parked {
+            self.conn.execute("DELETE FROM sync_parked WHERE id = ?1", [id])?;
+            pulled.push(serde_json::from_str::<Pulled>(&body).map_err(|e| Error::Other(e.to_string()))?);
+        }
+        // Not through `apply`, whose cursor update would be harmless but whose name would lie.
+        let room = self.room_of(project_id)?.ok_or_else(|| Error::Other("this board is not connected to a room".into()))?;
+        let tag = self.origin_tag()?.unwrap_or_default();
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        self.flush_inner()?;
+        let mut out = Applied::default();
+        for p in &pulled {
+            self.apply_one(&tag, &room, project_id, p, &mut out)?;
+        }
+        self.conn.execute("DELETE FROM sync_dirty", [])?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    fn apply_one(&self, tag: &str, room: &str, project_id: i64, p: &Pulled, out: &mut Applied) -> Result<()> {
+        let c = &p.change;
+        // This store's own change coming back: it is already here.
+        if c.cid_parts().is_some_and(|(t, _)| t == tag) {
+            out.ignored += 1;
+            return Ok(());
+        }
+        self.observe(&c.clock)?;
+        self.conn.execute_batch("SAVEPOINT sync_apply")?;
+        match self.apply_change(room, project_id, p) {
+            Ok(Outcome::Applied) => {
+                self.conn.execute_batch("RELEASE sync_apply")?;
+                out.applied += 1;
+            }
+            Ok(Outcome::Ignored) => {
+                self.conn.execute_batch("RELEASE sync_apply")?;
+                out.ignored += 1;
+            }
+            Err(e) => {
+                self.conn.execute_batch("ROLLBACK TO sync_apply; RELEASE sync_apply")?;
+                let body = serde_json::to_string(p).map_err(|e| Error::Other(e.to_string()))?;
+                self.conn.execute(
+                    "INSERT INTO sync_parked (project_id, body, reason, at) VALUES (?1, ?2, ?3, ?4)",
+                    params![project_id, body, e.to_string(), now()],
+                )?;
+                out.parked += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_change(&self, room: &str, project_id: i64, p: &Pulled) -> Result<Outcome> {
+        let c = &p.change;
+        let e = &c.entity;
+        if self.is_forgotten(room, e)? || c.subject.as_ref().map(|s| self.is_forgotten(room, s)).transpose()?.unwrap_or(false) {
+            return Ok(Outcome::Ignored);
+        }
+
+        if c.field.as_deref() == Some(FORGOTTEN) && c.clock.tag == SERVER_TAG {
+            return self.apply_forget(room, project_id, e);
+        }
+
+        if e.kind == "event" {
+            if c.field.is_some() {
+                return Err(Error::Other("an event change carries a field".into()));
+            }
+            if self.local_id(e)?.is_some() {
+                return Ok(Outcome::Ignored);
+            }
+            return self.insert_event(room, project_id, e, &c.value, &c.clock);
+        }
+
+        let field = c.field.as_deref().ok_or_else(|| Error::Other(format!("a {} change without a field", e.kind)))?;
+        if e.kind == "task" && field == LEFT_ROOM {
+            return self.apply_left(project_id, e, &p.author);
+        }
+        let s = specs(&e.kind)
+            .iter()
+            .find(|s| s.field == field)
+            .ok_or_else(|| Error::Other(format!("unknown field {}.{field}", e.kind)))?;
+        if let Some((_, stored)) = self.stored_field(room, e, field)? {
+            if stored >= c.clock {
+                return Ok(Outcome::Ignored);
+            }
+        }
+        let local = self.local_or_placeholder(room, project_id, e)?;
+        // A row moved to another board here keeps receiving nothing: it left the room.
+        let on_board: bool = self.conn.query_row(
+            &format!("SELECT project_id = ?2 FROM {} WHERE id = ?1", table(&e.kind)),
+            params![local, project_id],
+            |r| r.get(0),
+        )?;
+        if !on_board {
+            return Ok(Outcome::Ignored);
+        }
+        self.write_field(room, project_id, &e.kind, local, s, &c.value)?;
+        self.conn.execute(
+            &format!("UPDATE {} SET updated_at = ?2, version = version + 1 WHERE id = ?1", table(&e.kind)),
+            params![local, now()],
+        )?;
+        self.store_field(room, e, field, &c.value, &c.clock)?;
+        Ok(Outcome::Applied)
+    }
+
+    fn insert_event(&self, room: &str, project_id: i64, e: &Ref, row: &Value, c: &Clock) -> Result<Outcome> {
+        let get = |k: &str| row.get(k).cloned().unwrap_or(Value::Null);
+        let task = self.decode_ref(room, project_id, "task", &get("task"))?;
+        let note = self.decode_ref(room, project_id, "note", &get("note"))?;
+        let ts = get("ts").as_i64().ok_or_else(|| Error::Other(format!("event without ts: {row}")))?;
+        let text = |k: &str| get(k).as_str().map(String::from).ok_or_else(|| Error::Other(format!("event without {k}: {row}")));
+        self.conn.execute(
+            "INSERT INTO events (project_id, task_id, note_id, ts, actor, kind, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![project_id, task, note, ts, text("actor")?, text("kind")?, text("body")?],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.conn.execute(
+            "INSERT INTO sync_ids (kind, local_id, origin, origin_id) VALUES ('event', ?1, ?2, ?3)",
+            params![id, e.origin, e.id],
+        )?;
+        self.store_field(room, e, ROW, row, c)?;
+        Ok(Outcome::Applied)
+    }
+
+    /// A task another member moved off the team board. Their history stays here, frozen and
+    /// archived, rather than vanishing: it is part of this board's history too.
+    fn apply_left(&self, project_id: i64, e: &Ref, author: &str) -> Result<Outcome> {
+        let Some(local) = self.local_id(e)? else { return Ok(Outcome::Ignored) };
+        let n = self.conn.execute(
+            "UPDATE tasks SET status = 'archived', updated_at = ?3, version = version + 1 WHERE id = ?1 AND project_id = ?2",
+            params![local, project_id, now()],
+        )?;
+        if n == 1 {
+            self.write_event(project_id, Some(local), crate::core::model::Actor::System, LEFT_ROOM,
+                &format!("{author} moved this off the team board"))?;
+        }
+        Ok(Outcome::Applied)
+    }
+
+    /// The relay's tombstone: the same removal a local forget does, then remembered so nothing
+    /// about the entity can come back.
+    fn apply_forget(&self, room: &str, project_id: i64, e: &Ref) -> Result<Outcome> {
+        if let Some(local) = self.local_id(e)? {
+            let here: bool = self.conn
+                .query_row(&format!("SELECT EXISTS(SELECT 1 FROM {} WHERE id = ?1 AND project_id = ?2)", table(&e.kind)), params![local, project_id], |r| r.get(0))?;
+            if here {
+                match e.kind.as_str() {
+                    "task" => self.forget_task_unchecked(project_id, local, true)?,
+                    "note" => self.forget_note_unchecked(project_id, local, true)?,
+                    _ => {}
+                }
+            }
+        }
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sync_forgotten (room, kind, origin, origin_id) VALUES (?1, ?2, ?3, ?4)",
+            params![room, e.kind, e.origin, e.id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM sync_fields WHERE room = ?1 AND kind = ?2 AND origin = ?3 AND origin_id = ?4",
+            params![room, e.kind, e.origin, e.id],
+        )?;
+        Ok(Outcome::Applied)
+    }
+}

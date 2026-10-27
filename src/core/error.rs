@@ -48,6 +48,11 @@ pub enum Error {
     #[error("#{id} changed since you read it (you had v{expected}, it is now v{actual})")]
     Conflict { id: i64, expected: i64, actual: i64 },
 
+    /// The board is connected to a room, and the action would change what every member has
+    /// -- or leak a private board into the room. Carries the room so the caller can name it.
+    #[error("{reason}")]
+    SharedBoard { room: String, reason: String },
+
     #[error("{0}")]
     Other(String),
 }
