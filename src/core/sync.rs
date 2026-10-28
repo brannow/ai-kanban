@@ -1011,15 +1011,21 @@ impl Store {
         }
         let tag = self.origin_tag()?;
         let mut h = Handles { tag: tag.clone(), ..Default::default() };
+        // A task filed here since the last flush has no identity yet, but it will be exactly
+        // (this store's tag, its local id) -- flush assigns nothing else. Naming it that way at
+        // once keeps the agent that filed it from seeing (and writing down) a plain #12 first.
         let mut st = self.conn.prepare(
-            "SELECT s.local_id, s.origin, s.origin_id FROM sync_ids s
-               JOIN tasks t ON t.id = s.local_id
+            "SELECT t.id, s.origin, s.origin_id FROM tasks t
                JOIN sync_rooms r ON r.project_id = t.project_id
-              WHERE s.kind = 'task'",
+               LEFT JOIN sync_ids s ON s.kind = 'task' AND s.local_id = t.id",
         )?;
-        for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))? {
+        for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<i64>>(2)?)))? {
             let (local, origin, id) = row?;
-            h.tasks.insert(local, (origin, id));
+            match (origin, id, &tag) {
+                (Some(o), Some(i), _) => { h.tasks.insert(local, (o, i)); }
+                (_, _, Some(me)) => { h.tasks.insert(local, (me.clone(), local)); }
+                _ => {}
+            }
         }
         let me = tag.unwrap_or_default();
         for &(kind, local) in texts {
@@ -1054,17 +1060,23 @@ impl Store {
         if !self.any_connected()? {
             return Ok(format!("#{id}"));
         }
-        let synced: Option<(String, i64)> = self.conn
+        let row: Option<(Option<String>, Option<i64>)> = self.conn
             .query_row(
-                "SELECT s.origin, s.origin_id FROM sync_ids s
-                   JOIN tasks t ON t.id = s.local_id JOIN sync_rooms r ON r.project_id = t.project_id
-                  WHERE s.kind = 'task' AND s.local_id = ?1",
+                "SELECT s.origin, s.origin_id FROM tasks t
+                   JOIN sync_rooms r ON r.project_id = t.project_id
+                   LEFT JOIN sync_ids s ON s.kind = 'task' AND s.local_id = t.id
+                  WHERE t.id = ?1",
                 [id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        Ok(match synced {
-            Some((origin, n)) => format!("#{n}-{origin}"),
+        Ok(match row {
+            Some((Some(origin), Some(n))) => format!("#{n}-{origin}"),
+            // On a shared board, not flushed yet: it will be this store's tag and its own id.
+            Some(_) => match self.origin_tag()? {
+                Some(me) => format!("#{id}-{me}"),
+                None => format!("#{id}"),
+            },
             None => format!("#{id}"),
         })
     }
@@ -1100,6 +1112,13 @@ impl Store {
                 if let Some(id) = self.local_id(&Ref { kind: "task".into(), origin: h.origin.clone(), id: h.id })? {
                     self.task(project_id, id)?;
                     return Ok(id);
+                }
+                // This store's own handle for a task filed since the last flush: shown as
+                // `#12-b1` already, so it must resolve already.
+                if self.origin_tag()?.as_deref() == Some(h.origin.as_str()) && self.identity("task", h.id)?.is_none() {
+                    if self.task(project_id, h.id).is_ok() && self.room_of(project_id)?.is_some() {
+                        return Ok(h.id);
+                    }
                 }
             }
             return Err(Error::InvalidValue {

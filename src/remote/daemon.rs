@@ -92,6 +92,9 @@ fn round(store: &Store, client: &Client, watched: &mut HashSet<String>, notify: 
     if boards.is_empty() {
         return true;
     }
+    // Local and cheap, so first: even when the relay is unreachable, pending writes become
+    // countable changes, and the header can say how many are waiting.
+    let _ = store.flush();
     match check_identity(store, client) {
         Ok(()) => {}
         Err(RemoteError::Paused(_)) => return false,

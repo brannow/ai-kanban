@@ -45,7 +45,7 @@ BUILT       = target/release/ai-kanban
 PLUGIN_BIN ?= $(BIN)
 
 .DEFAULT_GOAL := help
-.PHONY: help build test install install-dev plugin uninstall where
+.PHONY: help build test smoke install install-dev plugin uninstall where
 
 help:
 	@echo 'ai-kanban'
@@ -55,6 +55,7 @@ help:
 	@echo '  make uninstall     remove the plugin and the installed binary'
 	@echo '  make where         show every path this Makefile would touch'
 	@echo '  make build/test    cargo build --release / cargo test'
+	@echo '  make smoke         two installations sharing a board, end to end'
 	@echo
 	@echo '  PREFIX=$(PREFIX)'
 	@echo '  CLAUDE_DIR=$(CLAUDE_DIR)'
@@ -72,7 +73,12 @@ build:
 	cargo build --release
 
 test:
-	cargo test
+	cargo test --workspace
+
+# Two installations (test-a.db, test-b.db) sharing a board through a relay, driven through the
+# real binary's CLI and MCP: tests/e2e_two_installs.rs.
+smoke:
+	cargo test --test e2e_two_installs -- --nocapture
 
 install: build
 	@mkdir -p '$(BINDIR)'
