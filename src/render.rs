@@ -48,6 +48,35 @@ pub fn ago(now: i64, ts: i64) -> String {
     }
 }
 
+/// Said first when an agent claims a task someone else already has in `doing`. The claim still
+/// went through -- a warning, not a lock: two people on one task can be deliberate, and only they
+/// know -- but it must be the first thing read, because it is the moment double work starts.
+pub fn claim_warning(handle: &str, who: &str, since: i64, now: i64) -> String {
+    let when = match ago(now, since).as_str() { "just now" => "just now".to_string(), w => format!("{w} ago") };
+    format!(
+        "Heads-up: {who} has had {handle} in doing since {when}. You are both on it now -- check with \
+         {who} before starting, or move it back.\n\n"
+    )
+}
+
+/// Said first after filing on a shared board when an open task already says the same thing.
+/// Each entry: (handle, title, status, who has it in doing).
+pub fn possible_duplicates(dups: &[(String, String, Status, Option<String>)]) -> String {
+    if dups.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Possible duplicate of what you just filed:\n");
+    for (handle, title, status, who) in dups {
+        let state = match who {
+            Some(w) => format!("{status}, by {w}"),
+            None => status.to_string(),
+        };
+        out.push_str(&format!("  {handle} {}  ({state})\n", truncate(title, 50)));
+    }
+    out.push_str("If it is the same work, archive yours and log on that one instead.\n\n");
+    out
+}
+
 /// The Board Snapshot -- the standard response shape most tools return.
 pub fn board(snap: &BoardSnapshot) -> String {
     let mut out = String::new();
@@ -68,6 +97,7 @@ pub fn board(snap: &BoardSnapshot) -> String {
         out.push_str(&task_line(
             t, snap.highlight == Some(t.id), &snap.blocker_status,
             snap.links_of(t.id), snap.repo_count > 0, &snap.handles,
+            snap.sync.as_ref().and_then(|s| s.claimed_by(t.id)).as_deref(),
         ));
     }
 
@@ -192,7 +222,13 @@ fn sync_line(s: &crate::core::sync::SyncStatus, now: i64) -> String {
     if s.parked > 0 {
         state.push(format!("{} parked until ai-kanban is upgraded", s.parked));
     }
-    let team = s.members.iter().map(|(tag, user)| format!("{tag} {user}")).collect::<Vec<_>>().join(", ");
+    let team = s.members.iter().map(|(tag, user)| {
+        let doing = s.claims.iter().filter(|(_, t)| t == tag).count();
+        let mut notes = Vec::new();
+        if s.me.as_deref() == Some(tag.as_str()) { notes.push("you".to_string()); }
+        if doing > 0 { notes.push(format!("{doing} doing")); }
+        if notes.is_empty() { format!("{tag} {user}") } else { format!("{tag} {user} ({})", notes.join(", ")) }
+    }).collect::<Vec<_>>().join(", ");
     match (team.is_empty(), state.is_empty()) {
         (true, true) => String::new(),
         (true, false) => format!("sync: {}\n", state.join(", ")),
@@ -214,12 +250,14 @@ fn sync_line(s: &crate::core::sync::SyncStatus, now: i64) -> String {
 /// same thing is one a reader learns to skip.
 fn task_line(
     t: &Task, highlighted: bool, blockers: &[(i64, Status)],
-    links: Option<&TaskLinks>, flag_missing: bool, h: &Handles,
+    links: Option<&TaskLinks>, flag_missing: bool, h: &Handles, claimed_by: Option<&str>,
 ) -> String {
     let mark = if highlighted { "*" } else { " " };
     let mut meta = vec![t.origin.to_string()];
     if t.task_type != TaskType::Task { meta.insert(0, t.task_type.to_string()); }
     if t.priority != Priority::Normal { meta.push(t.priority.to_string()); }
+    // On a shared board: who is on it. The one fact that stops two people starting the same work.
+    if let Some(who) = claimed_by { meta.push(format!("by {who}")); }
     if let Some(b) = t.blocked_by {
         // The blocker's status, not just its id. A finished blocker is no longer a reason
         // to skip the task, and the id alone cannot say so -- which left tasks reading as

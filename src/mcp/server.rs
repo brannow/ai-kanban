@@ -486,7 +486,14 @@ impl AiKanban {
         let task = store.create_task(resolved.project.id, draft).map_err(fail)?;
         self.wrote();
         let snap = store.board_after_mutation(resolved.project.id, task.id).map_err(fail)?;
-        Ok(render::board(&snap))
+        // On a shared board: someone may have filed this already. Caught up just above, so their
+        // task is here to be found.
+        let dups = store.possible_duplicates(resolved.project.id, task.id, 2).map_err(fail)?;
+        let named: Vec<(String, String, Status, Option<String>)> = dups.iter().map(|d| {
+            let who = snap.sync.as_ref().and_then(|s| s.claimed_by(d.id));
+            (store.task_ref(d.id).unwrap_or_else(|_| format!("#{}", d.id)), d.title.clone(), d.status, who)
+        }).collect();
+        Ok(format!("{}{}", render::possible_duplicates(&named), render::board(&snap)))
     }
 
     /// Move a task and record why, in one call. The `log` argument is the important half:
@@ -503,9 +510,19 @@ impl AiKanban {
         };
 
         let task = store.resolve_task_arg(resolved.project.id, &p.task.0).map_err(fail)?;
-        // Claiming work: catch up first, so a teammate who claimed it a minute ago is visible.
+        // Claiming work: catch up first, so a teammate who claimed it a minute ago is visible --
+        // then say so if they did. The claim still goes through.
+        let mut warning = String::new();
         if p.status.as_deref().map(str::trim).is_some_and(|s| s.eq_ignore_ascii_case("doing")) {
             self.catch_up(&store, resolved.project.id);
+            if let Some(c) = store.claim(resolved.project.id, task).map_err(fail)? {
+                if let Some(s) = store.sync_status(resolved.project.id).map_err(fail)? {
+                    if s.me.as_deref() != Some(c.tag.as_str()) {
+                        let handle = store.task_ref(task).map_err(fail)?;
+                        warning = render::claim_warning(&handle, &s.name_of(&c.tag), c.since, crate::core::now());
+                    }
+                }
+            }
         }
         let patch = TaskPatch {
             title: p.title.clone(),
@@ -554,7 +571,7 @@ impl AiKanban {
         // The board the task is on now, so "did it land" is answered where it landed.
         self.wrote();
         let snap = store.board_after_mutation(board, task).map_err(fail)?;
-        Ok(render::board(&snap))
+        Ok(format!("{warning}{}", render::board(&snap)))
     }
 
     /// Everything about one task: its full history, what blocks it, and the notes attached

@@ -265,14 +265,14 @@ fn a_shared_board_names_its_room_its_team_and_anything_wrong_with_its_sync() {
     s.flush().unwrap();
     s.outbox_sent(pid, i64::MAX).unwrap();
     s.sync_succeeded(pid, &team).unwrap();
-    assert!(header(&s, pid).ends_with("team: b1 benny, v1 volker"), "nothing wrong, nothing said: {}", header(&s, pid));
+    assert!(header(&s, pid).ends_with("team: b1 benny (you), v1 volker"), "nothing wrong, nothing said: {}", header(&s, pid));
 
     s.create_task(pid, TaskDraft::new("written offline")).unwrap();
     s.flush().unwrap();
     use ai_kanban::remote::RemoteError;
     s.sync_failed(pid, &RemoteError::Offline("connection refused".into()).recorded()).unwrap();
     let h = header(&s, pid);
-    assert!(h.contains("team: b1 benny, v1 volker  (offline, ") && h.ends_with(" changes unsent)"), "{h}");
+    assert!(h.contains("team: b1 benny (you), v1 volker  (offline, ") && h.ends_with(" changes unsent)"), "{h}");
     // Anything but unreachable needs someone to act, and says what.
     s.sync_failed(pid, &RemoteError::Unauthorized.recorded()).unwrap();
     assert!(header(&s, pid).contains("(sync failing: key rejected, "), "{}", header(&s, pid));

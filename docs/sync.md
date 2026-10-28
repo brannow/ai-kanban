@@ -221,9 +221,19 @@ written before the board connected, and agents that write a plain number.
   **one key per machine**, labelled (`benny/laptop`). R7 needs nothing more. Both machines'
   boards join the same room, and both appear as "benny".
 - Agent sessions stay local. `events.actor` (`user | agent | system`) is unchanged.
-- "Who is on it" = the author of the change that last set `doing`. **No assignee column.** On a
-  connected board the header gains one line: `doing: volker 3, benny 6`. Its token cost is measured in
-  `tests/budget.rs`.
+- "Who is on it" = whoever wrote the latest move into `doing` (the origin tag of that
+  `status:doing` event), or the creator of a task filed straight into `doing`. **No assignee
+  column.** On a shared board a `doing` row says `by volker` (or `by you`), and the team line counts
+  it: `team: a1 benny (you, 2 doing), b1 volker (1 doing)`. Measured in `tests/budget.rs`.
+- **Claiming what someone else has in `doing`** still goes through (a warning, not a lock: two
+  people on one task can be deliberate), but the answer leads with `Heads-up: volker has had
+  #12-v1 in doing since 20m ago. You are both on it now -- check with volker before starting`.
+  The catch-up round just before it makes that current.
+- **Filing on a shared board** checks the open tasks for one whose title shares most of the new
+  one's significant words (and at least two): `Possible duplicate of what you just filed: #7-v1
+  Login times out behind the proxy (doing, by volker)`. Words rather than FTS rank, because bm25
+  has no threshold that means "the same task", and a hint that fires on every filing gets ignored.
+  Shared boards only, so private boards render as they always did.
 
 ## How sync works
 
@@ -492,7 +502,7 @@ tolerant queries, so an unmigrated store shows the board without them.
 2. **Server:** relay, users and keys with origin tags, rooms, `hello`, snapshots, Docker image.
 3. **Client:** `remote`, `room list|connect|disconnect`, push/pull and the SSE stream in the MCP
    process, lock, parking, header line, pull before claim.
-4. **Coordination:** `doing: volker 3`, a duplicate hint on `task_add`, a warning when claiming a task someone else has in `doing`.
+4. **Coordination** (built): who has each `doing` task, the claim warning, the duplicate hint.
 
 ## Decided (2026-10-28)
 

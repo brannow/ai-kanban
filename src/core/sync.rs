@@ -180,6 +180,26 @@ pub struct SyncStatus {
     pub members: Vec<(String, String)>,
     /// This run has sync off (`AI_KANBAN_SYNC`): nothing reaches the relay until a run allows it.
     pub off: bool,
+    /// This store's own tag, so a reader can tell "you" from the team.
+    pub me: Option<String>,
+    /// Who has each task in `doing`: (local task id, origin tag).
+    pub claims: Vec<(i64, String)>,
+}
+
+impl SyncStatus {
+    /// What to call whoever publishes as `tag`: "you" for this store, the member's name when the
+    /// relay has told us, the bare tag otherwise.
+    pub fn name_of(&self, tag: &str) -> String {
+        if self.me.as_deref() == Some(tag) {
+            return "you".into();
+        }
+        self.members.iter().find(|(t, _)| t == tag).map(|(_, u)| u.clone()).unwrap_or_else(|| tag.to_string())
+    }
+
+    /// Who has a task in `doing`, by name.
+    pub fn claimed_by(&self, task_id: i64) -> Option<String> {
+        self.claims.iter().find(|(id, _)| *id == task_id).map(|(_, tag)| self.name_of(tag))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +370,11 @@ impl Store {
         let parked = self.conn.query_row("SELECT COUNT(*) FROM sync_parked WHERE project_id = ?1", [project_id], |r| r.get(0))?;
         let members: Vec<Value> = serde_json::from_str(&members).unwrap_or_default();
         let members = members.iter().filter_map(|m| Some((m.get("tag")?.as_str()?.to_string(), m.get("user")?.as_str()?.to_string()))).collect();
-        Ok(Some(SyncStatus { room, cursor, unsent, parked, last_ok_at, last_error, paused: self.paused()?, members, off: !sync_enabled() }))
+        let claims = self.claims(project_id)?.into_iter().map(|(id, c)| (id, c.tag)).collect();
+        Ok(Some(SyncStatus {
+            room, cursor, unsent, parked, last_ok_at, last_error, paused: self.paused()?, members,
+            off: !sync_enabled(), me: self.origin_tag()?, claims,
+        }))
     }
 
     /// Why sync is stopped for this store, if it is.
@@ -1262,4 +1286,104 @@ impl Store {
             |r| r.get(0),
         )?)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Who is on what: coordination on a shared board (docs/sync.md, phase 4)
+// ---------------------------------------------------------------------------
+
+/// Who put a task in `doing`, and when. Derived from history -- there is no assignee column,
+/// which the vision rules out -- so it is whoever wrote the latest move into `doing`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    /// The origin tag of whoever claimed it.
+    pub tag: String,
+    pub since: i64,
+}
+
+impl Store {
+    /// Who has a task in `doing` on a shared board, if it is in `doing` and the board is shared.
+    ///
+    /// The latest `status:doing` event says who: its origin tag, or this store's tag for an event
+    /// written here and not flushed yet. A task created straight into `doing` has no such event,
+    /// and then its creator claimed it.
+    pub fn claim(&self, project_id: i64, task_id: i64) -> Result<Option<Claim>> {
+        if self.room_of(project_id)?.is_none() {
+            return Ok(None);
+        }
+        let task = self.task(project_id, task_id)?;
+        if task.status != crate::core::model::Status::Doing {
+            return Ok(None);
+        }
+        let me = self.origin_tag()?.unwrap_or_default();
+        let event: Option<(i64, i64)> = self.conn
+            .query_row(
+                "SELECT id, ts FROM events WHERE task_id = ?1 AND kind = 'status:doing' ORDER BY ts DESC, id DESC LIMIT 1",
+                [task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(Some(match event {
+            Some((id, ts)) => Claim { tag: self.identity("event", id)?.map(|r| r.origin).unwrap_or(me), since: ts },
+            None => Claim { tag: self.identity("task", task_id)?.map(|r| r.origin).unwrap_or(me), since: task.created_at },
+        }))
+    }
+
+    /// Every claim on a shared board, by local task id.
+    pub fn claims(&self, project_id: i64) -> Result<Vec<(i64, Claim)>> {
+        if self.room_of(project_id)?.is_none() {
+            return Ok(vec![]);
+        }
+        let ids: Vec<i64> = {
+            let mut st = self.conn.prepare("SELECT id FROM tasks WHERE project_id = ?1 AND status = 'doing' ORDER BY id")?;
+            let ids = st.query_map([project_id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+            ids
+        };
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(c) = self.claim(project_id, id)? {
+                out.push((id, c));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Open tasks on a shared board whose titles say what `task_id`'s says: most of its
+    /// significant words, and at least two of them. Best match first, at most `limit`.
+    ///
+    /// Words rather than FTS ranking: bm25 has no threshold that means "the same task", and a
+    /// hint that fires on every filing is one the agent learns to skip. Only on shared boards,
+    /// where the problem is two people solving one thing twice; a private board renders as ever.
+    pub fn possible_duplicates(&self, project_id: i64, task_id: i64, limit: usize) -> Result<Vec<crate::core::model::Task>> {
+        if self.room_of(project_id)?.is_none() {
+            return Ok(vec![]);
+        }
+        let new = self.task(project_id, task_id)?;
+        let wanted = significant_words(&new.title);
+        if wanted.len() < 2 {
+            return Ok(vec![]);
+        }
+        let open = self.board(project_id, &crate::core::model::BoardQuery::board().with_limit(usize::MAX))?.tasks;
+        let mut scored: Vec<(usize, crate::core::model::Task)> = open
+            .into_iter()
+            .filter(|t| t.id != task_id)
+            .filter_map(|t| {
+                let shared = significant_words(&t.title).intersection(&wanted).count();
+                (shared >= 2 && shared * 2 >= wanted.len()).then_some((shared, t))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.updated_at.cmp(&a.1.updated_at)).then(b.1.id.cmp(&a.1.id)));
+        Ok(scored.into_iter().take(limit).map(|(_, t)| t).collect())
+    }
+}
+
+/// The words of a title that say what it is about: lowercased, four letters or more, minus the
+/// filler that would make every pair of titles look alike.
+fn significant_words(title: &str) -> std::collections::BTreeSet<String> {
+    const FILLER: &[&str] = &["with", "from", "that", "this", "when", "into", "after", "before", "should", "does", "doesn", "have", "make", "still", "again", "some"];
+    title
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.chars().count() >= 4 && !FILLER.contains(&w.as_str()))
+        .collect()
 }

@@ -195,6 +195,15 @@ fn two_installations_share_a_board_end_to_end() {
         t.contains("doing") && t.contains("taking it, I know this proxy")
     });
 
+    // --- A claims it too: the answer leads with who already has it ---------------------------
+    let overlap = aa.tool("task_update", json!({ "project": "sbb", "task": login, "status": "doing" }));
+    assert!(overlap.starts_with(&format!("Heads-up: volker has had #{login_h} in doing")), "{overlap}");
+    assert!(overlap.contains("by volker"), "the row says who:\n{overlap}");
+
+    // --- B files what A already filed: the answer points at A's task ---------------------------
+    let dup = ba.tool("task_add", json!({ "project": "sbahn-upgrade", "title": "Login timeout behind the proxy again" }));
+    assert!(dup.starts_with("Possible duplicate of what you just filed:") && dup.contains(&format!("#{login_h} ")), "{dup}");
+
     // --- B's findings land on A's task: a log naming B's own task, a note ------------------
     ba.tool("task_add", json!({ "project": "sbahn-upgrade", "title": "Raise proxy keep-alive timeout" }));
     let keepalive = b.local_id("Raise proxy keep-alive timeout");
