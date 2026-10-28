@@ -35,7 +35,11 @@ done
 
 # The plugin one directory down, which the archive source accepts. zip keeps the unix modes,
 # so the wrapper and the binaries arrive executable.
+# The output's directory may not exist yet (CI's dist/). Created here, and resolved outside a
+# command substitution, where a failed cd would not stop the script under `set -e`.
+mkdir -p "$(dirname "$out")"
 rm -f "$out"
-out_abs=$(cd "$(dirname "$out")" && pwd)/$(basename "$out")
+out_dir=$(cd "$(dirname "$out")" && pwd) || exit 1
+out_abs=$out_dir/$(basename "$out")
 (cd "$stage" && zip -qr -X "$out_abs" ai-kanban)
 echo "$out_abs"
