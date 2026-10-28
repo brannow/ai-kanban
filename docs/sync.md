@@ -264,6 +264,13 @@ Each mutation on a connected board writes, **in the same transaction**, one chan
 
 - **Clock:** a hybrid logical clock (wall time, then a counter, then the origin tag as the
   tie-break). Not `updated_at`, which is whole seconds, so ties are routine (note #3).
+- **The clock is taken at the edit, not at the sync.** The dirty triggers stamp each edited row
+  (`sync_edited`, migration 017), and flush publishes with that stamp. Stamping at flush time
+  made the side that synced *last* win: a status set offline in the morning and synced in the
+  evening reopened a task a teammate had closed at noon (#1069, found in a live race test). The
+  stamp is never behind anything this store has received, so an edit made after seeing a
+  teammate's change still beats it when their clock runs ahead. Granularity is the row: two
+  fields of one task edited hours apart offline both carry the later time.
 - **Apply:** for each field, apply if the incoming clock beats the stored clock for that field,
   else ignore. Order-independent and idempotent, so a change applied twice or late lands the
   same way. Tested as a property: any order of the same change set gives the same state.

@@ -432,6 +432,7 @@ nothing shared.
 | `sync_ids` | (kind, local id) ↔ (origin tag, origin id): a row's identity on every machine |
 | `sync_fields` | last value per field published to or received from a room, with its clock |
 | `sync_dirty` | rows changed on a connected board since the last flush, filled by triggers |
+| `sync_edited` | when each dirty row was last edited, as a clock value taken by the same triggers (017), so a conflict goes to the newest edit, not the last sync |
 | `sync_outbox` | changes waiting to be pushed (AUTOINCREMENT: the seq is half of a change's id) |
 | `sync_parked` | received changes this binary cannot store yet |
 | `sync_forgotten` | entities a room forgot, kept forever |

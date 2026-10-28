@@ -259,6 +259,29 @@ fn concurrent_edits_of_one_field_settle_on_the_same_winner_and_other_fields_both
 }
 
 #[test]
+fn the_newest_edit_wins_not_the_last_one_to_sync() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    let t = benny.store.create_task(benny.pid, TaskDraft::new("shared")).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    let vt = task_by_title(&volker, "shared");
+
+    // Both offline. Benny claims it; a moment later volker finishes it. Volker comes online
+    // first, benny only afterwards -- an edit from the morning must not reopen it in the evening.
+    benny.store.update_task(benny.pid, t.id, TaskPatch { status: Some(Status::Doing), ..patch() }).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    volker.store.update_task(volker.pid, vt.id, TaskPatch { status: Some(Status::Done), ..patch() }).unwrap();
+    push(&relay, &volker);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    push(&relay, &benny);
+    converge(&relay, &[&benny, &volker]);
+
+    assert_eq!(benny.store.task(benny.pid, t.id).unwrap().status, Status::Done);
+    assert_eq!(volker.store.task(volker.pid, vt.id).unwrap().status, Status::Done);
+}
+
+#[test]
 fn a_teammate_whose_clock_runs_ahead_does_not_win_my_later_edit() {
     let relay = relay();
     let benny = member(&relay, "benny", "b1", "sbb");

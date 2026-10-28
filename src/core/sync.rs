@@ -680,21 +680,23 @@ impl Store {
     }
 
     fn flush_inner(&self) -> Result<usize> {
-        let dirty: Vec<(String, i64, Option<i64>)> = {
+        let dirty: Vec<(String, i64, Option<i64>, Option<i64>)> = {
             // Tasks, then notes, then events: a receiver then usually meets a thing before the
             // things that point at it. Not required -- placeholders cover the other order.
+            // `wall_ms` is when the row was last edited (017); rows marked by `connect` have none.
             let mut st = self.conn.prepare(
-                "SELECT kind, local_id, left_from FROM sync_dirty
-                  ORDER BY CASE kind WHEN 'task' THEN 0 WHEN 'note' THEN 1 ELSE 2 END, local_id",
+                "SELECT d.kind, d.local_id, d.left_from, e.wall_ms FROM sync_dirty d
+                   LEFT JOIN sync_edited e ON e.kind = d.kind AND e.local_id = d.local_id
+                  ORDER BY CASE d.kind WHEN 'task' THEN 0 WHEN 'note' THEN 1 ELSE 2 END, d.local_id",
             )?;
-            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?
         };
-        self.conn.execute("DELETE FROM sync_dirty", [])?;
+        self.conn.execute_batch("DELETE FROM sync_dirty; DELETE FROM sync_edited;")?;
         let Some(tag) = self.origin_tag()? else { return Ok(0) };
 
         // Identities first, so a reference between two rows published in the same flush
         // resolves no matter which comes first.
-        for (kind, id, _) in &dirty {
+        for (kind, id, _, _) in &dirty {
             let on_connected: bool = self.conn.query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM {} x JOIN sync_rooms r ON r.project_id = x.project_id WHERE x.id = ?1)", table(kind)),
                 [id],
@@ -709,11 +711,11 @@ impl Store {
         }
 
         let mut written = 0;
-        for (kind, id, left_from) in dirty {
+        for (kind, id, left_from, edited) in dirty {
             if let Some(from) = left_from {
                 if let (Some(room), Some(me)) = (self.room_of(from)?, self.identity("task", id)?) {
                     let subject = Some(me.clone());
-                    written += self.emit(&tag, from, &room, &me, subject, Some(LEFT_ROOM), json!(true))?;
+                    written += self.emit(&tag, edited, from, &room, &me, subject, Some(LEFT_ROOM), json!(true))?;
                 }
             }
             let Some((project_id, fields)) = self.read_fields(&kind, id)? else { continue };
@@ -729,13 +731,13 @@ impl Store {
                 }
                 let subject = self.event_subject(&fields);
                 let row: serde_json::Map<String, Value> = fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-                written += self.emit(&tag, project_id, &room, &me, subject, None, Value::Object(row))?;
+                written += self.emit(&tag, edited, project_id, &room, &me, subject, None, Value::Object(row))?;
                 continue;
             }
             for (field, value) in fields {
                 let same = self.stored_field(&room, &me, field)?.is_some_and(|(v, _)| v == value.to_string());
                 if !same {
-                    written += self.emit(&tag, project_id, &room, &me, Some(me.clone()), Some(field), value)?;
+                    written += self.emit(&tag, edited, project_id, &room, &me, Some(me.clone()), Some(field), value)?;
                 }
             }
         }
@@ -752,8 +754,14 @@ impl Store {
         as_ref("note", fields.get("note")).or_else(|| as_ref("task", fields.get("task")))
     }
 
-    fn emit(&self, tag: &str, project_id: i64, room: &str, entity: &Ref, subject: Option<Ref>, field: Option<&str>, value: Value) -> Result<usize> {
-        let clock = self.tick(tag)?;
+    /// Queues one change, stamped with when the row was edited, so the newest edit wins a
+    /// conflict rather than whichever side syncs last (#1069). `tick` only for rows with no edit
+    /// recorded: ones `connect` publishes for the first time.
+    fn emit(&self, tag: &str, edited: Option<i64>, project_id: i64, room: &str, entity: &Ref, subject: Option<Ref>, field: Option<&str>, value: Value) -> Result<usize> {
+        let clock = match edited {
+            Some(wall_ms) => Clock { wall_ms, counter: 0, tag: tag.into() },
+            None => self.tick(tag)?,
+        };
         self.conn.execute("INSERT INTO sync_outbox (project_id, room, body) VALUES (?1, ?2, '')", params![project_id, room])?;
         let seq = self.conn.last_insert_rowid();
         let stored = match field {
@@ -806,7 +814,7 @@ impl Store {
         }
         // What applying wrote is already in `sync_fields`; flushing it would find no difference.
         // Clearing here just saves the next flush the reads.
-        self.conn.execute("DELETE FROM sync_dirty", [])?;
+        self.conn.execute_batch("DELETE FROM sync_dirty; DELETE FROM sync_edited;")?;
         tx.commit()?;
         Ok(out)
     }
@@ -831,7 +839,7 @@ impl Store {
         for p in &pulled {
             self.apply_one(&tag, &room, project_id, p, &mut out)?;
         }
-        self.conn.execute("DELETE FROM sync_dirty", [])?;
+        self.conn.execute_batch("DELETE FROM sync_dirty; DELETE FROM sync_edited;")?;
         tx.commit()?;
         Ok(out)
     }
