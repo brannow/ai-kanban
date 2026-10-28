@@ -119,3 +119,26 @@ fn an_unknown_repo_names_the_ones_that_exist() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("api"), "{}", String::from_utf8_lossy(&out.stderr));
 }
+
+/// `ai-kanban ... | head -1`: the reader goes away early. The command must end quietly, not panic
+/// with "failed printing to stdout: Broken pipe" (#1066).
+#[test]
+fn a_command_whose_reader_goes_away_ends_quietly() {
+    let c = Cli::new();
+    for args in [&["--help"][..], &["projects"][..]] {
+        // The reader is gone before the command starts, so its very first write meets a closed
+        // pipe -- deterministic, unlike racing a real `head`.
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let out = Command::new(env!("CARGO_BIN_EXE_ai-kanban"))
+            .args(args)
+            .env("AI_KANBAN_DB", &c.db)
+            .env_remove("CLAUDE_PROJECT_DIR")
+            .stdout(writer)
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!err.contains("panicked") && !err.contains("Broken pipe"), "{args:?}: {err}");
+    }
+}

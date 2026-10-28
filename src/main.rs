@@ -74,7 +74,11 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    match std::env::args().nth(1).as_deref() {
+    let command = std::env::args().nth(1);
+    if !matches!(command.as_deref(), Some("mcp" | "serve" | "hook")) {
+        quiet_on_closed_pipe();
+    }
+    match command.as_deref() {
         Some("mcp") => run_mcp().await,
         // Sharing boards through a relay (docs/sync.md). A person's commands, never the agent's.
         Some("remote") => ai_kanban::remote::cli::remote_cmd(),
@@ -383,4 +387,29 @@ async fn run_mcp() -> Result<(), Box<dyn std::error::Error>> {
     let service = AiKanban::with_sync(store, sync).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// Lets a closed pipe end a terminal command quietly, the way `ls | head` ends `ls`.
+///
+/// Rust ignores SIGPIPE, so writing to a reader that went away (`ai-kanban projects | head -1`)
+/// makes `println!` panic with "failed printing to stdout: Broken pipe" instead. Restoring the
+/// default disposition is the usual fix for command-line tools. Only for the commands a person
+/// runs: `serve` and `mcp` hold sockets and pipes whose peers may hang up, and the hooks run
+/// under Claude Code -- those keep Rust's default, where a hung-up peer is an error to handle,
+/// never a reason for the process to die.
+fn quiet_on_closed_pipe() {
+    #[cfg(unix)]
+    {
+        // Declared here rather than pulled in from the `libc` crate: one call, standard on every
+        // Unix this builds for, and SIGPIPE is 13 on Linux and macOS alike.
+        unsafe extern "C" {
+            fn signal(signum: i32, handler: usize) -> usize;
+        }
+        const SIGPIPE: i32 = 13;
+        const SIG_DFL: usize = 0;
+        // SAFETY: called once at startup, before any thread exists; SIG_DFL is always valid.
+        unsafe {
+            signal(SIGPIPE, SIG_DFL);
+        }
+    }
 }
