@@ -315,7 +315,14 @@ impl Store {
                 a == b
             }
         };
-        let unchanged = title == before.title && body == before.body && status == before.status
+        // Joining a teammate on a task already in `doing` changes no field, but it is a claim, and
+        // the teammate must see it (#1068): it is written as a move into `doing` like any other.
+        let joins = patch.status == Some(Status::Doing) && before.status == Status::Doing && {
+            let me = self.origin_tag()?;
+            let claimers = self.claimers(project_id, id)?;
+            !claimers.is_empty() && !claimers.iter().any(|c| Some(&c.tag) == me.as_ref())
+        };
+        let unchanged = !joins && title == before.title && body == before.body && status == before.status
             && priority == before.priority && task_type == before.task_type
             && blocked_by == before.blocked_by && workstream == before_ws && tags == before_tags
             && external_ref == before_ref && repos_same;
@@ -344,7 +351,7 @@ impl Store {
 
         // One event per call, not one per field. Per-field events would bury the reason in
         // noise; the reason is the part worth keeping.
-        let kind = if patch.status.is_some() && status != before.status {
+        let kind = if patch.status.is_some() && (status != before.status || joins) {
             // The new status rides in the kind so the board's `recent` section can render
             // `#12 -> doing` without re-deriving it from the task's *current* status,
             // which would be wrong for anything but the latest event.

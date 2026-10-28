@@ -51,11 +51,13 @@ pub fn ago(now: i64, ts: i64) -> String {
 /// Said first when an agent claims a task someone else already has in `doing`. The claim still
 /// went through -- a warning, not a lock: two people on one task can be deliberate, and only they
 /// know -- but it must be the first thing read, because it is the moment double work starts.
-pub fn claim_warning(handle: &str, who: &str, since: i64, now: i64) -> String {
+/// No "move it back": the status is shared, so that would take the task from them as well.
+pub fn claim_warning(handle: &str, who: &[String], since: i64, now: i64) -> String {
     let when = match ago(now, since).as_str() { "just now" => "just now".to_string(), w => format!("{w} ago") };
+    let (who, has) = if who.len() == 1 { (who[0].clone(), "has") } else { (who.join(" and "), "have") };
     format!(
-        "Heads-up: {who} has had {handle} in doing since {when}. You are both on it now -- check with \
-         {who} before starting, or move it back.\n\n"
+        "Heads-up: {who} {has} had {handle} in doing since {when}. You are both on it now -- check with \
+         {who} before starting.\n\n"
     )
 }
 

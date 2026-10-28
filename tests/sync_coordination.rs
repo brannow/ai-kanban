@@ -20,6 +20,10 @@ fn know_the_team(m: &Member) {
     m.store.sync_succeeded(m.pid, &team).unwrap();
 }
 
+fn tags(m: &Member, task: i64) -> Vec<String> {
+    m.store.claimers(m.pid, task).unwrap().into_iter().map(|c| c.tag).collect()
+}
+
 fn text(m: &Member) -> String {
     render::board(&m.store.board(m.pid, &BoardQuery::board()).unwrap())
 }
@@ -37,13 +41,76 @@ fn a_doing_row_names_who_is_on_it_and_the_team_line_counts_it() {
     know_the_team(&benny);
     know_the_team(&volker);
 
-    assert_eq!(benny.store.claim(benny.pid, t.id).unwrap().unwrap().tag, "v1");
+    assert_eq!(tags(&benny, t.id), ["v1"]);
     let b = text(&benny);
     assert!(b.contains("auth timeout behind the proxy") && b.contains("by volker"), "{b}");
     assert!(b.contains("team: b1 benny (you), v1 volker (1 doing)"), "{b}");
     let v = text(&volker);
     assert!(v.contains("by you"), "{v}");
     assert!(v.contains("b1 benny, v1 volker (you, 1 doing)"), "{v}");
+}
+
+#[test]
+fn joining_a_teammate_on_a_doing_task_is_seen_by_the_teammate_too() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    let t = benny.store.create_task(benny.pid, TaskDraft::new("proxy timeout")).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    let vt = task_by_title(&volker, "proxy timeout");
+    volker.store.update_task(volker.pid, vt.id, TaskPatch { status: Some(Status::Doing), ..patch() }).unwrap();
+    converge(&relay, &[&benny, &volker]);
+
+    // Already in doing, so the status does not change -- but benny joining is a claim, and the
+    // one already working on it is the person who most needs to hear about it.
+    benny.store.update_task(benny.pid, t.id, TaskPatch { status: Some(Status::Doing), ..patch() }).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    know_the_team(&benny);
+    know_the_team(&volker);
+    assert_eq!(tags(&volker, vt.id), ["v1", "b1"]);
+    let v = text(&volker);
+    assert!(v.contains("by you, benny"), "{v}");
+    assert!(v.contains("b1 benny (1 doing), v1 volker (you, 1 doing)"), "{v}");
+    assert!(text(&benny).contains("by volker, you"));
+
+    // Claiming again changes nothing: no second entry in the history.
+    let before = benny.store.task_events(t.id).unwrap().len();
+    benny.store.update_task(benny.pid, t.id, TaskPatch { status: Some(Status::Doing), ..patch() }).unwrap();
+    assert_eq!(benny.store.task_events(t.id).unwrap().len(), before);
+}
+
+#[test]
+fn two_claims_in_the_same_moment_both_stay_visible() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    let t = benny.store.create_task(benny.pid, TaskDraft::new("same moment")).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    let vt = task_by_title(&volker, "same moment");
+    benny.store.update_task(benny.pid, t.id, TaskPatch { status: Some(Status::Doing), ..patch() }).unwrap();
+    volker.store.update_task(volker.pid, vt.id, TaskPatch { status: Some(Status::Doing), ..patch() }).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    let mut b = tags(&benny, t.id);
+    let mut v = tags(&volker, vt.id);
+    b.sort();
+    v.sort();
+    assert_eq!((b, v), (vec!["b1".to_string(), "v1".into()], vec!["b1".to_string(), "v1".into()]));
+}
+
+#[test]
+fn leaving_doing_ends_every_claim_and_the_next_one_starts_fresh() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    let t = benny.store.create_task(benny.pid, TaskDraft::new("round two")).unwrap();
+    benny.store.update_task(benny.pid, t.id, TaskPatch { status: Some(Status::Doing), ..patch() }).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    let vt = task_by_title(&volker, "round two");
+    volker.store.update_task(volker.pid, vt.id, TaskPatch { status: Some(Status::Doing), ..patch() }).unwrap();
+    volker.store.update_task(volker.pid, vt.id, TaskPatch { status: Some(Status::Blocked), ..patch() }).unwrap();
+    volker.store.update_task(volker.pid, vt.id, TaskPatch { status: Some(Status::Doing), ..patch() }).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    assert_eq!(tags(&benny, t.id), ["v1"], "benny's claim ended when it left doing");
 }
 
 #[test]
@@ -54,7 +121,7 @@ fn a_task_filed_straight_into_doing_is_claimed_by_whoever_filed_it() {
     volker.store.create_task(volker.pid, TaskDraft { status: Status::Doing, ..TaskDraft::new("already on it") }).unwrap();
     converge(&relay, &[&benny, &volker]);
     let t = task_by_title(&benny, "already on it");
-    assert_eq!(benny.store.claim(benny.pid, t.id).unwrap().unwrap().tag, "v1");
+    assert_eq!(tags(&benny, t.id), ["v1"]);
 }
 
 #[test]
@@ -63,7 +130,7 @@ fn a_private_board_names_no_claims_and_looks_as_ever() {
     s.set_origin_tag("b1").unwrap();
     let pid = s.create_board("private").unwrap().id;
     let t = s.create_task(pid, TaskDraft { status: Status::Doing, ..TaskDraft::new("mine") }).unwrap();
-    assert_eq!(s.claim(pid, t.id).unwrap(), None);
+    assert!(s.claimers(pid, t.id).unwrap().is_empty());
     let text = render::board(&s.board(pid, &BoardQuery::board()).unwrap());
     assert!(!text.contains("by you"), "{text}");
     assert!(s.possible_duplicates(pid, t.id, 2).unwrap().is_empty());
@@ -93,9 +160,12 @@ fn filing_what_a_teammate_already_filed_is_noticed() {
 
 #[test]
 fn the_warnings_read_as_a_heads_up_with_the_handle_and_the_name() {
-    let w = render::claim_warning("#12-v1", "volker", 1000, 1000 + 20 * 60);
+    let w = render::claim_warning("#12-v1", &["volker".into()], 1000, 1000 + 20 * 60);
     assert!(w.starts_with("Heads-up: volker has had #12-v1 in doing since 20m ago."), "{w}");
-    assert!(render::claim_warning("#12-v1", "volker", 1000, 1010).contains("since just now."));
+    assert!(render::claim_warning("#12-v1", &["volker".into()], 1000, 1010).contains("since just now."));
+    let two = render::claim_warning("#12-v1", &["volker".into(), "carla".into()], 1000, 1010);
+    assert!(two.starts_with("Heads-up: volker and carla have had #12-v1") && two.contains("check with volker and carla"), "{two}");
+    assert!(!w.contains("move it back"), "the status is shared: moving it back would take it from volker too");
     let d = render::possible_duplicates(&[("#7-v1".into(), "Login times out".into(), Status::Doing, Some("volker".into()))]);
     assert!(d.contains("#7-v1 Login times out  (doing, by volker)"), "{d}");
     assert_eq!(render::possible_duplicates(&[]), "");

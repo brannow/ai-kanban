@@ -221,14 +221,23 @@ written before the board connected, and agents that write a plain number.
   **one key per machine**, labelled (`benny/laptop`). R7 needs nothing more. Both machines'
   boards join the same room, and both appear as "benny".
 - Agent sessions stay local. `events.actor` (`user | agent | system`) is unchanged.
-- "Who is on it" = whoever wrote the latest move into `doing` (the origin tag of that
-  `status:doing` event), or the creator of a task filed straight into `doing`. **No assignee
-  column.** On a shared board a `doing` row says `by volker` (or `by you`), and the team line counts
-  it: `team: a1 benny (you, 2 doing), b1 volker (1 doing)`. Measured in `tests/budget.rs`.
+- "Who is on it" = everyone who moved it into `doing` since it last left `doing` (the origin tags
+  of those `status:doing` events, earliest first), or the creator of a task filed straight into
+  `doing`. **No assignee column.** On a shared board a `doing` row says `by volker` (or `by you`,
+  or `by volker, you` when two are on it), and the team line counts it:
+  `team: a1 benny (you, 2 doing), b1 volker (1 doing)`. Measured in `tests/budget.rs`.
 - **Claiming what someone else has in `doing`** still goes through (a warning, not a lock: two
   people on one task can be deliberate), but the answer leads with `Heads-up: volker has had
-  #12-v1 in doing since 20m ago. You are both on it now -- check with volker before starting`.
+  #12-v1 in doing since 20m ago. You are both on it now -- check with volker before starting.`
   The catch-up round just before it makes that current.
+- **Joining is recorded as a claim.** The status is already `doing`, so no field changes, but a
+  `status:doing` event is written anyway and syncs. Otherwise only the one joining would know:
+  the person already working on it, who most needs to hear about it, would see nothing (#1068,
+  found in a live test). Claims made in the same moment, before either side saw the other's,
+  both stay listed for the same reason: "the latest claim" would silently drop one.
+- **No "or move it back"** in the heads-up. The status is shared, so moving it back would take
+  the task from the teammate too. There is no way to withdraw a joined claim short of a status
+  change; accepted until someone needs one.
 - **Filing on a shared board** checks the open tasks for one whose title shares most of the new
   one's significant words (and at least two): `Possible duplicate of what you just filed: #7-v1
   Login times out behind the proxy (doing, by volker)`. Words rather than FTS rank, because bm25

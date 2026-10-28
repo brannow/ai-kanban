@@ -182,7 +182,7 @@ pub struct SyncStatus {
     pub off: bool,
     /// This store's own tag, so a reader can tell "you" from the team.
     pub me: Option<String>,
-    /// Who has each task in `doing`: (local task id, origin tag).
+    /// Who has each task in `doing`: (local task id, origin tag), one entry per claimer.
     pub claims: Vec<(i64, String)>,
 }
 
@@ -196,9 +196,10 @@ impl SyncStatus {
         self.members.iter().find(|(t, _)| t == tag).map(|(_, u)| u.clone()).unwrap_or_else(|| tag.to_string())
     }
 
-    /// Who has a task in `doing`, by name.
+    /// Who has a task in `doing`, by name: "volker", or "volker, you" when two are on it.
     pub fn claimed_by(&self, task_id: i64) -> Option<String> {
-        self.claims.iter().find(|(id, _)| *id == task_id).map(|(_, tag)| self.name_of(tag))
+        let names: Vec<String> = self.claims.iter().filter(|(id, _)| *id == task_id).map(|(_, tag)| self.name_of(tag)).collect();
+        (!names.is_empty()).then(|| names.join(", "))
     }
 }
 
@@ -1301,7 +1302,7 @@ impl Store {
 // ---------------------------------------------------------------------------
 
 /// Who put a task in `doing`, and when. Derived from history -- there is no assignee column,
-/// which the vision rules out -- so it is whoever wrote the latest move into `doing`.
+/// which the vision rules out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claim {
     /// The origin tag of whoever claimed it.
@@ -1310,34 +1311,53 @@ pub struct Claim {
 }
 
 impl Store {
-    /// Who has a task in `doing` on a shared board, if it is in `doing` and the board is shared.
+    /// Who has a task in `doing` on a shared board, earliest first. Empty unless it is in `doing`
+    /// and the board is shared.
     ///
-    /// The latest `status:doing` event says who: its origin tag, or this store's tag for an event
-    /// written here and not flushed yet. A task created straight into `doing` has no such event,
-    /// and then its creator claimed it.
-    pub fn claim(&self, project_id: i64, task_id: i64) -> Result<Option<Claim>> {
+    /// Everyone whose `status:doing` came after the task last left `doing`: two people can be on
+    /// one task, by joining it or by claiming in the same moment, and the one who was there first
+    /// must see the second (#1068). An event's origin tag says who, or this store's tag for one
+    /// not flushed yet. A task created straight into `doing` has no such event, and then its
+    /// creator claimed it.
+    pub fn claimers(&self, project_id: i64, task_id: i64) -> Result<Vec<Claim>> {
         if self.room_of(project_id)?.is_none() {
-            return Ok(None);
+            return Ok(vec![]);
         }
         let task = self.task(project_id, task_id)?;
         if task.status != crate::core::model::Status::Doing {
-            return Ok(None);
+            return Ok(vec![]);
         }
         let me = self.origin_tag()?.unwrap_or_default();
-        let event: Option<(i64, i64)> = self.conn
+        let left: (i64, i64) = self.conn
             .query_row(
-                "SELECT id, ts FROM events WHERE task_id = ?1 AND kind = 'status:doing' ORDER BY ts DESC, id DESC LIMIT 1",
+                "SELECT ts, id FROM events WHERE task_id = ?1 AND kind LIKE 'status:%' AND kind != 'status:doing'
+                  ORDER BY ts DESC, id DESC LIMIT 1",
                 [task_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()?;
-        Ok(Some(match event {
-            Some((id, ts)) => Claim { tag: self.identity("event", id)?.map(|r| r.origin).unwrap_or(me), since: ts },
-            None => Claim { tag: self.identity("task", task_id)?.map(|r| r.origin).unwrap_or(me), since: task.created_at },
-        }))
+            .optional()?
+            .unwrap_or((i64::MIN, i64::MIN));
+        let events: Vec<(i64, i64)> = {
+            let mut st = self.conn.prepare(
+                "SELECT id, ts FROM events WHERE task_id = ?1 AND kind = 'status:doing' AND (ts, id) > (?2, ?3)
+                  ORDER BY ts, id",
+            )?;
+            let rows = st.query_map(params![task_id, left.0, left.1], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            rows
+        };
+        let mut out: Vec<Claim> = Vec::new();
+        for (id, ts) in events {
+            let tag = self.identity("event", id)?.map(|r| r.origin).unwrap_or_else(|| me.clone());
+            if !out.iter().any(|c| c.tag == tag) {
+                out.push(Claim { tag, since: ts });
+            }
+        }
+        if out.is_empty() {
+            out.push(Claim { tag: self.identity("task", task_id)?.map(|r| r.origin).unwrap_or(me), since: task.created_at });
+        }
+        Ok(out)
     }
 
-    /// Every claim on a shared board, by local task id.
     pub fn claims(&self, project_id: i64) -> Result<Vec<(i64, Claim)>> {
         if self.room_of(project_id)?.is_none() {
             return Ok(vec![]);
@@ -1349,9 +1369,7 @@ impl Store {
         };
         let mut out = Vec::new();
         for id in ids {
-            if let Some(c) = self.claim(project_id, id)? {
-                out.push((id, c));
-            }
+            out.extend(self.claimers(project_id, id)?.into_iter().map(|c| (id, c)));
         }
         Ok(out)
     }

@@ -515,12 +515,13 @@ impl AiKanban {
         let mut warning = String::new();
         if p.status.as_deref().map(str::trim).is_some_and(|s| s.eq_ignore_ascii_case("doing")) {
             self.catch_up(&store, resolved.project.id);
-            if let Some(c) = store.claim(resolved.project.id, task).map_err(fail)? {
-                if let Some(s) = store.sync_status(resolved.project.id).map_err(fail)? {
-                    if s.me.as_deref() != Some(c.tag.as_str()) {
-                        let handle = store.task_ref(task).map_err(fail)?;
-                        warning = render::claim_warning(&handle, &s.name_of(&c.tag), c.since, crate::core::now());
-                    }
+            if let Some(s) = store.sync_status(resolved.project.id).map_err(fail)? {
+                let others: Vec<_> = store.claimers(resolved.project.id, task).map_err(fail)?
+                    .into_iter().filter(|c| s.me.as_deref() != Some(c.tag.as_str())).collect();
+                if let Some(first) = others.first() {
+                    let handle = store.task_ref(task).map_err(fail)?;
+                    let names: Vec<String> = others.iter().map(|c| s.name_of(&c.tag)).collect();
+                    warning = render::claim_warning(&handle, &names, first.since, crate::core::now());
                 }
             }
         }
