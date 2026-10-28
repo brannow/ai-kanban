@@ -74,8 +74,30 @@ rewrite and a single writer), cr-sqlite (last push 2024-10, native extension). T
 
 ## Connecting a board
 
-Terminal commands only, never the agent's. **One remote per client** in v1: a store has one
-origin tag, and no command ever has to say which server it means.
+**One remote per client** in v1: a store has one origin tag, and no command ever has to say
+which server it means.
+
+**The usual way in is the plugin's settings.** Claude Code asks for them when the plugin is
+enabled, or under `/plugin` → ai-kanban → Configure: *Team relay URL* and *Team relay key*, both
+optional (`userConfig` in `plugin/.claude-plugin/plugin.json`). The key is `sensitive`, so it is
+kept in the system keychain and never typed into a conversation. The MCP server gets both
+through its environment and, at startup, saves them as this machine's remote (`remote.json`,
+below) **if it has none** -- locally, without asking the relay anything, so an offline start is
+not slowed. The first sync round then asks the relay whose key it is, and the store takes that
+tag (a store with no tag has never published, so it has nothing to collide with; a key copied
+from another machine is still caught by the high-water check, see "When sync pauses").
+
+An existing remote always wins: settings naming another relay or key are not taken, and every
+`board` answer opens with a heads-up that says so and how to switch (`ai-kanban remote
+--disconnect`, then a new session). Overwriting would move the store to another identity, which
+`remote` itself refuses while boards are connected. This also settles two Claude configurations
+on one machine (`~/.claude`, `~/.claude-private`): there is one store and one remote, and
+whichever was set first stays. Decided 2026-10-29, after the first marketplace install showed
+that without it the key had to go through a terminal or the chat.
+
+The commands below do the same by hand, and the rest of connecting. Claude can run them when
+asked (the plugin puts `ai-kanban` on its shell's PATH); none of them needs the key once the
+remote is set.
 
 ```
 ai-kanban remote https://sync.board.rannow.de --key akb_…   set the remote, check the key
@@ -87,7 +109,7 @@ ai-kanban remote --disconnect [...same flags]               disconnect every roo
 ```
 
 **`remote <url> --key`** checks the key at once (`/v1/hello` and `/v1/whoami`), so a typo fails
-here and not mid-session. The key is stored in `servers.json` in the data directory (mode 0600),
+here and not mid-session. The key is stored in `remote.json` next to the store (mode 0600),
 never in SQLite, so `backup` and `export` never carry it. `AI_KANBAN_SERVER_URL` and
 `AI_KANBAN_SERVER_KEY` cover CI. Setting a different URL while rooms are connected is refused:
 disconnect first. Moving the domain is `remote --move <new-url>`, the same server under a new name.

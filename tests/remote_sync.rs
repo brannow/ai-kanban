@@ -109,6 +109,36 @@ fn a_key_for_another_tag_pauses_sync_until_it_is_fixed() {
 }
 
 #[test]
+fn a_store_that_never_published_takes_the_tag_of_its_first_key() {
+    // A key arriving through the plugin's settings is saved without asking the relay anything,
+    // so the store has no tag yet when sync first runs. Having never published, it has no
+    // numbers under any tag to collide with: taking the key's tag is what `remote` would do.
+    let relay = HttpRelay::start();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("kanban.db")).unwrap();
+    let client = Client::new(&relay.url, &relay.key("volker", "v1"), Duration::from_secs(5));
+    assert_eq!(store.origin_tag().unwrap(), None);
+    check_identity(&store, &client).unwrap();
+    assert_eq!(store.origin_tag().unwrap().as_deref(), Some("v1"));
+    assert_eq!(store.paused().unwrap(), None);
+}
+
+#[test]
+fn a_fresh_store_on_a_key_already_in_use_elsewhere_is_still_caught() {
+    // The same key on a second machine: the fresh store takes the tag, and the high-water check
+    // right after it stops it before it reuses the first machine's numbers.
+    let relay = HttpRelay::start();
+    let first = machine(&relay, "volker", "v1", "x");
+    first.store.create_task(first.pid, TaskDraft::new("published from the first machine")).unwrap();
+    sync_board(&first.store, &first.client, first.pid).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let second = Store::open(&dir.path().join("kanban.db")).unwrap();
+    let err = check_identity(&second, &first.client).unwrap_err();
+    assert!(matches!(err, RemoteError::Paused(ref why) if why.contains("in use on another machine")), "{err:?}");
+}
+
+#[test]
 fn a_store_restored_from_a_backup_is_caught_before_it_reuses_ids() {
     let relay = HttpRelay::start();
     let benny = machine(&relay, "benny", "b1", "sbb");

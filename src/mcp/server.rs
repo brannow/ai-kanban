@@ -57,16 +57,25 @@ pub struct AiKanban {
     /// Captured once at startup. The server is spawned inside the project by the host, so
     /// this is the project context for the whole process.
     cwd: PathBuf,
+    /// Something about this session's setup the agent should pass on, said first in every
+    /// `board` answer: a relay in the plugin's settings that this machine did not take.
+    notice: Option<String>,
 }
 
 impl AiKanban {
     pub fn new(store: Store) -> Self {
-        Self { store: Arc::new(Mutex::new(store)), sync: None, cwd: project_dir() }
+        Self { store: Arc::new(Mutex::new(store)), sync: None, cwd: project_dir(), notice: None }
     }
 
     /// `new`, syncing shared boards in the background (`remote::daemon`).
     pub fn with_sync(store: Store, sync: Option<crate::remote::daemon::Syncer>) -> Self {
-        Self { store: Arc::new(Mutex::new(store)), sync: sync.map(Arc::new), cwd: project_dir() }
+        Self { store: Arc::new(Mutex::new(store)), sync: sync.map(Arc::new), cwd: project_dir(), notice: None }
+    }
+
+    /// Says `notice` at the top of every `board` answer.
+    pub fn with_notice(mut self, notice: Option<String>) -> Self {
+        self.notice = notice;
+        self
     }
 
     /// After a write: publish it soon, without making the agent wait.
@@ -444,7 +453,7 @@ impl AiKanban {
         }
 
         let snap = store.board(pid, &q).map_err(fail)?;
-        let mut out = String::new();
+        let mut out = self.notice.clone().unwrap_or_default();
         // Say the switch out loud. Entering by looking is convenient and has one sharp
         // edge: an agent that glances at an adjacent workstream has silently changed where
         // its next `task_add` lands. Unlike alias learning -- the precedent for

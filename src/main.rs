@@ -381,10 +381,27 @@ async fn run_mcp() -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open_default()?;
     eprintln!("ai-kanban: store at {}", Store::default_path()?.display());
 
+    // A relay in the plugin's settings becomes this machine's remote if it has none (local
+    // only: the first sync round asks the relay who the key is). One that differs is not taken,
+    // and the agent is told so. A failure here must not cost the session its board.
+    use ai_kanban::remote::config::{adopt_plugin_settings, Adoption};
+    let notice = match adopt_plugin_settings() {
+        Ok(Adoption::Adopted(cfg)) => {
+            eprintln!("ai-kanban: relay {} from the plugin settings saved as this machine's remote", cfg.url);
+            None
+        }
+        Ok(Adoption::Kept { machine }) => Some(ai_kanban::render::relay_settings_kept(&machine.url)),
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("ai-kanban: could not save the relay from the plugin settings: {e}");
+            None
+        }
+    };
+
     // Shared boards sync in a background thread of this process (`remote::daemon`); nothing
     // starts unless a remote is set and this run allows sync.
     let sync = ai_kanban::remote::daemon::Syncer::start();
-    let service = AiKanban::with_sync(store, sync).serve(stdio()).await?;
+    let service = AiKanban::with_sync(store, sync).with_notice(notice).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

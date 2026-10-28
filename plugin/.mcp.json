@@ -2,7 +2,13 @@
   "mcpServers": {
     "ai-kanban": {
       "command": "${CLAUDE_PLUGIN_ROOT}/bin/ai-kanban",
-      "args": ["mcp"]
+      "args": [
+        "mcp"
+      ],
+      "env": {
+        "AI_KANBAN_PLUGIN_RELAY_URL": "${user_config.relay_url}",
+        "AI_KANBAN_PLUGIN_RELAY_KEY": "${user_config.relay_key}"
+      }
     }
   }
 }

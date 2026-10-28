@@ -36,7 +36,13 @@ pub fn check_identity(store: &Store, client: &Client) -> Result<(), RemoteError>
         return Err(RemoteError::Paused(why));
     }
     let who = client.whoami()?;
-    let tag = store.origin_tag().ok().flatten();
+    let mut tag = store.origin_tag().ok().flatten();
+    // A store with no tag has never published, so it holds no numbers under any tag: it takes
+    // the key's, as `ai-kanban remote` would. That lets a key from the plugin's settings be saved
+    // without a round trip at startup. A copied key is still caught by the high-water check below.
+    if tag.is_none() && store.set_origin_tag(&who.tag).is_ok() {
+        tag = Some(who.tag.clone());
+    }
     if tag.as_deref() != Some(who.tag.as_str()) {
         let why = format!(
             "the key is for origin tag {}, but this store publishes as {}. Run `ai-kanban remote <url> --key <key>` with this machine's key",

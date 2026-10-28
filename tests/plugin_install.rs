@@ -237,3 +237,24 @@ fn the_hooks_file_uses_only_top_level_keys_the_loader_accepts() {
         }
     }
 }
+
+#[test]
+fn the_relay_settings_reach_the_mcp_server_and_the_key_stays_secret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugin = install(tmp.path(), &stub(tmp.path()));
+    let manifest = json(&plugin, ".claude-plugin/plugin.json");
+    let options = manifest["userConfig"].as_object().expect("the manifest declares the relay settings");
+
+    // A reference to an undeclared option is dropped by the loader, and the setting would then
+    // never reach the server -- sync silently off for whoever filled it in.
+    let env = json(&plugin, ".mcp.json")["mcpServers"]["ai-kanban"]["env"].clone();
+    for (var, value) in env.as_object().expect("the server gets the settings through env") {
+        let name = value.as_str().unwrap().strip_prefix("${user_config.").and_then(|v| v.strip_suffix('}'))
+            .unwrap_or_else(|| panic!("{var} must come from a setting: {value}"));
+        assert!(options.contains_key(name), "{var} names an undeclared setting {name:?}");
+    }
+    assert_eq!(options["relay_key"]["sensitive"], true, "the key belongs in the keychain, not in settings.json");
+    for (name, o) in options {
+        assert_ne!(o["required"], true, "{name}: most installs are local and must be able to leave it empty");
+    }
+}

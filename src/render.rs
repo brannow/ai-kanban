@@ -61,6 +61,17 @@ pub fn claim_warning(handle: &str, who: &[String], since: i64, now: i64) -> Stri
     )
 }
 
+/// Said first on `board` when the plugin's settings name a relay or key other than the one this
+/// machine already uses. The machine's wins (overwriting it would move the store to another
+/// identity), so whoever changed the settings needs to hear that it did not take effect.
+pub fn relay_settings_kept(machine_url: &str) -> String {
+    format!(
+        "Heads-up: ai-kanban's plugin settings name a different relay or key than this machine uses \
+         ({machine_url}). Kept this machine's. To switch, run `ai-kanban remote --disconnect` in a \
+         terminal and start a new session.\n\n"
+    )
+}
+
 /// Said first after filing on a shared board when an open task already says the same thing.
 /// Each entry: (handle, title, status, who has it in doing).
 pub fn possible_duplicates(dups: &[(String, String, Status, Option<String>)]) -> String {

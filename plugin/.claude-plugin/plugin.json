@@ -13,5 +13,20 @@
     "mcp",
     "context"
   ],
-  "repository": "https://github.com/brannow/ai-kanban"
+  "repository": "https://github.com/brannow/ai-kanban",
+  "userConfig": {
+    "relay_url": {
+      "type": "string",
+      "title": "Team relay URL (optional)",
+      "description": "Only to share boards with a team through an ai-kanban relay, e.g. https://kanban.example.com. Leave empty and ai-kanban stays on this machine.",
+      "required": false
+    },
+    "relay_key": {
+      "type": "string",
+      "title": "Team relay key (optional)",
+      "description": "This machine's key from the relay admin (ai-kanban-relay user add). Kept in your system keychain, never in a file you share.",
+      "sensitive": true,
+      "required": false
+    }
+  }
 }
