@@ -216,10 +216,14 @@ fn sync_line(s: &crate::core::sync::SyncStatus, now: i64) -> String {
         (None, Some(t)) if now - t > 3600 => state.push(format!("last sync {}", ago(now, t))),
         _ => {}
     }
-    // Changes, not tasks: one new task is a dozen field changes, and "13 unsent" would read as
-    // thirteen tasks.
+    // What was changed, not how many field changes that took: one new task is a dozen of them,
+    // and "39 changes unsent" for three tasks reads as something gone wrong.
     if s.unsent > 0 {
-        state.push(format!("{} change{} unsent", s.unsent, if s.unsent == 1 { "" } else { "s" }));
+        let (tasks, notes, board) = s.unsent_items;
+        let count = |n: i64, one: &str, many: &str| (n > 0).then(|| format!("{n} {}", if n == 1 { one } else { many }));
+        let items: Vec<String> = [count(tasks, "task", "tasks"), count(notes, "note", "notes"), count(board, "board update", "board updates")]
+            .into_iter().flatten().collect();
+        state.push(format!("{} unsent", if items.is_empty() { format!("{} changes", s.unsent) } else { items.join(", ") }));
     }
     if s.parked > 0 {
         state.push(format!("{} parked until ai-kanban is upgraded", s.parked));

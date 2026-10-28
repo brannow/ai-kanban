@@ -369,8 +369,12 @@ A shared board's header names its room, and adds one line only when there is som
 
 ```
 Board: sbb @sbahn  (5 open, 2 doing)
-team: b1 benny, v1 volker  (offline, 13 changes unsent)
+team: b1 benny, v1 volker  (offline, 3 tasks, 1 note unsent)
 ```
+
+Unsent work is counted by what it is about, not by change: one new task is a dozen field changes,
+and the first live test's `39 changes unsent` for three tasks read as something gone wrong.
+`room status` and the disconnect prompt keep the exact change count.
 
 The second line can also say `not synced yet`, `last sync 3h ago` (a stale local copy must say
 so), `sync off for this run`, `N parked until ai-kanban is upgraded`, or replace everything with

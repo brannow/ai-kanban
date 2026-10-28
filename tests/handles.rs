@@ -272,7 +272,7 @@ fn a_shared_board_names_its_room_its_team_and_anything_wrong_with_its_sync() {
     use ai_kanban::remote::RemoteError;
     s.sync_failed(pid, &RemoteError::Offline("connection refused".into()).recorded()).unwrap();
     let h = header(&s, pid);
-    assert!(h.contains("team: b1 benny (you), v1 volker  (offline, ") && h.ends_with(" changes unsent)"), "{h}");
+    assert!(h.contains("team: b1 benny (you), v1 volker  (offline, ") && h.ends_with(", 1 task unsent)"), "one task, however many fields it took: {h}");
     // Anything but unreachable needs someone to act, and says what.
     s.sync_failed(pid, &RemoteError::Unauthorized.recorded()).unwrap();
     assert!(header(&s, pid).contains("(sync failing: key rejected, "), "{}", header(&s, pid));

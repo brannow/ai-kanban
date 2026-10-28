@@ -169,7 +169,10 @@ pub fn sync_enabled() -> bool {
 pub struct SyncStatus {
     pub room: String,
     pub cursor: i64,
+    /// Changes waiting to be pushed: per field, so one new task is a dozen of them.
     pub unsent: i64,
+    /// What those changes are about, for people: (tasks, notes, board-level events).
+    pub unsent_items: (i64, i64, i64),
     pub parked: i64,
     pub last_ok_at: Option<i64>,
     /// Why the last attempt failed, until one succeeds.
@@ -368,12 +371,23 @@ impl Store {
             Err(e) => return Err(e.into()),
         };
         let unsent = self.conn.query_row("SELECT COUNT(*) FROM sync_outbox WHERE project_id = ?1", [project_id], |r| r.get(0))?;
+        // By subject: a task's fields and its history count as that task, a note's as that note.
+        let unsent_items = self.conn.query_row(
+            "SELECT COUNT(DISTINCT CASE WHEN json_extract(body, '$.subject.kind') = 'task'
+                                        THEN json_extract(body, '$.subject.origin') || ':' || json_extract(body, '$.subject.id') END),
+                    COUNT(DISTINCT CASE WHEN json_extract(body, '$.subject.kind') = 'note'
+                                        THEN json_extract(body, '$.subject.origin') || ':' || json_extract(body, '$.subject.id') END),
+                    COALESCE(SUM(json_extract(body, '$.subject') IS NULL), 0)
+               FROM sync_outbox WHERE project_id = ?1",
+            [project_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
         let parked = self.conn.query_row("SELECT COUNT(*) FROM sync_parked WHERE project_id = ?1", [project_id], |r| r.get(0))?;
         let members: Vec<Value> = serde_json::from_str(&members).unwrap_or_default();
         let members = members.iter().filter_map(|m| Some((m.get("tag")?.as_str()?.to_string(), m.get("user")?.as_str()?.to_string()))).collect();
         let claims = self.claims(project_id)?.into_iter().map(|(id, c)| (id, c.tag)).collect();
         Ok(Some(SyncStatus {
-            room, cursor, unsent, parked, last_ok_at, last_error, paused: self.paused()?, members,
+            room, cursor, unsent, unsent_items, parked, last_ok_at, last_error, paused: self.paused()?, members,
             off: !sync_enabled(), me: self.origin_tag()?, claims,
         }))
     }
