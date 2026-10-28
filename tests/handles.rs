@@ -298,3 +298,64 @@ fn a_board_that_is_not_shared_has_the_same_header_as_ever() {
     assert_eq!(header(&s, private).lines().next().unwrap(), "Board: private  (0 open)");
     assert!(!header(&s, private).contains("team") && !header(&s, private).contains("sync"));
 }
+
+// ---------------------------------------------------------------------------
+// The web page (#1065): the same naming the agent sees
+// ---------------------------------------------------------------------------
+
+async fn get_json(store: Store, uri: &str) -> serde_json::Value {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+    let (tx, _) = tokio::sync::broadcast::channel(4);
+    let api = ai_kanban::http::Api { store: std::sync::Arc::new(std::sync::Mutex::new(store)), changes: tx };
+    let res = ai_kanban::http::router(api).oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+    assert!(res.status().is_success(), "{uri}: {}", res.status());
+    serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 22).await.unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn the_web_page_gets_handles_and_qualified_text_for_a_shared_board() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    let mine = volker.store.create_task(volker.pid, TaskDraft::new("volker's own")).unwrap();
+    let theirs = volker.store.create_task(volker.pid, TaskDraft::new("needs zebracorn")).unwrap();
+    volker.store.log_on(volker.pid, Some(theirs.id), Actor::Agent, &format!("same cause as #{}", mine.id)).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    let here = task_by_title(&benny, "needs zebracorn");
+    let pid = benny.pid;
+
+    // One router over Benny's store for all three reads: the store moves into it.
+    let task = {
+        let (tx, _) = tokio::sync::broadcast::channel(4);
+        let api = ai_kanban::http::Api { store: std::sync::Arc::new(std::sync::Mutex::new(benny.store)), changes: tx };
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let mut out = vec![];
+        for uri in [format!("/api/projects/{pid}/board"), format!("/api/projects/{pid}/tasks/{}", here.id), "/api/recall?q=zebracorn".to_string()] {
+            let res = ai_kanban::http::router(api.clone()).oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap()).await.unwrap();
+            assert!(res.status().is_success(), "{uri}");
+            out.push(serde_json::from_slice::<serde_json::Value>(&axum::body::to_bytes(res.into_body(), 1 << 22).await.unwrap()).unwrap());
+        }
+        out
+    };
+    let (board, detail, recall) = (&task[0], &task[1], &task[2]);
+    assert_eq!(board["handles"][here.id.to_string()], format!("#{}-v1", theirs.id), "{}", board["handles"]);
+    let log = detail["events"].as_array().unwrap().iter().find(|e| e["kind"] == "log").unwrap();
+    assert_eq!(log["body"], format!("same cause as #{}", mine.id), "the stored text is unchanged");
+    let key = format!("event:{}", log["id"]);
+    assert_eq!(detail["texts"][&key], format!("same cause as #{}-v1", mine.id), "{}", detail["texts"]);
+    assert_eq!(recall["handles"][here.id.to_string()], format!("#{}-v1", theirs.id));
+}
+
+#[tokio::test]
+async fn a_store_that_shares_nothing_answers_the_web_page_exactly_as_before() {
+    let s = Store::open_in_memory().unwrap();
+    let pid = s.create_board("b").unwrap().id;
+    let t = s.create_task(pid, TaskDraft::new("t")).unwrap();
+    s.log_on(pid, Some(t.id), Actor::Agent, &format!("see #{}", t.id)).unwrap();
+    let board = get_json(s, &format!("/api/projects/{pid}/board")).await;
+    assert!(board.get("handles").is_none() && board.get("texts").is_none(), "{board}");
+}

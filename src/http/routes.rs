@@ -196,6 +196,36 @@ pub async fn project(State(api): State<Api>, Path(p): Path<String>) -> ApiResult
 /// Not a `BoardSnapshot`: the agent's snapshot is a capped list with an `omitted` count,
 /// which is right for something that must fit a token budget and wrong for columns you
 /// scroll.
+/// On a store with a board shared through a room: how its tasks are named (`#122-v1`), and
+/// teammates' text qualified for display (`docs/sync.md`, Identity) -- the same naming the agent
+/// sees, so a person looking up "#122-v1" on the page finds it. Added only when there is
+/// something to add, so a store that shares nothing answers exactly as before.
+///
+/// `texts` are (kind, id, raw text) whose display form may differ; each comes back under
+/// `texts["<key>"]` only when it does. The key is the caller's, so a snippet and a full body of
+/// the same event cannot overwrite each other in the page's merged map.
+fn add_handles(store: &Store, v: &mut serde_json::Value, texts: &[(&str, &str, i64, &str)]) -> Result<(), Error> {
+    let ids: Vec<(&str, i64)> = texts.iter().map(|(_, kind, id, _)| (*kind, *id)).collect();
+    let h = store.handles(&ids)?;
+    if h.tasks.is_empty() {
+        return Ok(());
+    }
+    let handles: serde_json::Map<String, serde_json::Value> =
+        h.tasks.keys().map(|id| (id.to_string(), json!(h.task(*id)))).collect();
+    v["handles"] = serde_json::Value::Object(handles);
+    let mut out = serde_json::Map::new();
+    for (key, kind, id, raw) in texts {
+        let shown = h.text(raw, h.origin_of(kind, *id));
+        if shown != *raw {
+            out.insert((*key).to_string(), json!(shown));
+        }
+    }
+    if !out.is_empty() {
+        v["texts"] = serde_json::Value::Object(out);
+    }
+    Ok(())
+}
+
 pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<Json<serde_json::Value>> {
     let store = api.store();
     let project = resolve(&store, &p)?;
@@ -241,7 +271,7 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
     let cursor = store.change_cursor()?;
     tx.commit()?;
 
-    Ok(Json(json!({
+    let mut v = json!({
         "now": crate::core::now(),
         "cursor": cursor,
         "project": project,
@@ -266,7 +296,9 @@ pub async fn board(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<J
         // nothing is scoped, so the control can offer the list without a second request.
         "workstream": current,
         "workstreams": store.all_open_workstreams(project.id)?,
-    })))
+    });
+    add_handles(&store, &mut v, &[])?;
+    Ok(Json(v))
 }
 
 // ---------------------------------------------------------------------------
@@ -369,14 +401,16 @@ pub async fn tasks(
     // 50 cards and none after -- which reads as "those tasks have no tags".
     let tags = store.tags_for(project.id, &page.items)?;
     let links = store.links_for(project.id, &page.items)?;
-    Ok(Json(json!({
+    let mut v = json!({
         "now": crate::core::now(),
         "tasks": page.items,
         "task_tags": tags.iter().map(|(id, t)| (id.to_string(), json!(t)))
             .collect::<serde_json::Map<String, serde_json::Value>>(),
         "task_links": links_json(&links),
         "next": page.next.map(encode_cursor),
-    })))
+    });
+    add_handles(&store, &mut v, &[])?;
+    Ok(Json(v))
 }
 
 pub async fn task(
@@ -386,7 +420,12 @@ pub async fn task(
     let project = resolve(&store, &p)?;
     let detail = store.task_detail(project.id, t)?;
     let version = detail.task.version;
-    Ok((etag(version), Json(json!({
+    let event_keys: Vec<String> = detail.events.iter().map(|e| format!("event:{}", e.id)).collect();
+    let task_key = format!("task:{}", detail.task.id);
+    let mut texts: Vec<(&str, &str, i64, &str)> = detail.events.iter().zip(&event_keys)
+        .map(|(e, k)| (k.as_str(), "event", e.id, e.body.as_str())).collect();
+    texts.push((task_key.as_str(), "task", detail.task.id, detail.task.body.as_str()));
+    let mut v = json!({
         "now": detail.now,
         "task": detail.task,
         // Same reason as `workstream` below: out of `TASK_COLS`, so no `Task` carries it.
@@ -406,7 +445,9 @@ pub async fn task(
             Some(w) => json!(store.workstream(project.id, w)?),
             None => serde_json::Value::Null,
         },
-    }))))
+    });
+    add_handles(&store, &mut v, &texts)?;
+    Ok((etag(version), Json(v)))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -593,7 +634,7 @@ pub async fn all_board(State(api): State<Api>) -> ApiResult<Json<serde_json::Val
     let cursor = store.change_cursor()?;
     tx.commit()?;
 
-    Ok(Json(json!({
+    let mut v = json!({
         "now": crate::core::now(),
         "cursor": cursor,
         "all": true,
@@ -606,7 +647,9 @@ pub async fn all_board(State(api): State<Api>) -> ApiResult<Json<serde_json::Val
             .collect::<Vec<_>>(),
         "task_tags": tags_json(&tags),
         "task_links": links_json(&links),
-    })))
+    });
+    add_handles(&store, &mut v, &[])?;
+    Ok(Json(v))
 }
 
 /// A further page of one All Projects column.
@@ -620,13 +663,15 @@ pub async fn all_tasks(
         q.limit.unwrap_or(PAGE).min(200),
     )?;
     let (_, tags, links) = extras_across(&store, &page.items)?;
-    Ok(Json(json!({
+    let mut v = json!({
         "now": crate::core::now(),
         "tasks": page.items,
         "task_tags": tags_json(&tags),
         "task_links": links_json(&links),
         "next": page.next.map(encode_cursor),
-    })))
+    });
+    add_handles(&store, &mut v, &[])?;
+    Ok(Json(v))
 }
 
 /// Task links keyed by task id, like `task_tags`. Only tasks with a repo or an external ref appear.
@@ -783,11 +828,18 @@ pub async fn recall(
         project_id,
         limit: p.limit.unwrap_or(20).min(100),
     })?;
-    Ok(Json(json!({
+    let keys: Vec<String> = (0..result.hits.len()).map(|i| format!("hit:{i}")).collect();
+    let texts: Vec<(&str, &str, i64, &str)> = result.hits.iter().zip(&keys).map(|(h, k)| {
+        let kind = match h.kind { HitKind::Event => "event", HitKind::Task => "task", HitKind::Note => "note" };
+        (k.as_str(), kind, h.id, h.snippet.as_str())
+    }).collect();
+    let mut v = json!({
         "now": crate::core::now(),
         "scope": result.scope,
         "hits": result.hits,
         "omitted": result.omitted,
         "available": result.available,
-    })))
+    });
+    add_handles(&store, &mut v, &texts)?;
+    Ok(Json(v))
 }

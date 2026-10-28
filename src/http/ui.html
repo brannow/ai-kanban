@@ -203,10 +203,21 @@ function fail(msg) {
   fail._t = setTimeout(() => { el.hidden = true; }, 6000);
 }
 
+// How tasks are named on boards shared through a room (#122-v1), and teammates' text as it is
+// shown, collected from every answer that carries them. Empty on a store that shares nothing,
+// and then every task is the plain #id it always was. Stored text is never rewritten: these are
+// for showing only, never for an edit field.
+const HANDLES = {};
+const TEXTS = {};
+function tref(id) { return HANDLES[id] || ('#' + id); }
+function shown(key, raw) { return Object.prototype.hasOwnProperty.call(TEXTS, key) ? TEXTS[key] : raw; }
+
 async function api(path, opts = {}) {
   const res = await fetch(path, opts);
   if (res.status === 204) return null;
   const body = await res.json().catch(() => null);
+  if (body && body.handles) Object.assign(HANDLES, body.handles);
+  if (body && body.texts) Object.assign(TEXTS, body.texts);
   if (!res.ok) {
     const e = body && body.error || {};
     let msg = e.message || `${res.status} ${res.statusText}`;
@@ -403,13 +414,13 @@ function render() {
   $('#columns').innerHTML = b.columns.map(col => {
     const cards = col.tasks.map(t => `
       <div class="card ${esc(t.task_type)}" data-id="${t.id}" data-pid="${t.project_id}">
-        <span class="t">#${t.id} ${esc(t.title)}</span>
+        <span class="t">${esc(tref(t.id))} ${esc(t.title)}</span>
         <span class="m">
           ${isAll() ? `<span class="board">${esc(boardName(t.project_id))}</span>` : ''}
           <span>${esc(t.task_type)}</span>
           ${t.priority !== 'normal' ? `<span class="pri-${esc(t.priority)}">${esc(t.priority)}</span>` : ''}
           ${t.origin === 'user' ? '<span class="badge-user">user</span>' : ''}
-          ${t.blocked_by ? `<span>blocked by #${t.blocked_by}${blockerDone(t.blocked_by) ? ' (done)' : ''}</span>` : ''}
+          ${t.blocked_by ? `<span>blocked by ${esc(tref(t.blocked_by))}${blockerDone(t.blocked_by) ? ' (done)' : ''}</span>` : ''}
           ${repoChips(t)}
           ${tagsOf(t.id).map(g => `<span class="tag">${esc(g)}</span>`).join('')}
           <span class="dim2" title="updated ${when(t.updated_at)}&#10;created ${when(t.created_at)}">upd ${ago(t.updated_at)}</span>
@@ -553,7 +564,7 @@ async function openTask(id, pid) {
   const statuses = META.statuses.map(s => s.value);
   $('#panel').innerHTML = `
     <div class="row" style="justify-content:space-between">
-      <h2>#${t.id} ${esc(t.title)}</h2>
+      <h2>${esc(tref(t.id))} ${esc(t.title)}</h2>
       <button id="close">close</button>
     </div>
     <div class="m dim2" style="font-size:11px">
@@ -585,13 +596,13 @@ async function openTask(id, pid) {
     ${body.repos && body.repos.length ? `<section><h3>repos</h3>${body.repos.map(r => `
       <div class="reporow"><b>${esc(r.name)}</b><span class="p">${esc(r.path)}</span></div>`).join('')}</section>` : ''}
 
-    ${t.body ? `<section><h3>detail</h3><pre class="body">${esc(t.body)}</pre></section>` : ''}
+    ${t.body ? `<section><h3>detail</h3><pre class="body">${esc(shown('task:' + t.id, t.body))}</pre></section>` : ''}
 
     ${body.blocker ? `<section><h3>blocked by</h3><div class="card" data-id="${body.blocker.id}">
-      <span class="t">#${body.blocker.id} ${esc(body.blocker.title)}</span></div></section>` : ''}
+      <span class="t">${esc(tref(body.blocker.id))} ${esc(body.blocker.title)}</span></div></section>` : ''}
 
     ${body.blocking.length ? `<section><h3>blocking</h3>${body.blocking.map(x =>
-      `<div class="card" data-id="${x.id}"><span class="t">#${x.id} ${esc(x.title)}</span></div>`).join('')}</section>` : ''}
+      `<div class="card" data-id="${x.id}"><span class="t">${esc(tref(x.id))} ${esc(x.title)}</span></div>`).join('')}</section>` : ''}
 
     ${body.notes.length ? `<section><h3>notes</h3>${body.notes.map(n => `
       <div class="note">
@@ -605,7 +616,7 @@ async function openTask(id, pid) {
         <span class="dim2">${ago(e.ts)}</span>
         <span class="k">${esc(e.kind)}</span>
         <span class="dim2">${esc(e.actor)}</span>
-        <div>${esc(e.body)}</div>
+        <div>${esc(shown('event:' + e.id, e.body))}</div>
       </div>`).reverse().join('') || '<div class="empty">nothing yet</div>'}
     </section>
 
@@ -723,10 +734,10 @@ async function runSearch(q) {
       <section>${body.hits.map((h, i) => `
         <div class="hit${h.task_id ? ' open' : ''}" ${h.task_id ? `data-hit="${i}"` : ''}>
           <div class="dim2" style="font-size:11px">
-            ${esc(h.kind)} · ${esc(h.project)} ${h.task_id ? `· #${h.task_id}` : ''} · ${ago(h.ts)}
+            ${esc(h.kind)} · ${esc(h.project)} ${h.task_id ? `· ${esc(tref(h.task_id))}` : ''} · ${ago(h.ts)}
           </div>
           <b>${esc(h.title)}</b>
-          <div style="margin-top:4px">${esc(h.snippet).replace(/&gt;&gt;/g, '<mark>').replace(/&lt;&lt;/g, '</mark>')}</div>
+          <div style="margin-top:4px">${esc(shown('hit:' + i, h.snippet)).replace(/&gt;&gt;/g, '<mark>').replace(/&lt;&lt;/g, '</mark>')}</div>
         </div>`).join('') || '<div class="empty">nothing found</div>'}
       </section>`;
     $('#panel').hidden = false;
