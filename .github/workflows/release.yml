@@ -54,7 +54,7 @@ jobs:
           bin=target/${{ matrix.target }}/release/ai-kanban
           AI_KANBAN_DB="$RUNNER_TEMP/check.db" "$bin" where
           file "$bin"
-          if [ "$RUNNER_OS" = Linux ]; then file "$bin" | grep -q 'statically linked'; fi
+          if [ "$RUNNER_OS" = Linux ]; then file "$bin" | grep -qE 'statically linked|static-pie linked'; fi
           mkdir -p out && cp "$bin" "out/ai-kanban-${{ matrix.build }}"
       - uses: actions/upload-artifact@v4
         with:
