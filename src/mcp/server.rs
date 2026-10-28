@@ -560,6 +560,8 @@ impl AiKanban {
             // Unguarded, deliberately -- see `TaskPatch::expected_version`.
             expected_version: None,
             actor: Actor::Agent,
+            // An agent asking for doing is taking the task on, even if it is in doing already.
+            claim: p.status.as_deref().map(str::trim).is_some_and(|s| s.eq_ignore_ascii_case("doing")),
         };
         store.update_task(resolved.project.id, task, patch).map_err(fail)?;
         let board = match &target {

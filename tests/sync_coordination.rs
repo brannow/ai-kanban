@@ -63,7 +63,7 @@ fn joining_a_teammate_on_a_doing_task_is_seen_by_the_teammate_too() {
 
     // Already in doing, so the status does not change -- but benny joining is a claim, and the
     // one already working on it is the person who most needs to hear about it.
-    benny.store.update_task(benny.pid, t.id, TaskPatch { status: Some(Status::Doing), ..patch() }).unwrap();
+    benny.store.update_task(benny.pid, t.id, TaskPatch { status: Some(Status::Doing), claim: true, ..patch() }).unwrap();
     converge(&relay, &[&benny, &volker]);
     know_the_team(&benny);
     know_the_team(&volker);
@@ -75,8 +75,40 @@ fn joining_a_teammate_on_a_doing_task_is_seen_by_the_teammate_too() {
 
     // Claiming again changes nothing: no second entry in the history.
     let before = benny.store.task_events(t.id).unwrap().len();
-    benny.store.update_task(benny.pid, t.id, TaskPatch { status: Some(Status::Doing), ..patch() }).unwrap();
+    benny.store.update_task(benny.pid, t.id, TaskPatch { status: Some(Status::Doing), claim: true, ..patch() }).unwrap();
     assert_eq!(benny.store.task_events(t.id).unwrap().len(), before);
+}
+
+#[test]
+fn saving_a_teammates_doing_task_from_a_form_is_not_a_claim() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    let t = benny.store.create_task(benny.pid, TaskDraft::new("form save")).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    let vt = task_by_title(&volker, "form save");
+    volker.store.update_task(volker.pid, vt.id, TaskPatch { status: Some(Status::Doing), claim: true, ..patch() }).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    // The web form sends every field, status included, on every save: a body edit says nothing
+    // about who is working on it.
+    benny.store.update_task(benny.pid, t.id, TaskPatch { status: Some(Status::Doing), body: Some("more detail".into()), ..patch() }).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    assert_eq!(tags(&volker, vt.id), ["v1"]);
+}
+
+#[test]
+fn joining_a_task_filed_straight_into_doing_keeps_whoever_filed_it() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    volker.store.create_task(volker.pid, TaskDraft { status: Status::Doing, ..TaskDraft::new("filed into doing") }).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    let t = task_by_title(&benny, "filed into doing");
+    benny.store.update_task(benny.pid, t.id, TaskPatch { status: Some(Status::Doing), claim: true, ..patch() }).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    let vt = task_by_title(&volker, "filed into doing");
+    assert_eq!(tags(&benny, t.id), ["v1", "b1"]);
+    assert_eq!(tags(&volker, vt.id), ["v1", "b1"]);
 }
 
 #[test]
@@ -106,7 +138,7 @@ fn leaving_doing_ends_every_claim_and_the_next_one_starts_fresh() {
     benny.store.update_task(benny.pid, t.id, TaskPatch { status: Some(Status::Doing), ..patch() }).unwrap();
     converge(&relay, &[&benny, &volker]);
     let vt = task_by_title(&volker, "round two");
-    volker.store.update_task(volker.pid, vt.id, TaskPatch { status: Some(Status::Doing), ..patch() }).unwrap();
+    volker.store.update_task(volker.pid, vt.id, TaskPatch { status: Some(Status::Doing), claim: true, ..patch() }).unwrap();
     volker.store.update_task(volker.pid, vt.id, TaskPatch { status: Some(Status::Blocked), ..patch() }).unwrap();
     volker.store.update_task(volker.pid, vt.id, TaskPatch { status: Some(Status::Doing), ..patch() }).unwrap();
     converge(&relay, &[&benny, &volker]);

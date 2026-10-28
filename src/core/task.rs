@@ -77,6 +77,11 @@ pub struct TaskPatch {
     /// worth reading six months later.
     pub log: Option<String>,
     pub actor: Actor,
+    /// The caller is taking this task on: on a shared board, a move into `doing` by someone not
+    /// already on it is recorded even when the task is in `doing` already (#1068). Explicit
+    /// rather than read off `status`, because a form sends `status` with every save, and a body
+    /// edit says nothing about who is working on it.
+    pub claim: bool,
     /// The `version` the caller read, if it read one. `Some` makes the write a
     /// compare-and-swap that fails with `Error::Conflict` rather than overwriting a change
     /// it never saw.
@@ -167,6 +172,13 @@ impl Store {
         }
         let actor = match draft.origin { Origin::User => Actor::User, Origin::Agent => Actor::Agent };
         self.write_event(project_id, Some(id), actor, "created", &draft.title)?;
+        // Filing straight into `doing` is a claim. On a shared board it is written as one, so the
+        // filer stays listed when a teammate joins later; without it, history could not tell this
+        // from "filed in backlog, moved into doing by the teammate" (#1068). Private boards keep
+        // their history as it always was.
+        if draft.status == Status::Doing && self.room_of(project_id)?.is_some() {
+            self.write_event(project_id, Some(id), actor, "status:doing", "")?;
+        }
         self.task(project_id, id)
     }
 
@@ -317,7 +329,7 @@ impl Store {
         };
         // Joining a teammate on a task already in `doing` changes no field, but it is a claim, and
         // the teammate must see it (#1068): it is written as a move into `doing` like any other.
-        let joins = patch.status == Some(Status::Doing) && before.status == Status::Doing && {
+        let joins = patch.claim && patch.status == Some(Status::Doing) && before.status == Status::Doing && {
             let me = self.origin_tag()?;
             let claimers = self.claimers(project_id, id)?;
             !claimers.is_empty() && !claimers.iter().any(|c| Some(&c.tag) == me.as_ref())

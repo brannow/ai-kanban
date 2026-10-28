@@ -551,6 +551,8 @@ pub async fn update_task(
         log: b.log.clone(),
         actor: Actor::User,
         expected_version: Some(expected),
+        // The form sends every field on every save; a save is not someone taking the task on.
+        claim: false,
     };
     let task = store.update_task(project.id, t, patch)?;
     let version = task.version;

@@ -234,7 +234,13 @@ written before the board connected, and agents that write a plain number.
   `status:doing` event is written anyway and syncs. Otherwise only the one joining would know:
   the person already working on it, who most needs to hear about it, would see nothing (#1068,
   found in a live test). Claims made in the same moment, before either side saw the other's,
-  both stay listed for the same reason: "the latest claim" would silently drop one.
+  both stay listed for the same reason: "the latest claim" would silently drop one. Filing
+  straight into `doing` on a shared board writes that event too, so the filer stays listed when
+  someone joins. Only the agent's explicit `doing` claims: the web form sends `status` with every
+  save, and editing a body is not taking the task on.
+- Known edge: "since it last left `doing`" orders events by their whole-second timestamp, so a
+  `blocked` and a `doing` from two people in the same second can be ordered differently on two
+  machines, and the claimer lists differ until the next status change. Rare; accepted.
 - **No "or move it back"** in the heads-up. The status is shared, so moving it back would take
   the task from the teammate too. There is no way to withdraw a joined claim short of a status
   change; accepted until someone needs one.

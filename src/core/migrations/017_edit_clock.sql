@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS sync_edited (
 -- has seen (sync_node moves past every received clock), so an edit made after receiving a
 -- teammate's change still wins over it even when their clock runs ahead. One millisecond per
 -- edit instead of a counter: the clock is a single number per row, and edits do not come
--- faster than that for long.
+-- faster than that for long. Rows written by applying a teammate's changes fire this too, so a
+-- large first pull runs the clock ahead by a millisecond per row: harmless, since a clock ahead
+-- only ever wins ties it would otherwise have had to break by tag.
 DROP TRIGGER IF EXISTS sync_edited_ai;
 CREATE TRIGGER sync_edited_ai AFTER INSERT ON sync_edited BEGIN
     UPDATE sync_node SET wall_ms = MAX(wall_ms + 1, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)), counter = 0 WHERE id = 1;
