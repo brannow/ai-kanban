@@ -130,7 +130,7 @@ plugin:
 	@test -n '$(HOST_BUILD)' || { echo "make: no ai-kanban build for $$(uname -s) $$(uname -m)" >&2; exit 1; }
 	@rm -rf '$(PLUGIN_DIR)'
 	@mkdir -p '$(PLUGIN_DIR)/libexec'
-	@cp -R plugin/.claude-plugin plugin/hooks plugin/bin plugin/.mcp.json '$(PLUGIN_DIR)/'
+	@cp -R plugin/.claude-plugin plugin/hooks plugin/bin plugin/skills plugin/.mcp.json '$(PLUGIN_DIR)/'
 	@if [ -n '$(PLUGIN_LINK)' ]; then \
 	  ln -s '$(PLUGIN_BIN)' '$(PLUGIN_DIR)/libexec/ai-kanban-$(HOST_BUILD)'; \
 	else \

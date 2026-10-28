@@ -37,6 +37,8 @@ USAGE:
     ai-kanban room connect <room>  Share a board through a room (--board <b>, --yes)
     ai-kanban room disconnect <room>   Uncouple it again
     ai-kanban room status | sync   What each shared board last did; sync them now
+    ai-kanban install-cli --link L Link this command into ~/.local/bin (what /ai-kanban:install-cli
+                                   runs; --dir <d>, --replace)
     ai-kanban --help
 
 Everything you have recorded lives in one SQLite file outside version control. Keep it
@@ -83,6 +85,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Sharing boards through a relay (docs/sync.md). A person's commands, never the agent's.
         Some("remote") => ai_kanban::remote::cli::remote_cmd(),
         Some("room") => ai_kanban::remote::cli::room_cmd(),
+        #[cfg(unix)]
+        Some("install-cli") => install_cli(),
         Some("serve") => {
             // Loopback only, and no flag to change that: the store is global and there is no
             // auth. See `http::serve`.
@@ -398,11 +402,51 @@ async fn run_mcp() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Keeps the link `install-cli` points the terminal at on this binary, so the command in a
+    // user's PATH follows plugin updates. Only under the plugin, and never at the session's cost.
+    #[cfg(unix)]
+    if let (Some(data), Ok(exe)) = (std::env::var_os("CLAUDE_PLUGIN_DATA"), std::env::current_exe()) {
+        if let Err(e) = ai_kanban::install_cli::refresh_stable_link(std::path::Path::new(&data), &exe) {
+            eprintln!("ai-kanban: could not update the terminal link in {}: {e}", std::path::Path::new(&data).display());
+        }
+    }
+
     // Shared boards sync in a background thread of this process (`remote::daemon`); nothing
     // starts unless a remote is set and this run allows sync.
     let sync = ai_kanban::remote::daemon::Syncer::start();
     let service = AiKanban::with_sync(store, sync).with_notice(notice).serve(stdio()).await?;
     service.waiting().await?;
+    Ok(())
+}
+
+/// `install-cli`: what `/ai-kanban:install-cli` runs. Touches no store.
+#[cfg(unix)]
+fn install_cli() -> Result<(), Box<dyn std::error::Error>> {
+    use ai_kanban::install_cli::{install, on_path, Installed, Refused};
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+    let link = value("--link").ok_or("usage: ai-kanban install-cli --link <plugin data>/bin/ai-kanban [--dir <dir>] [--replace]")?;
+    let dir = value("--dir").map(|d| ai_kanban::expand_home(&d)).unwrap_or_else(|| ai_kanban::expand_home("~/.local/bin"));
+    let at = dir.join("ai-kanban");
+    match install(&dir, std::path::Path::new(&link), args.iter().any(|a| a == "--replace")) {
+        Ok(Installed::Created) => println!("linked {} -> {link}", at.display()),
+        Ok(Installed::Already) => println!("already linked: {} -> {link}", at.display()),
+        Ok(Installed::Replaced) => println!("replaced what was at {} with a link to {link}", at.display()),
+        Err(Refused::NoStableLink(p)) => {
+            return Err(format!("{} does not exist yet: the plugin creates it when a Claude Code session starts. Start one, then run this again", p.display()).into());
+        }
+        Err(Refused::Occupied { at, what }) => {
+            return Err(format!("{} is already there ({what}). Run again with --replace to put the link in its place", at.display()).into());
+        }
+    }
+    println!("It follows plugin updates by itself: the plugin moves the link it points to.");
+    if !on_path(&dir, &std::env::var("PATH").unwrap_or_default()) {
+        println!(
+            "\n{} is not on your PATH, so `ai-kanban` will not be found by name yet. Add to your shell profile:\n\n  export PATH=\"{}:$PATH\"",
+            dir.display(),
+            dir.display()
+        );
+    }
     Ok(())
 }
 

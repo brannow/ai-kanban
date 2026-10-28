@@ -18,7 +18,7 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 
 mkdir -p "$stage/ai-kanban/libexec"
-cp -R "$root/plugin/.claude-plugin" "$root/plugin/hooks" "$root/plugin/bin" "$root/plugin/.mcp.json" "$root/plugin/README.md" "$stage/ai-kanban/"
+cp -R "$root/plugin/.claude-plugin" "$root/plugin/hooks" "$root/plugin/bin" "$root/plugin/skills" "$root/plugin/.mcp.json" "$root/plugin/README.md" "$stage/ai-kanban/"
 if [ -n "$version" ]; then
     awk -v v="$version" '{ print } /^  "name": "ai-kanban",$/ { print "  \"version\": \"" v "\"," }' \
         "$root/plugin/.claude-plugin/plugin.json" > "$stage/ai-kanban/.claude-plugin/plugin.json"

@@ -15,6 +15,8 @@
 pub mod core;
 pub mod hook;
 pub mod http;
+#[cfg(unix)]
+pub mod install_cli;
 pub mod mcp;
 pub mod remote;
 pub mod render;

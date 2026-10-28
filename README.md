@@ -29,10 +29,13 @@ claude plugin install ai-kanban@ai-kanban
 turn on auto-update for the `ai-kanban` marketplace under `/plugin` → Marketplaces (it is off
 by default for every marketplace that is not Anthropic's).
 
-**In your own terminal**, the plugin's binary is not on your `PATH` -- Claude Code puts it on
-the PATH of its own shell only, so Claude can run `ai-kanban room connect` for you. For
-commands you would rather not run through Claude, such as `ai-kanban remote <url> --key <key>`
-(the key would end up in the conversation), install from source as below.
+**Sharing boards with a team** (optional): enter the relay's URL and your key in the plugin's
+settings -- Claude Code asks when you enable it, or under `/plugin` → ai-kanban → Configure. The
+key is kept in your system keychain. Then ask Claude to connect a board to a room. See
+`docs/sync.md`.
+
+**In your own terminal**, the plugin's binary is not on your `PATH`: Claude Code puts it on the
+PATH of its own shell only. Run `/ai-kanban:install-cli` once to link it into `~/.local/bin`.
 
 ### From source
 

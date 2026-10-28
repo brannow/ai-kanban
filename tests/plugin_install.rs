@@ -258,3 +258,14 @@ fn the_relay_settings_reach_the_mcp_server_and_the_key_stays_secret() {
         assert_ne!(o["required"], true, "{name}: most installs are local and must be able to leave it empty");
     }
 }
+
+#[test]
+fn the_install_cli_skill_ships_and_only_runs_when_asked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugin = install(tmp.path(), &stub(tmp.path()));
+    let skill = read(&plugin, "skills/install-cli/SKILL.md");
+    // It writes into the user's PATH: the user decides when, never the model on its own.
+    assert!(skill.contains("disable-model-invocation: true"), "{skill}");
+    // Claude Code substitutes this in skill text; the Bash tool's environment does not carry it.
+    assert!(skill.contains("${CLAUDE_PLUGIN_DATA}/bin/ai-kanban"), "{skill}");
+}
