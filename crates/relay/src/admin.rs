@@ -17,13 +17,13 @@ USAGE:
         Run the relay. ADDR defaults to 127.0.0.1:7373; the container passes 0.0.0.0:7373.
         DUR is like 30m, 6h or 1d. Snapshots go to <db dir>/snapshots by default.
 
-    ai-kanban-relay user add <name>
+    ai-kanban-relay user add <name>              the user and their key, printed once
     ai-kanban-relay user list
     ai-kanban-relay user disable <name>
-    ai-kanban-relay key add <user> --tag <tag> [--label <label>]   prints the key once
+    ai-kanban-relay key add <user>               a key for the user's next machine
     ai-kanban-relay key list [user]
     ai-kanban-relay key revoke <id>
-    ai-kanban-relay key rotate <tag>             new key, same tag, old key revoked
+    ai-kanban-relay key rotate <user> [--tag T]  new key, same tag, old key revoked
     ai-kanban-relay room list
     ai-kanban-relay room delete <room> [--yes]   dry run without --yes
     ai-kanban-relay room cleanup                 remove rooms empty for 7 days now
@@ -40,7 +40,6 @@ struct Args {
     db: Option<PathBuf>,
     listen: Option<String>,
     tag: Option<String>,
-    label: Option<String>,
     snapshot_every: Option<String>,
     snapshot_dir: Option<PathBuf>,
     keep: Option<String>,
@@ -49,7 +48,7 @@ struct Args {
 
 fn args() -> Result<Args, String> {
     let mut a = Args {
-        pos: vec![], db: None, listen: None, tag: None, label: None,
+        pos: vec![], db: None, listen: None, tag: None,
         snapshot_every: None, snapshot_dir: None, keep: None, yes: false,
     };
     let mut it = std::env::args().skip(1);
@@ -59,7 +58,6 @@ fn args() -> Result<Args, String> {
             "--db" => a.db = Some(PathBuf::from(value("--db")?)),
             "--listen" => a.listen = Some(value("--listen")?),
             "--tag" => a.tag = Some(value("--tag")?),
-            "--label" => a.label = Some(value("--label")?),
             "--snapshot-every" => a.snapshot_every = Some(value("--snapshot-every")?),
             "--snapshot-dir" => a.snapshot_dir = Some(PathBuf::from(value("--snapshot-dir")?)),
             "--keep" => a.keep = Some(value("--keep")?),
@@ -166,7 +164,8 @@ fn user(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
         Some("add") => {
             let name = a.arg(2).ok_or_else(|| usage("user add <name>"))?;
             db.add_user(name)?;
-            println!("user {name} added. Give them a key: ai-kanban-relay key add {name} --tag <tag> --label <machine>");
+            let (tag, key) = db.issue_key(name)?;
+            print_key(&key, &format!("user {name} added, origin tag {tag}. Their tasks show as #N-{tag}."));
         }
         Some("list") | None => {
             let users = db.users()?;
@@ -189,15 +188,19 @@ fn user(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The key alone on stdout, so it can be piped; what it is on stderr.
+fn print_key(key: &str, what: &str) {
+    println!("{key}");
+    eprintln!("{what}\nShown once -- it cannot be recovered, only rotated. On their machine: ai-kanban remote <url> --key <key>");
+}
+
 fn key(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let db = a.open()?;
     match a.arg(1) {
         Some("add") => {
-            let user = a.arg(2).ok_or_else(|| usage("key add <user> --tag <tag> [--label <label>]"))?;
-            let tag = a.tag.as_deref().ok_or_else(|| usage("key add <user> --tag <tag> [--label <label>]"))?;
-            let key = db.add_key(user, tag, a.label.as_deref().unwrap_or(""))?;
-            println!("{key}");
-            eprintln!("key for {user}, origin tag {tag}. Shown once -- it cannot be recovered, only rotated.");
+            let user = a.arg(2).ok_or_else(|| usage("key add <user>"))?;
+            let (tag, key) = db.issue_key(user)?;
+            print_key(&key, &format!("a key for another of {user}'s machines, origin tag {tag}. Every machine needs its own."));
         }
         Some("list") | None => {
             for k in db.keys(a.arg(2))? {
@@ -205,7 +208,7 @@ fn key(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     Some(_) => "revoked".to_string(),
                     None => format!("last used {}", ago(k.last_used_at)),
                 };
-                println!("{:>4}  {:<12} {:<8} {:<16} {}", k.id, k.user, k.tag, k.label, state);
+                println!("{:>4}  {:<16} {:<8} {}", k.id, k.user, k.tag, state);
             }
         }
         Some("revoke") => {
@@ -214,10 +217,17 @@ fn key(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
             println!("key {id} revoked.");
         }
         Some("rotate") => {
-            let tag = a.arg(2).ok_or_else(|| usage("key rotate <tag>"))?;
-            let key = db.rotate_key(tag)?;
-            println!("{key}");
-            eprintln!("new key for tag {tag}; the previous one is revoked. Shown once.");
+            let user = a.arg(2).ok_or_else(|| usage("key rotate <user> [--tag <tag>]"))?;
+            let tags = db.tags_of(user)?;
+            let tag = match (a.tag.as_deref(), tags.as_slice()) {
+                (Some(t), _) if tags.iter().any(|x| x == t) => t.to_string(),
+                (Some(t), _) => return Err(format!("{user} has no tag {t}; theirs: {}", tags.join(", ")).into()),
+                (None, [only]) => only.clone(),
+                (None, []) => return Err(format!("{user} has no key yet: ai-kanban-relay key add {user}").into()),
+                (None, _) => return Err(format!("{user} has one key per machine ({}); say which: --tag <tag>", tags.join(", ")).into()),
+            };
+            let key = db.rotate_key(&tag)?;
+            print_key(&key, &format!("new key for {user}, tag {tag}; the previous one is revoked."));
         }
         Some(other) => return Err(format!("unknown key command {other:?}").into()),
     }

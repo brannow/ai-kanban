@@ -38,7 +38,7 @@ impl HttpRelay {
     }
 
     pub fn key(&self, user: &str, tag: &str) -> String {
-        self.admin().add_key(user, tag, "").unwrap()
+        self.admin().add_key(user, tag).unwrap()
     }
 
     pub fn stop(&mut self) {

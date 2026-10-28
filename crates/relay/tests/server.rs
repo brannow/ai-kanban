@@ -19,8 +19,8 @@ fn fixture() -> Fixture {
     let db = ServerDb::open_in_memory().unwrap();
     db.add_user("benny").unwrap();
     db.add_user("volker").unwrap();
-    let benny = db.add_key("benny", "b1", "laptop").unwrap();
-    let volker = db.add_key("volker", "v1", "laptop").unwrap();
+    let benny = db.add_key("benny", "b1").unwrap();
+    let volker = db.add_key("volker", "v1").unwrap();
     Fixture { relay: Relay::new(db), benny, volker }
 }
 
@@ -108,10 +108,10 @@ async fn tags_are_validated_reserved_and_never_reused() {
     let db = ServerDb::open_in_memory().unwrap();
     db.add_user("benny").unwrap();
     db.add_user("volker").unwrap();
-    assert!(db.add_key("benny", "b-1", "").is_err(), "'-' would break handle parsing");
-    assert!(db.add_key("benny", "srv", "").is_err(), "the server's own tag");
-    db.add_key("benny", "b1", "").unwrap();
-    let err = db.add_key("volker", "b1", "").unwrap_err().to_string();
+    assert!(db.add_key("benny", "b-1").is_err(), "'-' would break handle parsing");
+    assert!(db.add_key("benny", "srv").is_err(), "the server's own tag");
+    db.add_key("benny", "b1").unwrap();
+    let err = db.add_key("volker", "b1").unwrap_err().to_string();
     assert!(err.contains("already belongs to benny"), "{err}");
 }
 
@@ -335,7 +335,7 @@ async fn the_event_stream_announces_changes_made_by_another_process() {
     let (key, relay) = {
         let db = ServerDb::open(&path).unwrap();
         db.add_user("benny").unwrap();
-        let key = db.add_key("benny", "b1", "").unwrap();
+        let key = db.add_key("benny", "b1").unwrap();
         (key, Relay::new(db))
     };
     let p = relay.db.lock().unwrap().authenticate(&key).unwrap();
@@ -380,7 +380,7 @@ async fn the_event_stream_ends_when_its_key_is_revoked() {
     let (key, relay) = {
         let db = ServerDb::open(&path).unwrap();
         db.add_user("benny").unwrap();
-        let key = db.add_key("benny", "b1", "").unwrap();
+        let key = db.add_key("benny", "b1").unwrap();
         (key, Relay::new(db))
     };
     let p = relay.db.lock().unwrap().authenticate(&key).unwrap();
@@ -425,7 +425,7 @@ async fn the_event_stream_ends_when_its_key_is_revoked() {
 fn db_with_benny() -> (ServerDb, String) {
     let db = ServerDb::open_in_memory().unwrap();
     db.add_user("benny").unwrap();
-    let key = db.add_key("benny", "b1", "").unwrap();
+    let key = db.add_key("benny", "b1").unwrap();
     (db, key)
 }
 
@@ -436,7 +436,7 @@ fn admin_commands_refuse_what_does_not_exist_or_already_happened() {
     for bad in ["", "Benny", "a b", "-x"] {
         assert!(db.add_user(bad).is_err(), "user name {bad:?}");
     }
-    assert!(db.add_key("nobody", "n1", "").unwrap_err().to_string().contains("no user"));
+    assert!(db.add_key("nobody", "n1").unwrap_err().to_string().contains("no user"));
     assert!(db.rotate_key("zz").unwrap_err().to_string().contains("no tag"));
 
     let key_id = db.keys(Some("benny")).unwrap()[0].id;
@@ -448,13 +448,32 @@ fn admin_commands_refuse_what_does_not_exist_or_already_happened() {
 }
 
 #[test]
-fn a_key_lists_its_user_tag_label_and_state() {
+fn a_key_lists_its_user_tag_and_state() {
     let (db, key) = db_with_benny();
     db.authenticate(&key).unwrap();
     let k = &db.keys(None).unwrap()[0];
     assert_eq!((k.user.as_str(), k.tag.as_str(), k.revoked_at), ("benny", "b1", None));
     assert!(k.last_used_at.is_some(), "authenticating records when the key was last seen");
     assert_eq!(db.users().unwrap()[0].tags, ["b1"]);
+}
+
+#[test]
+fn issued_keys_pick_the_tag_one_per_machine_and_never_reuse_one() {
+    let db = ServerDb::open_in_memory().unwrap();
+    for u in ["volker", "vera", "42bot"] {
+        db.add_user(u).unwrap();
+    }
+    let (t1, k1) = db.issue_key("volker").unwrap();
+    let (t2, _) = db.issue_key("vera").unwrap();
+    let (t3, _) = db.issue_key("volker").unwrap();
+    assert_eq!((t1.as_str(), t2.as_str(), t3.as_str()), ("v1", "v2", "v3"), "initial, then the lowest free number");
+    assert_eq!(db.tags_of("volker").unwrap(), ["v1", "v3"]);
+    assert_eq!(db.issue_key("42bot").unwrap().0, "u1", "a name that starts with no letter still gets a valid tag");
+    assert_eq!(db.authenticate(&k1).unwrap().tag, "v1");
+    // A revoked tag stays taken: handles published under it outlive its keys.
+    db.revoke_key(db.keys(Some("volker")).unwrap()[0].id).unwrap();
+    assert_eq!(db.issue_key("vera").unwrap().0, "v4");
+    assert!(db.issue_key("nobody").is_err());
 }
 
 #[tokio::test]

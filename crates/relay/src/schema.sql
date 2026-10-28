@@ -24,6 +24,7 @@ CREATE TABLE tags (
 CREATE TABLE keys (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     tag          TEXT    NOT NULL REFERENCES tags(tag),
+    -- Unused since keys are no longer labelled; kept so existing databases need no migration.
     label        TEXT    NOT NULL DEFAULT '',
     hash         TEXT    NOT NULL UNIQUE,
     created_at   INTEGER NOT NULL,

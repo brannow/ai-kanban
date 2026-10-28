@@ -153,7 +153,7 @@ fn connecting_publishes_what_the_board_already_holds() {
     s.create_note(pid, NoteDraft { task_id: Some(t.id), paths: vec!["src/a.rs".into()], ..NoteDraft::new("existing note") }, Actor::Agent).unwrap();
     s.log(pid, Actor::Agent, "an old decision").unwrap();
     s.connect_board(pid, ROOM).unwrap();
-    let key = relay.add_key("benny", "b1", "").unwrap();
+    let key = relay.add_key("benny", "b1").unwrap();
     let benny = Member { store: s, pid, p: relay.authenticate(&key).unwrap() };
     relay.join(ROOM, &benny.p).unwrap();
     sync(&relay, &benny);
@@ -346,7 +346,7 @@ fn any_order_of_the_same_changes_gives_the_same_board() {
     assert_eq!(state(&volker.store, volker.pid), expected);
 
     let log = relay.pull(ROOM, &benny.p, 0, 1000).unwrap().changes;
-    let key = relay.add_key("carla", "c1", "").unwrap();
+    let key = relay.add_key("carla", "c1").unwrap();
     let carla_p = relay.authenticate(&key).unwrap();
     for seed in 1..=25u64 {
         let mut order = log.clone();

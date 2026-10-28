@@ -26,7 +26,7 @@ pub fn relay() -> ServerDb {
 
 /// A member whose board `board` is connected to the room, with an origin tag issued by `relay`.
 pub fn member(relay: &ServerDb, user: &str, tag: &str, board: &str) -> Member {
-    let key = relay.add_key(user, tag, "").unwrap();
+    let key = relay.add_key(user, tag).unwrap();
     let p = relay.authenticate(&key).unwrap();
     relay.join(ROOM, &p).unwrap();
     let store = Store::open_in_memory().unwrap();

@@ -2,8 +2,7 @@
 #
 #   docker build -t ai-kanban-relay .
 #   docker run -d --name kanban -v kanban-data:/data -p 7373:7373 ai-kanban-relay
-#   docker exec kanban ai-kanban-relay user add benny
-#   docker exec kanban ai-kanban-relay key add benny --tag b1 --label laptop
+#   docker exec kanban ai-kanban-relay user add benny     # prints benny's key once
 #
 # TLS belongs to the reverse proxy in front of it. Behind nginx, the event stream needs
 # `proxy_buffering off;` or notifications arrive in bursts.

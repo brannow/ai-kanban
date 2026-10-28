@@ -64,7 +64,6 @@ pub struct KeyRow {
     pub id: i64,
     pub user: String,
     pub tag: String,
-    pub label: String,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
     pub revoked_at: Option<i64>,
@@ -226,13 +225,44 @@ impl ServerDb {
             .ok_or_else(|| ServerError::NotFound(format!("no user {name}")))
     }
 
+    /// A key for one more of `user`'s machines, under the next free tag: their initial and the
+    /// lowest unused number (`volker` gets `v1`, then `v2` for a second machine). Returns the
+    /// tag and the key.
+    ///
+    /// Picked rather than asked for: the admin had to invent a tag per key and gained nothing by
+    /// it. One tag per machine stays, because a store's task numbers are its own -- two machines
+    /// under one tag would both publish `#1-v1`.
+    pub fn issue_key(&self, user: &str) -> Result<(String, String)> {
+        self.user_id(user)?;
+        let initial = user.chars().next().filter(char::is_ascii_lowercase).unwrap_or('u');
+        let mut n = 1;
+        let tag = loop {
+            let tag = format!("{initial}{n}");
+            let taken: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM tags WHERE tag = ?1)", [&tag], |r| r.get(0))?;
+            if !taken {
+                break tag;
+            }
+            n += 1;
+        };
+        let key = self.add_key(user, &tag)?;
+        Ok((tag, key))
+    }
+
+    /// The tags `user` holds, oldest first: one per machine.
+    pub fn tags_of(&self, user: &str) -> Result<Vec<String>> {
+        let uid = self.user_id(user)?;
+        let mut st = self.conn.prepare("SELECT tag FROM tags WHERE user_id = ?1 ORDER BY created_at, tag")?;
+        let tags = st.query_map([uid], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(tags)
+    }
+
     /// Issues a key under a new origin tag and returns it. The plain key exists only in this
     /// return value; the database keeps its hash.
     ///
     /// A tag belongs to one user forever, even after its keys are revoked: tasks published as
     /// `#122-v1` keep that handle, and handing `v1` to someone else later would make their new
     /// tasks collide with it.
-    pub fn add_key(&self, user: &str, tag: &str, label: &str) -> Result<String> {
+    pub fn add_key(&self, user: &str, tag: &str) -> Result<String> {
         let uid = self.user_id(user)?;
         if !protocol::valid_tag(tag) {
             return Err(ServerError::BadRequest(format!(
@@ -253,10 +283,7 @@ impl ServerDb {
         }
         tx.execute("INSERT INTO tags (tag, user_id, created_at) VALUES (?1, ?2, ?3)", params![tag, uid, now()])?;
         let key = new_key()?;
-        tx.execute(
-            "INSERT INTO keys (tag, label, hash, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![tag, label, hash_key(&key), now()],
-        )?;
+        tx.execute("INSERT INTO keys (tag, hash, created_at) VALUES (?1, ?2, ?3)", params![tag, hash_key(&key), now()])?;
         tx.commit()?;
         Ok(key)
     }
@@ -269,16 +296,9 @@ impl ServerDb {
         if !exists {
             return Err(ServerError::NotFound(format!("no tag {tag}")));
         }
-        let label: String = tx
-            .query_row("SELECT label FROM keys WHERE tag = ?1 ORDER BY id DESC LIMIT 1", [tag], |r| r.get(0))
-            .optional()?
-            .unwrap_or_default();
         tx.execute("UPDATE keys SET revoked_at = ?2 WHERE tag = ?1 AND revoked_at IS NULL", params![tag, now()])?;
         let key = new_key()?;
-        tx.execute(
-            "INSERT INTO keys (tag, label, hash, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![tag, label, hash_key(&key), now()],
-        )?;
+        tx.execute("INSERT INTO keys (tag, hash, created_at) VALUES (?1, ?2, ?3)", params![tag, hash_key(&key), now()])?;
         tx.commit()?;
         Ok(key)
     }
@@ -296,7 +316,7 @@ impl ServerDb {
 
     pub fn keys(&self, user: Option<&str>) -> Result<Vec<KeyRow>> {
         let mut st = self.conn.prepare(
-            "SELECT k.id, u.name, k.tag, k.label, k.created_at, k.last_used_at, k.revoked_at
+            "SELECT k.id, u.name, k.tag, k.created_at, k.last_used_at, k.revoked_at
                FROM keys k JOIN tags t ON t.tag = k.tag JOIN users u ON u.id = t.user_id
               WHERE ?1 IS NULL OR u.name = ?1
               ORDER BY u.name, k.tag, k.id",
@@ -306,10 +326,9 @@ impl ServerDb {
                 id: r.get(0)?,
                 user: r.get(1)?,
                 tag: r.get(2)?,
-                label: r.get(3)?,
-                created_at: r.get(4)?,
-                last_used_at: r.get(5)?,
-                revoked_at: r.get(6)?,
+                created_at: r.get(3)?,
+                last_used_at: r.get(4)?,
+                revoked_at: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -559,7 +578,8 @@ impl ServerDb {
                 Some(_) => {
                     return Err(ServerError::Conflict(format!(
                         "change id {} was already used for different content. This store looks restored \
-                         from a backup or copied: it needs a new tag (`ai-kanban-relay key add`)",
+                         from a backup or copied, or a second machine sharing one key: it needs a key of its own \
+                         (`ai-kanban-relay key add <user>`)",
                         ch.cid
                     )));
                 }

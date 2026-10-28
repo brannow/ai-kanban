@@ -218,8 +218,12 @@ written before the board connected, and agents that write a plain number.
 ## People, not sessions
 
 - The server derives the **author** from the key. A client never sends it. One **user**, many keys:
-  **one key per machine**, labelled (`benny/laptop`). R7 needs nothing more. Both machines'
-  boards join the same room, and both appear as "benny".
+  **one key per machine**, each under its own origin tag, which the relay picks (`v1`, then `v2`).
+  R7 needs nothing more. Both machines' boards join the same room, and both appear as "volker".
+  One key per machine is not bookkeeping: a store's task numbers are its own, so two machines
+  under one tag would both publish `#1-v1`. A copied key is caught (see "Pauses") before it
+  publishes anything. Keys carry no label: the tag already tells machines apart, and a label
+  solved nothing anyone had (decided 2026-10-28).
 - Agent sessions stay local. `events.actor` (`user | agent | system`) is unchanged.
 - "Who is on it" = everyone who moved it into `doing` since it last left `doing` (the origin tags
   of those `status:doing` events, earliest first), or the creator of a task filed straight into
@@ -382,8 +386,10 @@ Sync stops for the whole store, never local work, when continuing would corrupt 
 - the key belongs to a different origin tag than the store publishes under;
 - **the relay already holds higher ids from this tag than the store would hand out next** -- a
   store restored from a backup, or copied. Its next tasks would reuse numbers the room holds.
-  The way out: `ai-kanban room disconnect <room> --keep-foreign`, a key with a new tag from the
-  relay admin, `ai-kanban remote <url> --key <new key>`, then `ai-kanban room connect` again. Work
+  A second machine using a copied key looks exactly the same, and is caught the same way.
+  The way out: `ai-kanban room disconnect <room> --keep-foreign`, a key of its own from the
+  relay admin (`key add <user>`), `ai-kanban remote <url> --key <new key>`, then
+  `ai-kanban room connect` again. Work
   published under the old tag stays the store's own (`sync_own_tags`).
 
 A good check lifts the pause by itself; `ai-kanban remote` and `ai-kanban room status` show it.
@@ -422,9 +428,9 @@ proxy. It has its own router with bearer auth on every route; `serve`'s loopback
 stay for `serve`.
 
 ```
-ai-kanban-relay user add volker
-ai-kanban-relay key add volker --label laptop --tag v1   # prints the key once
-ai-kanban-relay key list | revoke <id> | rotate <tag>
+ai-kanban-relay user add volker                       # the user, tag v1 and a key, printed once
+ai-kanban-relay key add volker                        # a second machine: tag v2, its own key
+ai-kanban-relay key list | revoke <id> | rotate <user> [--tag v2]
 ai-kanban-relay room list | delete <room>               # rooms are created by connecting
 ai-kanban-relay forget <room> <handle>                 # the only forget in a room
 ai-kanban-relay snapshot                              # also scheduled: --snapshot-every 6h --keep 28
@@ -456,7 +462,7 @@ ai-kanban-relay snapshot                              # also scheduled: --snapsh
   (`#812-b1` twice in a room) and outbox seqs (new changes dropped as "retries"). So the server
   tracks, per tag, the highest outbox seq and the highest origin id per kind it has accepted.
   `whoami` returns them, and a client whose local counters are lower **stops syncing** and asks
-  for a new tag. As a second net, a `cid` that arrives again with different content is refused.
+  for a key of its own (a new tag). As a second net, a `cid` that arrives again with different content is refused.
 - **Bind:** `--listen` defaults to `127.0.0.1:7373`. The container passes `0.0.0.0:7373`. `hello`
   is the only route without a key.
 - **SSE notifications come from polling** `MAX(seq)` per room, not from the push handler, for the
@@ -472,12 +478,14 @@ The image is built by `Dockerfile` and published by `.github/workflows/relay-ima
 ```
 docker run -d --name kanban --restart unless-stopped \
   -v kanban-data:/data -p 127.0.0.1:7373:7373 ghcr.io/<owner>/ai-kanban-relay:latest
-docker exec kanban ai-kanban-relay user add benny
-docker exec kanban ai-kanban-relay key add benny --tag b1 --label laptop   # prints the key once
+docker exec kanban ai-kanban-relay user add benny   # prints benny's key once (tag b1)
 ```
 
 - **Runs as non-root** (distroless, uid 65532) and owns `/data`. A bind mount instead of a named
-  volume must be writable by that uid.
+  volume must be writable by that uid, or the container runs as the folder's owner instead
+  (compose: `user: "1000:1000"`). Otherwise it stops at once with `unable to open database file`.
+  Found on the first real deployment. Docker Desktop on macOS maps ownership differently and does
+  not reproduce it, so test this on the Linux host.
 - **Snapshots** every 6h into `/data/snapshots`, the newest 28 kept. That is the same volume, so
   copy the volume off the host as well.
 - **TLS goes on the proxy.** Publish the port on loopback only, as above, and let nginx (or

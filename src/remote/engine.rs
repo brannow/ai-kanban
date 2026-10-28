@@ -50,9 +50,11 @@ pub fn check_identity(store: &Store, client: &Client) -> Result<(), RemoteError>
     let hw = &who.high_water;
     if local.outbox < hw.outbox || local.task < hw.task || local.note < hw.note || local.event < hw.event {
         let why = format!(
-            "this store is behind what the relay already has from {tag} (restored from a backup, or copied?), so \
-             its next tasks would reuse numbers the room holds. Disconnect its boards (`ai-kanban room disconnect`), \
-             ask the relay admin for a key with a new tag, run `ai-kanban remote <url> --key <new key>`, then connect again",
+            "this store is behind what the relay already has from {tag}, so its next tasks would reuse numbers the \
+             room holds. Either this key is in use on another machine (every machine needs its own), or the store was \
+             restored from a backup. Disconnect its boards (`ai-kanban room disconnect`), ask the relay admin for a \
+             key of its own (`ai-kanban-relay key add <user>`), run `ai-kanban remote <url> --key <new key>`, then \
+             connect again",
             tag = who.tag
         );
         pause(store, &why);
