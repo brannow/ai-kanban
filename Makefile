@@ -1,14 +1,17 @@
-# ai-kanban -- build and install.
+# ai-kanban -- build and install from a checkout.
 #
-# Two things get installed, and they are separate on purpose:
+# Most people do not need this: the plugin installs from its marketplace, binary included
+# (README, "Install"). This is for building from source and for working on ai-kanban.
 #
-#   1. the binary        -> $(BINDIR), somewhere your shell can find it
-#   2. the plugin config -> $(CLAUDE_DIR)/skills/ai-kanban, so Claude Code loads it
+# Two things get installed:
 #
-# The plugin config is GENERATED, not copied, with the binary's absolute path baked in.
-# See plugin/README.md for why -- briefly: a copied config cannot know where the binary
-# went, and the previous answer was a 60-line shell script that searched six directories at
-# session start to rediscover what the installer already knew.
+#   1. the binary        -> $(BINDIR), so `ai-kanban` runs in your terminal
+#   2. the plugin        -> $(CLAUDE_DIR)/skills/ai-kanban, so Claude Code loads it
+#
+# The plugin is `plugin/` copied as it is, with the binary placed in its `libexec/`. Its
+# configs name the binary through ${CLAUDE_PLUGIN_ROOT}, and plugin/bin/ai-kanban picks the
+# build for the machine -- the same layout the release zip has, so what you install from here
+# is what users install. See plugin/README.md.
 
 PREFIX     ?= $(HOME)/.local
 BINDIR     ?= $(PREFIX)/bin
@@ -39,10 +42,21 @@ endif
 
 BIN         = $(BINDIR)/ai-kanban
 BUILT       = target/release/ai-kanban
-# The path baked into the generated config. `install` points it at the installed copy;
-# `install-dev` overrides it to the checkout, so a global install cannot shadow the build
-# you are testing.
+# The build name plugin/bin/ai-kanban looks for on this machine. The same mapping as in that
+# script; tests/plugin_install.rs installs through here and runs the wrapper, so the two
+# cannot drift apart unnoticed.
+HOST_OS   := $(shell uname -s)-$(shell uname -m)
+ifeq ($(HOST_OS),Darwin-arm64)
+HOST_BUILD := macos-arm64
+else ifneq ($(filter Linux-x86_64 Linux-amd64,$(HOST_OS)),)
+HOST_BUILD := linux-x86_64
+else ifneq ($(filter Linux-aarch64 Linux-arm64,$(HOST_OS)),)
+HOST_BUILD := linux-arm64
+endif
+# What goes into the plugin's libexec/: the installed binary for `install`, a link to this
+# checkout's build for `install-dev`, so a global install cannot shadow the build you test.
 PLUGIN_BIN ?= $(BIN)
+PLUGIN_LINK ?=
 
 .DEFAULT_GOAL := help
 .PHONY: help build test smoke install install-dev plugin uninstall where
@@ -50,8 +64,8 @@ PLUGIN_BIN ?= $(BIN)
 help:
 	@echo 'ai-kanban'
 	@echo
-	@echo '  make install       build, install the binary, generate the plugin'
-	@echo '  make install-dev   plugin only, pointed at this checkout (for working on ai-kanban)'
+	@echo '  make install       build, install the binary and the plugin'
+	@echo '  make install-dev   plugin only, running the build in this checkout (for working on ai-kanban)'
 	@echo '  make uninstall     remove the plugin and the installed binary'
 	@echo '  make where         show every path this Makefile would touch'
 	@echo '  make build/test    cargo build --release / cargo test'
@@ -66,7 +80,7 @@ help:
 where:
 	@echo 'binary      $(BIN)'
 	@echo 'plugin      $(PLUGIN_DIR)'
-	@echo 'baked path  $(PLUGIN_BIN)'
+	@echo 'build       ai-kanban-$(HOST_BUILD), from $(PLUGIN_BIN)'
 	@echo 'store       '`$(BUILT) where 2>/dev/null || echo '(build first)'`
 
 build:
@@ -95,7 +109,7 @@ install: build
 	@case ':$(PATH):' in *':$(BINDIR):'*) ;; *) \
 	  echo; \
 	  echo "  NOTE: $(BINDIR) is not on your PATH, so \`ai-kanban\` will not run in your"; \
-	  echo '        terminal. The plugin still works -- it uses the absolute path above.' ;; \
+	  echo '        terminal. The plugin still works -- it carries its own copy.' ;; \
 	esac
 	@echo
 	@echo 'Restart Claude Code to pick it up.'
@@ -103,17 +117,25 @@ install: build
 # The plugin without touching the binary, pointed at this checkout. What you want while
 # working on ai-kanban: `cargo build --release` then reload, with no reinstall step.
 install-dev: build
-	@$(MAKE) --no-print-directory plugin PLUGIN_BIN='$(CURDIR)/$(BUILT)'
-	@echo 'Plugin installed at $(PLUGIN_DIR), pointed at $(CURDIR)/$(BUILT)'
+	@$(MAKE) --no-print-directory plugin PLUGIN_BIN='$(CURDIR)/$(BUILT)' PLUGIN_LINK=1
+#	The same link inside the checkout, for `claude --plugin-dir ./plugin`.
+	@mkdir -p plugin/libexec
+	@ln -sfn '$(CURDIR)/$(BUILT)' 'plugin/libexec/ai-kanban-$(HOST_BUILD)'
+	@echo 'Plugin installed at $(PLUGIN_DIR), running $(CURDIR)/$(BUILT)'
+	@echo 'Note: a copy installed from the marketplace takes precedence over this one.'
 
-# Render the templates. Separated from `install` so `install-dev` can reuse it with a
-# different PLUGIN_BIN rather than duplicating the substitution.
+# Copy the plugin and put the binary where its wrapper looks. Separated from `install` so
+# `install-dev` can reuse it with a link instead of a copy.
 plugin:
-	@mkdir -p '$(PLUGIN_DIR)/.claude-plugin'
-	@cp plugin/plugin.json '$(PLUGIN_DIR)/.claude-plugin/plugin.json'
-#	`|` as the sed delimiter: the substitution is a filesystem path and will contain slashes.
-	@sed 's|@BIN@|$(PLUGIN_BIN)|g' plugin/hooks.json.in > '$(PLUGIN_DIR)/hooks.json'
-	@sed 's|@BIN@|$(PLUGIN_BIN)|g' plugin/mcp.json.in   > '$(PLUGIN_DIR)/mcp.json'
+	@test -n '$(HOST_BUILD)' || { echo "make: no ai-kanban build for $$(uname -s) $$(uname -m)" >&2; exit 1; }
+	@rm -rf '$(PLUGIN_DIR)'
+	@mkdir -p '$(PLUGIN_DIR)/libexec'
+	@cp -R plugin/.claude-plugin plugin/hooks plugin/bin plugin/.mcp.json '$(PLUGIN_DIR)/'
+	@if [ -n '$(PLUGIN_LINK)' ]; then \
+	  ln -s '$(PLUGIN_BIN)' '$(PLUGIN_DIR)/libexec/ai-kanban-$(HOST_BUILD)'; \
+	else \
+	  install -m 755 '$(PLUGIN_BIN)' '$(PLUGIN_DIR)/libexec/ai-kanban-$(HOST_BUILD)'; \
+	fi
 
 uninstall:
 	rm -rf '$(PLUGIN_DIR)'

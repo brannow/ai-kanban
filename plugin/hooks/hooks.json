@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ -x \"@BIN@\" ] && \"@BIN@\" hook session-start || true",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/ai-kanban\" hook session-start 2>/dev/null || true",
             "timeout": 5
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ -x \"@BIN@\" ] && \"@BIN@\" hook post-tool-use || true",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/ai-kanban\" hook post-tool-use 2>/dev/null || true",
             "timeout": 5
           }
         ]

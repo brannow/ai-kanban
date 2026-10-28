@@ -1,0 +1,87 @@
+# Builds the plugin zip users install from the marketplace (.claude-plugin/marketplace.json):
+# plugin/ plus one ai-kanban binary per platform, packed by scripts/package-plugin.sh.
+#
+#   tag v1.2.3         -> release v1.2.3. The marketplace points at releases/latest, so this is
+#                         what users get on their next update.
+#   run it by hand     -> pre-release rc-<run>, to try a build before tagging. `latest` skips
+#                         pre-releases, so no user receives it, and the relay image workflow
+#                         (tags v*) does not fire.
+#
+# Each binary builds on a native runner. Linux builds are static (musl), so one binary runs on
+# every distribution; one built against the runner's glibc would refuse older ones.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    container: rust:1.99-trixie
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --locked --workspace
+
+  build:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - build: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - build: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - build: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain the relay image and the tests use, not whatever the runner preinstalls.
+      - run: |
+          rustup toolchain install 1.99 --profile minimal --target ${{ matrix.target }}
+          rustup default 1.99
+      # rusqlite and ring compile C; for a static binary that has to be against musl.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked -p ai-kanban --target ${{ matrix.target }}
+      - name: The binary runs, and a Linux one is static
+        run: |
+          bin=target/${{ matrix.target }}/release/ai-kanban
+          AI_KANBAN_DB="$RUNNER_TEMP/check.db" "$bin" where
+          file "$bin"
+          if [ "$RUNNER_OS" = Linux ]; then file "$bin" | grep -q 'statically linked'; fi
+          mkdir -p out && cp "$bin" "out/ai-kanban-${{ matrix.build }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-kanban-${{ matrix.build }}
+          path: out/ai-kanban-${{ matrix.build }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: bins
+          merge-multiple: true
+      # A release's zip carries the tag's version; a test build's version is its digest.
+      - run: scripts/package-plugin.sh dist/ai-kanban-plugin.zip bins "$(test "$GITHUB_REF_TYPE" = tag && echo "${GITHUB_REF_NAME#v}")"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            gh release create "$GITHUB_REF_NAME" dist/ai-kanban-plugin.zip --verify-tag --generate-notes
+          else
+            gh release create "rc-${GITHUB_RUN_NUMBER}" dist/ai-kanban-plugin.zip --prerelease \
+              --target "$GITHUB_SHA" --title "rc-${GITHUB_RUN_NUMBER} (test build of ${GITHUB_SHA::7})" \
+              --notes "Not a release. Try it with: claude --plugin-dir <downloaded zip>"
+          fi

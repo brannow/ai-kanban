@@ -160,27 +160,22 @@ The honest signals:
 
 ## Installing
 
-```sh
-make install
+From the plugin marketplace this repository is (`.claude-plugin/marketplace.json`):
+
+```
+/plugin install ai-kanban --marketplace brannow/ai-kanban
 ```
 
-That builds the binary, installs it to `$(PREFIX)/bin`, and **generates** the plugin into
-`$(CLAUDE_DIR)/skills/ai-kanban/` with the binary's absolute path baked in. `CLAUDE_DIR`
-defaults to `~/.claude`; pass `CLAUDE_DIR=~/.claude-private` for a non-default Claude
-configuration directory.
+The marketplace entry is an `archive` source: the release zip, built by
+`.github/workflows/release.yml` with `scripts/package-plugin.sh`. It holds `plugin/` as it is
+plus one binary per platform in `libexec/`. `make install` installs the same layout from a
+checkout into `$(CLAUDE_DIR)/skills/ai-kanban/`, which loads as a skills-dir plugin; a
+marketplace copy takes precedence over it.
 
-A directory under `<claude-dir>/skills/` containing a `.claude-plugin/plugin.json` loads as
-a skills-dir plugin (`reference/skills.md:150`). Installed under the user's Claude directory
-it applies to every project with no trust dialog; dropped into a repo's own
-`.claude/skills/`, it applies to that repo and asks once.
+### How the plugin finds its binary
 
-Discovery happens at session start, so it does not appear in `claude plugin list` until the
-next session.
-
-### Why the config is generated rather than checked in
-
-**A plugin is installed by being copied, and a copied config cannot know where the binary
-went.** That single fact drove three designs, and the first two were wrong:
+**A plugin is installed by being copied, so its config must name the binary relative to where
+the copy lands.** That single fact drove four designs:
 
 1. **Hard-coded relative path.** Both configs named
    `${CLAUDE_PLUGIN_ROOT}/../../../target/release/ai-kanban`, which resolves only when the
@@ -188,52 +183,55 @@ went.** That single fact drove three designs, and the first two were wrong:
    caught it, because every path resolves correctly *here* and here is the only place it was
    ever run.
 2. **A resolver script.** `bin/ai-kanban` searched `$AI_KANBAN_BIN`, a surrounding checkout,
-   `~/.local/bin`, `~/.cargo/bin`, the Homebrew and `/usr/local` directories, then `PATH` —
+   `~/.local/bin`, `~/.cargo/bin`, the Homebrew and `/usr/local` directories, then `PATH` --
    with a guard against re-exec'ing itself. Sixty lines reconstructing at session start what
-   the installer already knew, and a list that silently had to be kept in sync with whatever
-   the README told people to do.
-3. **Generation at install time.** The path is known exactly once — when someone installs —
-   so that is where it gets written down.
+   the installer already knew.
+3. **Generation at install time.** `make install` baked the binary's absolute path into the
+   config. Right for a source install, but it cannot be distributed: a marketplace copies
+   files, and no file can know an absolute path on someone else's machine.
+4. **The binary inside the plugin** (current, 2026-10-28). The configs name
+   `${CLAUDE_PLUGIN_ROOT}/bin/ai-kanban`, and that wrapper runs
+   `../libexec/ai-kanban-<os>-<arch>` -- the one build for this machine, at a path fixed
+   *relative to the wrapper itself*. Design 1 failed because its path pointed outside the
+   plugin; this one never leaves it. Design 2 failed because it searched; this one has one
+   path and no fallback. The release zip, `make install` and `make install-dev` all produce
+   that layout, so there is one plugin, not one per way of installing it.
 
-The third removes the search, the script, and the `AI_KANBAN_BIN` escape hatch that existed
-only to patch the search. It also moves the failure: `make install` runs the binary before
-writing any config, so a broken install fails **loudly, at install time, in front of the
-person doing it**, instead of silently at session start.
+The wrapper is not design 2 coming back: it chooses between builds, never between places.
+Read `plugin/bin/ai-kanban` before replacing it -- it is twenty lines for that reason.
 
-The trade is real and worth stating: a baked absolute path breaks if the binary is moved
-afterwards. The fix is to re-run `make install`. That is better than a search silently
-picking a different binary than the one intended — which is the failure mode the checkout
-ordering in the old resolver existed to prevent, and which `make install-dev` now handles
-explicitly instead.
+### What the config still has to protect
 
-### What the generated config still has to protect
+The hooks run the wrapper as `"${CLAUDE_PLUGIN_ROOT}/bin/ai-kanban" hook … 2>/dev/null ||
+true`. **A hook that complains on every session start is a hook the user removes**, taking the
+bundled MCP server with it -- so a missing binary or an unsupported machine leaves the hooks
+quiet rather than erroring.
 
-`hooks.json` guards each command with `[ -x "<bin>" ] && … || true`. **A hook that complains
-on every session start is a hook the user removes**, taking the bundled MCP server with it —
-so if the binary is later moved, the hooks go quiet rather than erroring.
-
-`mcp.json` deliberately does **not** guard, and the asymmetry is the point: an MCP server
+`.mcp.json` deliberately does **not** guard, and the asymmetry is the point: an MCP server
 that dies in silence is a board that is mysteriously absent, which is harder to diagnose
-than a startup error.
+than a startup error. The wrapper names the machine it has no build for.
 
 The same risk arrives by a second route that is easy to miss, because nothing breaks. The
-plugin loader accepts exactly four top-level keys in `hooks.json` — `description`, `hooks`,
-`modules`, `surface` — and warns on every session start about anything else. We shipped a
+plugin loader accepts exactly four top-level keys in `hooks.json` -- `description`, `hooks`,
+`modules`, `surface` -- and warns on every session start about anything else. We shipped a
 `"_comment"` key and warned for weeks. The hooks ran fine; the plugin was merely noisy, and
 noisy is what gets uninstalled. `claude plugin validate` does **not** catch it, so the guard
-is an allowlist assertion in `tests/plugin_install.rs`. See note #94 and `plugin/README.md`,
-which holds the full reasoning.
+is an allowlist assertion in `tests/plugin_install.rs`. See note #94.
+
+The manifest sets no `version`. A pinned version wins over the archive's digest, so every
+release would look like the last one and no user would be offered an update.
 
 ### Testing it
 
-Note #15's rule survives the redesign, because the reason for it does: *any test of the
+Note #15's rule survives every redesign, because the reason for it does: *any test of the
 plugin's own configuration must exercise an installed copy, never the working tree.* A test
 that runs the plugin in place asserts the one configuration that was never in doubt.
 
-`tests/plugin_install.rs` renders the templates into a temporary directory with `make
-plugin`, then asserts the output names an absolute path, mentions neither
-`CLAUDE_PLUGIN_ROOT` nor a `..` hop, runs from `/`, and goes silent when the binary is
-removed.
+`tests/plugin_install.rs` installs with `make plugin` into a temporary directory and runs each
+entry point the way the host does: `${CLAUDE_PLUGIN_ROOT}` substituted, from `/`, with a bare
+`PATH` and an empty `HOME`. A release zip can be checked the same way before it is published:
+`claude --plugin-dir ai-kanban-plugin.zip` (verified 2026-10-28: the zip keeps the exec bits,
+and both the briefing and the MCP tools come up).
 
 ## `instructions` — the channel that needs no hook
 

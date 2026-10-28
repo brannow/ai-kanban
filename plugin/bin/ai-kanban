@@ -1,0 +1,22 @@
+#!/bin/sh
+# Runs the ai-kanban build for this machine, which sits next to this script in ../libexec.
+#
+# This is not a search. The release zip, `make install` and `make install-dev` all put the
+# binaries at exactly that place, so there is one path to try and nothing to fall back to. The
+# script that went before it looked in six places and shipped broken for four days (note #15);
+# see plugin/README.md.
+#
+# No output on success and no writes, ever: the hooks run this in every directory Claude Code
+# is opened in. An unsupported machine gets one line on stderr and exit 1 -- the hooks discard
+# it, and the MCP server should fail loudly.
+here=$(cd "$(dirname "$0")/.." && pwd) || exit 1
+case "$(uname -s)-$(uname -m)" in
+    Darwin-arm64) build=macos-arm64 ;;
+    Linux-x86_64 | Linux-amd64) build=linux-x86_64 ;;
+    Linux-aarch64 | Linux-arm64) build=linux-arm64 ;;
+    *)
+        echo "ai-kanban: no build for $(uname -s) $(uname -m) (there are macos-arm64, linux-x86_64, linux-arm64)" >&2
+        exit 1
+        ;;
+esac
+exec "$here/libexec/ai-kanban-$build" "$@"

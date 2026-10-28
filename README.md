@@ -8,47 +8,77 @@ without being asked.
 
 ## Install
 
+In Claude Code:
+
+```
+/plugin install ai-kanban --marketplace brannow/ai-kanban
+```
+
+Restart Claude Code. That is the whole setup: the plugin brings its own binary, built for
+Apple silicon Macs and for Linux on x86_64 and arm64 (statically linked, so any distribution).
+Nothing to compile, no Rust needed.
+
+The same from a shell, in two steps:
+
 ```sh
-git clone <this repo> && cd ai-kanban
+claude plugin marketplace add brannow/ai-kanban
+claude plugin install ai-kanban@ai-kanban
+```
+
+**Updates** arrive with `claude plugin update ai-kanban@ai-kanban`, or by themselves once you
+turn on auto-update for the `ai-kanban` marketplace under `/plugin` → Marketplaces (it is off
+by default for every marketplace that is not Anthropic's).
+
+**In your own terminal**, the plugin's binary is not on your `PATH` -- Claude Code puts it on
+the PATH of its own shell only, so Claude can run `ai-kanban room connect` for you. For
+commands you would rather not run through Claude, such as `ai-kanban remote <url> --key <key>`
+(the key would end up in the conversation), install from source as below.
+
+### From source
+
+```sh
+git clone https://github.com/brannow/ai-kanban && cd ai-kanban
 make install
 ```
 
-Restart Claude Code. That is the whole setup.
-
-`make install` builds the binary, puts it in `~/.local/bin`, and generates the Claude Code
-plugin with that path baked in. It checks the binary runs before writing anything, so a
-broken install fails here rather than silently at session start.
+`make install` builds the binary, puts it in `~/.local/bin` for your terminal, and installs
+the plugin -- the same files the release ships, with the binary placed inside. It checks the
+binary runs before writing anything, so a broken install fails here rather than silently at
+session start. A copy installed from the marketplace takes precedence over this one.
 
 ### Choosing where things go
 
 ```sh
-make where                                  # every path it would touch
-make install PREFIX=/usr/local              # binary -> /usr/local/bin (may need sudo)
-make install CLAUDE_DIR=~/.claude-private   # plugin -> a different Claude config directory
+make where                                        # every path it would touch
+make install PREFIX=/usr/local                    # binary -> /usr/local/bin (may need sudo)
+make install CLAUDE_DIR=$HOME/.claude-private     # plugin -> a different Claude config directory
 ```
 
 `CLAUDE_DIR` is for anyone who keeps Claude Code's configuration somewhere other than
 `~/.claude`. It must match the `CLAUDE_CONFIG_DIR` your Claude Code actually uses, or the
-plugin lands where nothing looks for it.
+plugin lands where nothing looks for it. Write `$HOME`, not `~`: make does not expand `~`.
 
 Pick a `PREFIX` **your shell already knows about**, so you can also run `ai-kanban backup`
-yourself — `make install` warns if the one you chose is not on your `PATH`. The plugin works
-either way, because it uses the absolute path rather than searching.
+yourself -- `make install` warns if the one you chose is not on your `PATH`. The plugin works
+either way, because it carries its own copy.
 
 ```sh
 echo $PATH | tr ':' '\n'     # what yours actually is
 ```
 
-`/usr/bin` is not an option on macOS — it is protected and unwritable.
+`/usr/bin` is not an option on macOS -- it is protected and unwritable.
 
 ### Working on ai-kanban itself
 
 ```sh
-make install-dev     # plugin only, pointed at ./target/release
+make install-dev     # plugin installed, running ./target/release/ai-kanban through a link
 ```
 
-Then `cargo build --release` and reload, with no reinstall step. Without this a global
-install would silently shadow the build you are testing.
+Then `cargo build --release` and reload, with no reinstall step. Or skip the install and
+start a session with `claude --plugin-dir ./plugin`. Either way the plugin is the same
+directory the release zip is built from, so what you test is what ships. Uninstall a
+marketplace copy first (`claude plugin uninstall ai-kanban@ai-kanban`): it would take
+precedence and you would be testing the release, not your build.
 
 ### Check it worked
 

@@ -1,2 +1,5 @@
 /target
 .DS_Store
+# Binaries for the plugin wrapper: the release zip, `make install` and `make install-dev` put them here.
+/plugin/libexec/
+/dist/

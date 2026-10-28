@@ -74,7 +74,7 @@ cargo test --workspace          # the whole suite: client, protocol, relay
 cargo test --test budget -- --nocapture   # prints measured token costs
 cargo build --release           # the plugin's hook and MCP configs both point at this
 AI_KANBAN_DB=/tmp/x.db ./target/release/ai-kanban serve   # web UI on :7373
-make install-dev                # plugin pointed at this checkout, so a global install
+make install-dev                # plugin running this checkout's build, so a global install
                                 # cannot shadow the build you are testing
 make where                      # every path an install would touch
 cargo run -p ai-kanban-relay -- --db /tmp/r.db   # the sync relay (docs/sync.md)
