@@ -264,6 +264,13 @@ impl Store {
         Ok(self.conn.query_row("SELECT room FROM sync_rooms WHERE project_id = ?1", [project_id], |r| r.get(0)).optional()?)
     }
 
+    /// The room a board is connected to and how far into it this store has pulled.
+    pub fn room_cursor(&self, project_id: i64) -> Result<Option<(String, i64)>> {
+        Ok(self.conn
+            .query_row("SELECT room, cursor FROM sync_rooms WHERE project_id = ?1", [project_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+    }
+
     pub fn board_of_room(&self, room: &str) -> Result<Option<i64>> {
         Ok(self.conn.query_row("SELECT project_id FROM sync_rooms WHERE room = ?1", [room], |r| r.get(0)).optional()?)
     }

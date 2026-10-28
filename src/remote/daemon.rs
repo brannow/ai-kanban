@@ -12,9 +12,10 @@ use super::client::{Client, RemoteError};
 use super::config::{self, RemoteConfig};
 use super::engine::{check_identity, sync_board, sync_board_within};
 use crate::core::Store;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// The backstop interval: what a session without working notifications still gets.
 const EVERY: Duration = Duration::from_secs(60);
@@ -25,10 +26,18 @@ const SETTLE: Duration = Duration::from_millis(300);
 /// agent about this much at most, and the claim goes through regardless.
 const CLAIM_BUDGET: Duration = Duration::from_millis(2500);
 const CLAIM_REQUEST: Duration = Duration::from_millis(1200);
+/// How long a stream counts as live after the last thing it sent. The relay sends a heartbeat
+/// every 30s, so a stream silent for longer than this is dead even if the socket has not noticed.
+const LIVE_FOR: Duration = Duration::from_secs(40);
+
+/// What each room's notification stream last said: the head it announced, and when it last
+/// sent anything at all. An entry exists only while its stream is connected.
+type Live = Arc<Mutex<HashMap<String, (i64, Instant)>>>;
 
 pub struct Syncer {
     kick: Sender<()>,
     claim: Client,
+    live: Live,
 }
 
 impl Syncer {
@@ -42,6 +51,8 @@ impl Syncer {
         let (tx, rx) = channel::<()>();
         let background = Client::new(&cfg.url, &cfg.key, Duration::from_secs(30));
         let notify = tx.clone();
+        let live: Live = Arc::default();
+        let watching = live.clone();
         std::thread::Builder::new()
             .name("ai-kanban-sync".into())
             .spawn(move || {
@@ -51,7 +62,7 @@ impl Syncer {
                 let mut watched = HashSet::new();
                 let mut backoff = EVERY;
                 loop {
-                    let healthy = round(&store, &background, &mut watched, &notify);
+                    let healthy = round(&store, &background, &mut watched, &notify, &watching);
                     // A store that cannot sync (offline, paused) is checked less and less often,
                     // up to every five minutes, instead of hammering a relay that is not there.
                     backoff = if healthy { EVERY } else { (backoff * 2).min(Duration::from_secs(300)) };
@@ -66,7 +77,7 @@ impl Syncer {
                 }
             })
             .ok()?;
-        Some(Syncer { kick: tx, claim: Client::new(&cfg.url, &cfg.key, CLAIM_REQUEST) })
+        Some(Syncer { kick: tx, claim: Client::new(&cfg.url, &cfg.key, CLAIM_REQUEST), live })
     }
 
     /// Something was written: publish it soon.
@@ -78,16 +89,28 @@ impl Syncer {
     /// files a task -- so what it sees is current, not as of the last minute. Failures are
     /// recorded for the header and otherwise ignored: the claim must never fail because the
     /// relay is unreachable.
+    ///
+    /// Skipped when the room's stream is live and everything it announced is already pulled:
+    /// the local copy is then as current as a round would make it, and the round would only
+    /// cost the agent two trips to the relay (0.6s from across the world). What this misses is a
+    /// teammate's change from the last moment before the relay announces it, about two seconds.
     pub fn now(&self, store: &Store, project_id: i64) {
-        if store.room_of(project_id).ok().flatten().is_some() && store.paused().ok().flatten().is_none() {
-            let _ = sync_board_within(store, &self.claim, project_id, CLAIM_BUDGET);
+        let Some((room, cursor)) = store.room_cursor(project_id).ok().flatten() else { return };
+        if store.paused().ok().flatten().is_some() || self.current(&room, cursor) {
+            return;
         }
+        let _ = sync_board_within(store, &self.claim, project_id, CLAIM_BUDGET);
+    }
+
+    fn current(&self, room: &str, cursor: i64) -> bool {
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        live.get(room).is_some_and(|(head, seen)| seen.elapsed() < LIVE_FOR && cursor >= *head)
     }
 }
 
 /// One background round over every connected board. Returns whether the relay was reachable and
 /// sync is allowed.
-fn round(store: &Store, client: &Client, watched: &mut HashSet<String>, notify: &Sender<()>) -> bool {
+fn round(store: &Store, client: &Client, watched: &mut HashSet<String>, notify: &Sender<()>, live: &Live) -> bool {
     let boards = store.connected_boards().unwrap_or_default();
     if boards.is_empty() {
         return true;
@@ -111,7 +134,7 @@ fn round(store: &Store, client: &Client, watched: &mut HashSet<String>, notify: 
             ok = false;
         }
         if watched.insert(room.clone()) {
-            watch(client.clone(), room, notify.clone());
+            watch(client.clone(), room, notify.clone(), live.clone());
         }
     }
     ok
@@ -119,16 +142,31 @@ fn round(store: &Store, client: &Client, watched: &mut HashSet<String>, notify: 
 
 /// Follows one room's notification stream for the life of the process, reconnecting with
 /// backoff, and turns every announced head into a round.
-fn watch(client: Client, room: String, notify: Sender<()>) {
+fn watch(client: Client, room: String, notify: Sender<()>, live: Live) {
     let _ = std::thread::Builder::new().name(format!("ai-kanban-watch-{room}")).spawn(move || {
         let mut backoff = Duration::from_secs(5);
         loop {
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             let mut alive = true;
-            let _ = client.watch(&room, |_| {
-                alive = notify.send(()).is_ok();
+            let _ = client.watch(&room, |head| {
+                let mut l = live.lock().unwrap_or_else(|e| e.into_inner());
+                match head {
+                    Some(h) => {
+                        l.insert(room.clone(), (h, Instant::now()));
+                        alive = notify.send(()).is_ok();
+                    }
+                    // A heartbeat: still connected. Before the first head there is nothing to
+                    // vouch for yet.
+                    None => {
+                        if let Some(e) = l.get_mut(&room) {
+                            e.1 = Instant::now();
+                        }
+                    }
+                }
                 alive
             });
+            // Disconnected: until it is back, a claim catches up the slow way.
+            live.lock().unwrap_or_else(|e| e.into_inner()).remove(&room);
             if !alive {
                 return;
             }

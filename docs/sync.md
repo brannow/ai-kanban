@@ -233,7 +233,13 @@ written before the board connected, and agents that write a plain number.
 - **Claiming what someone else has in `doing`** still goes through (a warning, not a lock: two
   people on one task can be deliberate), but the answer leads with `Heads-up: volker has had
   #12-v1 in doing since 20m ago. You are both on it now -- check with volker before starting.`
-  The catch-up round just before it makes that current.
+  The catch-up round just before it makes that current, and it is skipped when it would add
+  nothing: while the room's notification stream is live (it spoke within 40s; the relay sends a
+  heartbeat every 30s) and everything it announced is already pulled, the local copy is as
+  current as a round would make it. Measured from far away (280ms to the relay), that took
+  `task_add` and claims from 0.6s to 0.01s. Without a live stream, or with an announced change
+  not yet pulled, the bounded round runs as before. What neither catches is a teammate's claim
+  from the last second or so, before their session has pushed it; #1068 then shows both names.
 - **Joining is recorded as a claim.** The status is already `doing`, so no field changes, but a
   `status:doing` event is written anyway and syncs. Otherwise only the one joining would know:
   the person already working on it, who most needs to hear about it, would see nothing (#1068,

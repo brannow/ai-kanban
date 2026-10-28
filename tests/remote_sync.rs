@@ -185,7 +185,7 @@ fn the_notification_stream_announces_a_teammates_push() {
     let watcher = volker.client.clone();
     let seen = std::thread::spawn(move || {
         let mut heads = vec![];
-        let _ = watcher.watch("sbahn", |h| { heads.push(h); heads.len() < 2 });
+        let _ = watcher.watch("sbahn", |h| { heads.extend(h); heads.len() < 2 });
         heads
     });
     std::thread::sleep(Duration::from_millis(300));

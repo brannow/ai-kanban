@@ -127,10 +127,11 @@ impl Client {
         read(res)
     }
 
-    /// Reads a room's notification stream, calling `on_head` with each head the relay
-    /// announces, until the stream ends, goes quiet for longer than its heartbeat, or `on_head`
-    /// returns false. Reconnecting is the caller's business.
-    pub fn watch(&self, room: &str, mut on_head: impl FnMut(i64) -> bool) -> Result<(), RemoteError> {
+    /// Reads a room's notification stream, calling `on_line` with each head the relay announces
+    /// and with `None` for anything else it sends (the heartbeat among it, so the caller can tell
+    /// a live stream from a dead one), until the stream ends, goes quiet for longer than its
+    /// heartbeat, or `on_line` returns false. Reconnecting is the caller's business.
+    pub fn watch(&self, room: &str, mut on_line: impl FnMut(Option<i64>) -> bool) -> Result<(), RemoteError> {
         use std::io::BufRead;
         // No overall timeout -- the stream is meant to stay open -- but a read timeout above the
         // relay's 30s heartbeat, so a dead connection is noticed instead of waited on forever.
@@ -147,10 +148,9 @@ impl Client {
         let reader = std::io::BufReader::new(res.into_body().into_reader());
         for line in reader.lines() {
             let line = line.map_err(|e| RemoteError::Offline(e.to_string()))?;
-            if let Some(head) = line.strip_prefix("data:").and_then(|d| d.trim().parse::<i64>().ok()) {
-                if !on_head(head) {
-                    return Ok(());
-                }
+            let head = line.strip_prefix("data:").and_then(|d| d.trim().parse::<i64>().ok());
+            if !on_line(head) {
+                return Ok(());
             }
         }
         Ok(())
