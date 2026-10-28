@@ -30,7 +30,9 @@ jobs:
       matrix:
         include:
           - build: macos-arm64
-            runner: macos-15
+            # macos-15 queued twice without getting a machine (capacity); 14 is the same
+            # Apple silicon from a less contended pool, and the target does not depend on it.
+            runner: macos-14
             target: aarch64-apple-darwin
           - build: linux-x86_64
             runner: ubuntu-24.04
