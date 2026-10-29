@@ -254,6 +254,9 @@ fn the_relay_settings_reach_the_mcp_server_and_the_key_stays_secret() {
         assert!(options.contains_key(name), "{var} names an undeclared setting {name:?}");
     }
     assert_eq!(options["relay_key"]["sensitive"], true, "the key belongs in the keychain, not in settings.json");
+    for var in ["AI_KANBAN_PLUGIN_RELAY_URL", "AI_KANBAN_PLUGIN_RELAY_KEY", "AI_KANBAN_PLUGIN_RELAY_NAME"] {
+        assert!(env.get(var).is_some(), "src/remote/config.rs reads {var}");
+    }
     for (name, o) in options {
         assert_ne!(o["required"], true, "{name}: most installs are local and must be able to leave it empty");
     }

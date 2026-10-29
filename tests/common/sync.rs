@@ -18,9 +18,6 @@ pub struct Member {
 
 pub fn relay() -> ServerDb {
     let db = ServerDb::open_in_memory().unwrap();
-    for u in ["benny", "volker", "carla"] {
-        db.add_user(u).unwrap();
-    }
     db
 }
 

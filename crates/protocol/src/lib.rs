@@ -179,6 +179,12 @@ pub struct Member {
     pub user: String,
 }
 
+/// `PUT /v1/me`: the name this machine goes by. The first one fixes the key's tag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetName {
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomInfo {
     pub name: String,

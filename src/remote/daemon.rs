@@ -60,9 +60,10 @@ impl Syncer {
                 // waiting on the network must not hold it.
                 let Ok(store) = Store::open_default() else { return };
                 let mut watched = HashSet::new();
+                let mut named = false;
                 let mut backoff = EVERY;
                 loop {
-                    let healthy = round(&store, &background, &mut watched, &notify, &watching);
+                    let healthy = round(&store, &background, &mut watched, &mut named, &notify, &watching);
                     // A store that cannot sync (offline, paused) is checked less and less often,
                     // up to every five minutes, instead of hammering a relay that is not there.
                     backoff = if healthy { EVERY } else { (backoff * 2).min(Duration::from_secs(300)) };
@@ -110,9 +111,16 @@ impl Syncer {
 
 /// One background round over every connected board. Returns whether the relay was reachable and
 /// sync is allowed.
-fn round(store: &Store, client: &Client, watched: &mut HashSet<String>, notify: &Sender<()>, live: &Live) -> bool {
+fn round(store: &Store, client: &Client, watched: &mut HashSet<String>, named: &mut bool, notify: &Sender<()>, live: &Live) -> bool {
     let boards = store.connected_boards().unwrap_or_default();
     if boards.is_empty() {
+        // Nothing to sync yet, but a name from the plugin's settings has to reach the relay
+        // before anything else does: the first `room connect` runs in a shell that does not
+        // have the setting, and a key used without a name fixes its tag from a generated one.
+        // Until the relay has had it once; the rounds with boards send it every time.
+        if !*named && config::wanted_name().is_some() {
+            *named = check_identity(store, client).is_ok();
+        }
         return true;
     }
     // Local and cheap, so first: even when the relay is unreachable, pending writes become

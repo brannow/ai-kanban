@@ -22,15 +22,14 @@ usage() {
 $prog -- the ai-kanban relay in this directory
 
 The container:
-    $prog                          status: container, health, users, rooms
+    $prog                          status: container, health, keys, rooms
     $prog logs [-f]                the last 100 log lines (-f: follow)
     $prog update                   pull the image and restart on it (debug stays as it was)
     $prog restart
     $prog debug on|off             log all traffic, bodies included; watch: logs -f
     $prog backup                   a snapshot now, into data/snapshots
 
-    $prog invite <name>            = user add <name>: a new user, and a message to send them
-    $prog invite <name> --machine  = key add <name>: a key for their next machine
+    $prog invite <label>           = key add <label>: a key for someone, and a message to send them
 
 EOF
 	if [ -n "$(docker compose ps -q --status running "$SERVICE" 2>/dev/null)" ]; then
@@ -84,8 +83,8 @@ status() {
 	echo "url:    $(url)"
 	if debugging; then echo "debug:  ON -- every request is logged, bodies included ($prog debug off)"; fi
 	echo
-	echo "users:"
-	relay user list
+	echo "keys:"
+	relay key list
 	echo
 	echo "rooms:"
 	relay room list
@@ -96,9 +95,10 @@ status() {
 case "${1:-status}" in
 	status) status ;;
 	invite)
-		[ -n "${2:-}" ] || { echo "usage: $prog invite <name> [--machine]" >&2; exit 2; }
+		shift
+		[ $# -gt 0 ] || { echo "usage: $prog invite <label>   (who it is for, like: volker laptop)" >&2; exit 2; }
 		running
-		if [ "${3:-}" = "--machine" ]; then relay key add "$2"; else relay user add "$2"; fi
+		relay key add "$@"
 		;;
 	logs)
 		shift
@@ -125,7 +125,7 @@ case "${1:-status}" in
 		ls -lt data/snapshots | head -n 4
 		echo "data/ is what to copy off this host."
 		;;
-	user | key | room | forget | snapshot | health)
+	key | room | forget | snapshot | health)
 		running
 		relay "$@"
 		;;

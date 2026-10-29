@@ -18,7 +18,7 @@ fn public_url() -> String {
 
 const RULE: &str = "----------------------------------------------------------------------";
 
-pub const TOPICS: &[&str] = &["user", "key", "room", "forget", "snapshot", "health"];
+pub const TOPICS: &[&str] = &["key", "room", "forget", "snapshot", "health"];
 
 /// The overview: every command, one line each.
 pub fn overview() -> String {
@@ -43,14 +43,12 @@ Run it:
         "\
 ai-kanban relay -- administration
 
-{run}People and keys:
-    {p} user add <name>              a new user and their key, with a message to send them
-    {p} user list
-    {p} user disable <name>          their keys stop working; their work stays
-    {p} key add <user>               a key for the user's next machine (one per machine)
-    {p} key list [user]
-    {p} key rotate <user> [--tag T]  replace a lost or leaked key
-    {p} key revoke <id>
+{run}Keys -- one per machine; people name themselves:
+    {p} key add <label>              a key for someone, with a message to send them
+    {p} key list
+    {p} key rotate <tag|id>          replace a lost or leaked key
+    {p} key revoke <tag|id>
+    {p} key label <tag|id> <label>
 
 Rooms:
     {p} room list
@@ -73,52 +71,41 @@ Each in detail, with examples:  {p} help <{topics}>
 pub fn page(topic: &str) -> Option<String> {
     let p = prog();
     let text = match topic {
-        "user" => format!(
-            "\
-{p} user -- the people who share boards
-
-    {p} user add <name>
-        A new user and their first key. Prints a message to send them: how to install
-        ai-kanban, the relay's URL and their key. The key is shown only then; lost, it can
-        only be replaced (key rotate). Their tag is picked for them -- their initial and the
-        lowest free number, volker -> v1 -- and their tasks show as #N-v1.
-
-    {p} user list
-        Every user and their tags, one tag per machine.
-
-    {p} user disable <name>
-        Their keys stop working at once. What they published stays in the rooms.
-
-Examples:
-    {p} user add volker
-    {p} key add volker            a key for volker's second machine
-"
-        ),
         "key" => format!(
             "\
 {p} key -- one key per machine
 
+The relay hands out keys; people name themselves. A key is given out with a label -- your
+note of who has it, which the team never sees -- and gets its tag the first time it is used:
+from the name its user picks, or a generated one like brave-otter. They can change the name
+any time; the tag stays, and with it the handles of everything they published (#12-v1).
+Names may repeat: the tag tells two people apart. A name is what someone says they are
+called; the tag and your label are what you can rely on.
+
 Every machine needs a key of its own: task numbers are counted per machine, and two
-machines on one key would hand out the same ones. Each key belongs to a tag (v1, v2, ...).
+machines on one key would hand out the same ones.
 
-    {p} key add <user>
-        A key for the user's next machine, with the next free tag. Prints a message to send
-        them.
+    {p} key add <label>
+        A new key, labelled with who it is for. Prints a message to send them.
 
-    {p} key list [user]
-        Every key: id, user, tag, and when it was last used.
+    {p} key list
+        Every key: id, tag, the name its user chose, your label, and when it was last used.
 
-    {p} key rotate <user> [--tag T]
-        For a lost or leaked key: a new key for the same tag, and the old one stops working
-        at once. Prints a message to send them with what to do on that machine. --tag picks
-        the machine when the user has several.
+    {p} key rotate <tag|id>
+        For a lost or leaked key: a new key with the same tag, name and label, and the old
+        one stops working at once. Prints a message to send them.
 
-    {p} key revoke <id>
-        Stop a key for good (the id from key list). Its tag is not given out again.
+    {p} key revoke <tag|id>
+        Stop a key for good. Its tag is not given out again.
+
+    {p} key label <tag|id> <label>
+        Change your label for a key.
+
+A key not used yet has no tag; name it by its id, from key list.
 
 Examples:
-    {p} key rotate volker              volker has one machine
-    {p} key rotate volker --tag v2     the second of several
+    {p} key add volker laptop
+    {p} key rotate v1
     {p} key revoke 3
 "
         ),
@@ -201,15 +188,15 @@ mod tests {
     }
 }
 
-/// Said after `user add` and `key add`: the message for the person, ready to send.
-pub fn welcome(what: &str, user: &str, key: &str) -> String {
+/// Said after `key add`: the message for whoever the key is for, ready to send.
+pub fn welcome(id: i64, label: &str, key: &str) -> String {
     let (p, url) = (prog(), public_url());
     format!(
         "\
-{what}
+Key {id} issued for \"{label}\" (the label is only for you).
 
-Send this to {user}. The key is shown only this once; lost, it can only be replaced
-({p} key rotate {user}).
+Send this to them. The key is shown only this once; lost, it can only be replaced
+({p} key rotate {id}).
 {RULE}
 ai-kanban: team relay
 
@@ -220,6 +207,8 @@ ai-kanban: team relay
 2. Enter in its settings (asked on install, or /plugin -> ai-kanban -> Configure):
      Team relay URL   {url}
      Team relay key   {key}
+     Your name        how the team sees you. Optional: left empty you get one like
+                      brave-otter, and you can change it any time.
 
    One key per machine. For another machine, ask for a new one.
 
@@ -233,17 +222,18 @@ ai-kanban: team relay
 /// Said after `key rotate`. The machine keeps its own remote over the plugin's settings
 /// (src/remote/config.rs), so the new key has to be set on the machine, and the settings
 /// changed as well, or every session reports the two disagreeing.
-pub fn rotated(user: &str, tag: &str, key: &str) -> String {
+pub fn rotated(label: &str, tag: Option<&str>, key: &str) -> String {
     let url = public_url();
+    let which = tag.map(|t| format!(" (tag {t})")).unwrap_or_default();
     format!(
         "\
-New key for {user}, tag {tag}. The old key stopped working just now.
+New key for \"{label}\"{which}. The old key stopped working just now; tag and name stay.
 
-Send this to {user}. The key is shown only this once.
+Send this to them. The key is shown only this once.
 {RULE}
 ai-kanban: your team relay key was replaced
 
-On the machine that used it (tag {tag}):
+On the machine that used it{which}:
 
 1. Ask Claude to run this (or run it in a terminal, after /ai-kanban:install-cli):
      ai-kanban remote {url} --key {key}

@@ -85,7 +85,7 @@ fn a_revoked_key_fails_the_round_with_a_clear_reason_and_local_work_goes_on() {
     let relay = HttpRelay::start();
     let benny = machine(&relay, "benny", "b1", "sbb");
     sync_board(&benny.store, &benny.client, benny.pid).unwrap();
-    let key = relay.admin().keys(Some("benny")).unwrap()[0].id;
+    let key = relay.admin().key_id("b1").unwrap();
     relay.admin().revoke_key(key).unwrap();
 
     benny.store.create_task(benny.pid, TaskDraft::new("still works")).unwrap();

@@ -180,7 +180,7 @@ fn header(snap: &BoardSnapshot) -> String {
     // never have to guess what it is looking at. A board silently showing a subset is the
     // confusion this feature was built to fix, so it would be perverse to reintroduce it.
     let title = match &snap.workstream {
-        Some(w) => format!("{} / {}", snap.project.name, w.name),
+        Some(w) => format!("{} / {}", snap.project.name, one_line(&w.name)),
         None => snap.project.name.clone(),
     };
     let room = snap.sync.as_ref().map(|s| format!(" @{}", s.room)).unwrap_or_default();
@@ -191,7 +191,7 @@ fn header(snap: &BoardSnapshot) -> String {
 
     if !snap.other_workstreams.is_empty() {
         let shown = snap.other_workstreams.iter().take(DIRECTORY_LIMIT)
-            .map(|w| format!("{} {}", w.workstream.name, w.open))
+            .map(|w| format!("{} {}", one_line(&w.workstream.name), w.open))
             .collect::<Vec<_>>().join(", ");
         let rest = snap.other_workstreams.len().saturating_sub(DIRECTORY_LIMIT);
         let more = if rest > 0 { format!(", +{rest} more") } else { String::new() };
@@ -379,7 +379,7 @@ fn reason(body: &str) -> String {
 pub fn task_detail(d: &TaskDetail) -> String {
     let t = &d.task;
     let h = &d.handles;
-    let mut out = format!("Board: {}\n\n{} {}\n", d.project.name, h.task(t.id), t.title);
+    let mut out = format!("Board: {}\n\n{} {}\n", d.project.name, h.task(t.id), one_line(&t.title));
     let mut meta = vec![t.status.to_string(), t.task_type.to_string(), format!("{} priority", t.priority), t.origin.to_string()];
     if let Some(r) = &d.external_ref { meta.push(format!("tracks issue {r}")); }
     meta.push(format!("filed {}", since(d.now, t.created_at)));
@@ -414,7 +414,7 @@ pub fn task_detail(d: &TaskDetail) -> String {
         out.push_str(&format!("\n{}\n", h.text(&t.body, h.origin_of("task", t.id))));
     }
     if let Some(b) = &d.blocker {
-        out.push_str(&format!("\nblocked by {} {} ({})\n", h.task(b.id), b.title, b.status));
+        out.push_str(&format!("\nblocked by {} {} ({})\n", h.task(b.id), one_line(&b.title), b.status));
     } else if t.status == Status::Blocked {
         // status is authoritative; blocked_by is only annotation. Say so rather than
         // leaving the reader to wonder whether something is missing.
@@ -472,7 +472,7 @@ pub fn recall(r: &RecallResult, cross_project: bool, missing: &MissingSubjects) 
         if let Some(body) = &h.body {
             // Full mode: the text the agent asked to read, unindented and with its own line
             // breaks, because a hand-off is structured by them. The title is not cut either.
-            out.push_str(&format!("\n{kind} {:<5} {}  ({})\n", id, h.title, tail.join(", ")));
+            out.push_str(&format!("\n{kind} {:<5} {}  ({})\n", id, one_line(&h.title), tail.join(", ")));
             if !body.is_empty() {
                 out.push_str(&format!("{}\n", r.handles.text(body, origin).trim_end()));
             }
@@ -761,7 +761,7 @@ fn plural(n: usize) -> &'static str { if n == 1 { "" } else { "s" } }
 /// term no row contains, so the search for the line came back empty. A single word longer
 /// than the line is still cut hard -- there is no boundary to fall back to.
 fn truncate(s: &str, max: usize) -> String {
-    let s = s.replace('\n', " ");
+    let s = one_line(s);
     if s.chars().count() <= max { return s; }
     let chars: Vec<char> = s.chars().collect();
     let keep = max.saturating_sub(1);
@@ -772,6 +772,30 @@ fn truncate(s: &str, max: usize) -> String {
     };
     let cut: String = chars[..end].iter().collect();
     format!("{}…", cut.trim_end())
+}
+
+/// Text as it may leave for a terminal or an agent's context. Board text is stored as written --
+/// titles and descriptions hold code, and `a < b && c` must stay what it says -- so the
+/// defence is here, where it is shown: control characters other than line breaks and tabs
+/// become U+FFFD, and so do the bidi controls that make text display in another order than it
+/// reads. Without this, a teammate's title with `ESC[2J` would clear the screen of whoever runs
+/// `room show`, and `ESC]0;...` retitle their terminal. Visible rather than dropped, so that
+/// something having been there is not hidden either.
+///
+/// Applied where text leaves -- the MCP answers, the hook, the CLI -- not per field: the next
+/// field shown would be the one forgotten. HTML has its own escaping (`esc` in `ui.js`).
+pub fn safe(s: &str) -> std::borrow::Cow<'_, str> {
+    let unsafe_char = |c: char| (c.is_control() && c != '\n' && c != '\t') || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    if !s.chars().any(unsafe_char) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(s.chars().map(|c| if unsafe_char(c) { '\u{FFFD}' } else { c }).collect())
+}
+
+/// A title or a name, which is one line wherever it is shown: a line break in one would let it
+/// pass for lines of the board around it ("just now #99 -> done").
+fn one_line(s: &str) -> String {
+    s.chars().map(|c| if matches!(c, '\n' | '\r' | '\t') { ' ' } else { c }).collect()
 }
 
 /// One room in `room list`: what tells it apart from the others at a glance -- the board it

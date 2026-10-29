@@ -91,6 +91,32 @@ impl Client {
         read(res)
     }
 
+    /// Sets the name this machine goes by, and answers like `whoami`. The first call fixes the
+    /// key's tag from the name, so it has to come before any other authenticated request: the
+    /// relay gives a key used without a name a generated one.
+    pub fn set_name(&self, name: &str) -> Result<WhoAmI, RemoteError> {
+        let body = serde_json::to_vec(&crate::sync::protocol::SetName { name: name.to_string() }).map_err(|e| RemoteError::Http(0, e.to_string()))?;
+        let res = self.agent
+            .put(format!("{}/v1/me", self.url))
+            .header("authorization", self.bearer())
+            .header("content-type", "application/json")
+            .send(body)
+            .map_err(offline)?;
+        read(res)
+    }
+
+    /// `set_name` when there is a name to set, else `whoami`. A relay from before names (no
+    /// `/v1/me`) gets `whoami`, so a newer client still works with it.
+    pub fn identify(&self, name: Option<&str>) -> Result<WhoAmI, RemoteError> {
+        match name {
+            Some(n) => match self.set_name(n) {
+                Err(RemoteError::NotFound(_) | RemoteError::Http(405, _)) => self.whoami(),
+                other => other,
+            },
+            None => self.whoami(),
+        }
+    }
+
     pub fn rooms(&self) -> Result<Vec<RoomInfo>, RemoteError> {
         let res = self.agent.get(format!("{}/v1/rooms", self.url)).header("authorization", self.bearer()).call().map_err(offline)?;
         read(res)

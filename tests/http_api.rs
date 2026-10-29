@@ -256,12 +256,35 @@ async fn the_ui_is_served_from_the_binary() {
     // Embedded rather than read from disk: "one file to install" stops being true the moment
     // the UI needs its assets next to it.
     let (api, _) = api();
-    let res = router(api).oneshot(get("/")).await.unwrap();
+    let res = router(api.clone()).oneshot(get("/")).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+    let csp = res.headers()["content-security-policy"].to_str().unwrap().to_string();
     let bytes = axum::body::to_bytes(res.into_body(), 4 * 1024 * 1024).await.unwrap();
     let html = String::from_utf8_lossy(&bytes);
     assert!(html.contains("<title>ai-kanban</title>"));
-    assert!(html.contains("EventSource"), "the page must actually subscribe to live updates");
+    let res = router(api).oneshot(get("/app.js")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 4 * 1024 * 1024).await.unwrap();
+    let js = String::from_utf8_lossy(&bytes);
+    assert!(js.contains("EventSource"), "the page must actually subscribe to live updates");
+
+    // Board text is teammates' text. If an escaping mistake ever lets markup through, the
+    // policy still keeps an injected script from running: none may run inline, and the page
+    // has none to need it -- no inline <script> body and no on...= handler anywhere.
+    assert!(csp.contains("script-src 'self'") && !csp.contains("script-src 'self' 'unsafe-inline'"), "{csp}");
+    assert!(csp.contains("connect-src 'self'") && csp.contains("frame-ancestors 'none'"), "{csp}");
+    assert!(!html.contains("<script>"), "no inline script in the page");
+    let handler = regex_free_find_handler(&html).or_else(|| regex_free_find_handler(&js));
+    assert!(handler.is_none(), "an inline event handler would be blocked by the policy: {handler:?}");
+}
+
+/// ` onclick="`, ` onerror="` and the like, written into markup.
+fn regex_free_find_handler(s: &str) -> Option<String> {
+    s.match_indices(" on").find_map(|(i, _)| {
+        let rest = &s[i + 3..];
+        let name: String = rest.chars().take_while(|c| c.is_ascii_lowercase()).collect();
+        (!name.is_empty() && rest[name.len()..].starts_with("=\"")).then(|| format!("on{name}"))
+    })
 }
 
 

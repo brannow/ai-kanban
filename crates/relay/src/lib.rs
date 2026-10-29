@@ -85,6 +85,7 @@ pub fn router(relay: Relay) -> Router {
     let routes = Router::new()
         .route("/v1/hello", get(hello))
         .route("/v1/whoami", get(whoami))
+        .route("/v1/me", axum::routing::put(set_name))
         .route("/v1/rooms", get(rooms))
         .route("/v1/rooms/{room}/join", post(join))
         .route("/v1/rooms/{room}/leave", post(leave))
@@ -128,6 +129,18 @@ async fn hello() -> Json<Hello> {
 async fn whoami(State(r): State<Relay>, headers: HeaderMap) -> ApiResult<WhoAmI> {
     let p = r.auth(&headers)?;
     let high_water = r.db().high_water(&p.tag)?;
+    Ok(Json(WhoAmI { user: p.user, tag: p.tag, high_water }))
+}
+
+/// The name this key's machine goes by, set by its client. The first call fixes the key's tag
+/// from it, which is why it reads the key without `auth`: that would give an unnamed key a
+/// generated name, and its tag, first.
+async fn set_name(State(r): State<Relay>, headers: HeaderMap, Json(body): Json<protocol::SetName>) -> ApiResult<WhoAmI> {
+    let key = bearer(&headers).ok_or(ServerError::Unauthorized)?;
+    let db = r.db();
+    let (key_id, _) = db.lookup(key)?;
+    let p = db.name_key(key_id, &body.name)?;
+    let high_water = db.high_water(&p.tag)?;
     Ok(Json(WhoAmI { user: p.user, tag: p.tag, high_water }))
 }
 
@@ -238,16 +251,14 @@ async fn events(
 
 /// The room's head, if the stream may still see it. Checked on every tick rather than once at
 /// connect, because every other route checks access per request: a stream that outlived a
-/// revoked key, a disabled user or a left room would be the one route that doesn't.
+/// revoked key or a left room would be the one route that doesn't.
 fn head_if_allowed(conn: &rusqlite::Connection, room_id: i64, tag: &str, key_id: i64) -> Option<i64> {
     let allowed: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM members m
                              JOIN keys k ON k.tag = m.tag
-                             JOIN tags t ON t.tag = m.tag
-                             JOIN users u ON u.id = t.user_id
                             WHERE m.room_id = ?1 AND m.tag = ?2 AND m.left_at IS NULL
-                              AND k.id = ?3 AND k.revoked_at IS NULL AND u.disabled_at IS NULL)",
+                              AND k.id = ?3 AND k.revoked_at IS NULL)",
             rusqlite::params![room_id, tag, key_id],
             |r| r.get(0),
         )

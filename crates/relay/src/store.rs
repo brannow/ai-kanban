@@ -27,7 +27,11 @@ const APPLICATION_ID: i64 = 0x414B_6253;
 /// Each entry runs once, in order, inside a transaction, and stamps `user_version`. Frozen once
 /// shipped, for the reason note #178 gives about core's migrations: a store that already ran
 /// one never runs an edited version of it.
-const MIGRATIONS: &[&str] = &[include_str!("schema.sql"), include_str!("migrate_002_room_board.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("schema.sql"),
+    include_str!("migrate_002_room_board.sql"),
+    include_str!("migrate_003_keys_and_names.sql"),
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -51,7 +55,8 @@ pub enum ServerError {
 
 pub type Result<T> = std::result::Result<T, ServerError>;
 
-/// Who a request is from, resolved from its key.
+/// Who a request is from, resolved from its key. `user` is the name its client chose for
+/// itself -- a claim, not a proof; `tag` is what the relay vouches for.
 #[derive(Debug, Clone)]
 pub struct Principal {
     pub user: String,
@@ -62,19 +67,15 @@ pub struct Principal {
 #[derive(Debug, Clone)]
 pub struct KeyRow {
     pub id: i64,
-    pub user: String,
-    pub tag: String,
+    /// None until the key is first used.
+    pub tag: Option<String>,
+    /// The name its client chose, if it has a tag.
+    pub name: Option<String>,
+    /// The admin's note of who it was given to.
+    pub label: String,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
     pub revoked_at: Option<i64>,
-}
-
-#[derive(Debug, Clone)]
-pub struct UserRow {
-    pub name: String,
-    pub created_at: i64,
-    pub disabled_at: Option<i64>,
-    pub tags: Vec<String>,
 }
 
 /// What `forget` and `delete_room` would remove, so the CLI can show it before `--yes`.
@@ -113,7 +114,6 @@ impl ServerDb {
 
     fn init(conn: Connection, path: Option<PathBuf>) -> Result<Self> {
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
-        conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
         let app: i64 = conn.query_row("PRAGMA application_id", [], |r| r.get(0))?;
@@ -132,6 +132,10 @@ impl ServerDb {
                 MIGRATIONS.len()
             )));
         }
+        // Off while migrating, outside any transaction (inside one the pragma does nothing):
+        // a migration that rebuilds a table drops the old one while others still point at it.
+        // Checked once all have run, so a migration cannot leave a dangling reference behind.
+        conn.pragma_update(None, "foreign_keys", "OFF")?;
         while (version as usize) < MIGRATIONS.len() {
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(MIGRATIONS[version as usize])?;
@@ -140,6 +144,11 @@ impl ServerDb {
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
             tx.commit()?;
         }
+        let dangling: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?;
+        if dangling > 0 {
+            return Err(ServerError::Other(format!("server database has {dangling} broken references after migrating")));
+        }
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(Self { conn, path })
     }
 
@@ -170,100 +179,142 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-impl ServerDb {
-    pub fn add_user(&self, name: &str) -> Result<()> {
-        let name = name.trim();
-        // Same spelling rule as a room: it is typed on command lines and printed next to tags.
-        if protocol::room_name(name).as_deref() != Some(name) {
-            return Err(ServerError::BadRequest(format!(
-                "user name {name:?}: lowercase letters, digits, '-' and '_' only"
-            )));
-        }
-        let n = self.conn.execute(
-            "INSERT OR IGNORE INTO users (name, created_at) VALUES (?1, ?2)",
-            params![name, now()],
-        )?;
-        if n == 0 {
-            return Err(ServerError::Conflict(format!("user {name} exists")));
-        }
-        Ok(())
-    }
+/// Text that other people's terminals will print: no control characters, trimmed, at most `max`
+/// characters. Cleaned rather than refused, where refusing would fail a join over a hint.
+fn clean_text(raw: &str, max: usize) -> String {
+    raw.chars().filter(|c| !c.is_control()).take(max).collect::<String>().trim().to_string()
+}
 
-    pub fn users(&self) -> Result<Vec<UserRow>> {
-        let mut st = self.conn.prepare(
-            "SELECT u.name, u.created_at, u.disabled_at,
-                    COALESCE((SELECT group_concat(tag, ',') FROM (SELECT tag FROM tags WHERE user_id = u.id ORDER BY tag)), '')
-               FROM users u ORDER BY u.name",
-        )?;
-        let rows = st.query_map([], |r| {
-            let tags: String = r.get(3)?;
-            Ok(UserRow {
-                name: r.get(0)?,
-                created_at: r.get(1)?,
-                disabled_at: r.get(2)?,
-                tags: tags.split(',').filter(|t| !t.is_empty()).map(String::from).collect(),
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    pub fn disable_user(&self, name: &str) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE users SET disabled_at = ?2 WHERE name = ?1 AND disabled_at IS NULL",
-            params![name, now()],
-        )?;
-        if n == 0 {
-            return Err(ServerError::NotFound(format!("no active user {name}")));
-        }
-        Ok(())
-    }
-
-    fn user_id(&self, name: &str) -> Result<i64> {
-        self.conn
-            .query_row("SELECT id FROM users WHERE name = ?1", [name], |r| r.get(0))
-            .optional()?
-            .ok_or_else(|| ServerError::NotFound(format!("no user {name}")))
-    }
-
-    /// A key for one more of `user`'s machines, under the next free tag: their initial and the
-    /// lowest unused number (`volker` gets `v1`, then `v2` for a second machine). Returns the
-    /// tag and the key.
-    ///
-    /// Picked rather than asked for: the admin had to invent a tag per key and gained nothing by
-    /// it. One tag per machine stays, because a store's task numbers are its own -- two machines
-    /// under one tag would both publish `#1-v1`.
-    pub fn issue_key(&self, user: &str) -> Result<(String, String)> {
-        self.user_id(user)?;
-        let initial = user.chars().next().filter(char::is_ascii_lowercase).unwrap_or('u');
-        let mut n = 1;
-        let tag = loop {
-            let tag = format!("{initial}{n}");
-            let taken: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM tags WHERE tag = ?1)", [&tag], |r| r.get(0))?;
-            if !taken {
-                break tag;
-            }
-            n += 1;
+/// A name as the team will see it, or why not. Shown in other people's terminals and pages, so
+/// what it may contain is a list, not a list of exceptions: letters and digits of any script,
+/// the marks those scripts write their letters with, single spaces, and `- . _ '` (and the two
+/// middle dots names use). That leaves out by itself what has no business in a name: emoji and
+/// symbols, control characters (terminal escapes), invisible format characters (zero-width
+/// joiners, the bidi overrides that make text read differently than it is stored), and the
+/// characters of markup (`< > & "`).
+///
+/// Refused rather than cleaned: a name that silently came out different from the one typed is
+/// worse than being told. Only spaces are tidied -- trimmed, and runs of them made one.
+fn valid_name(raw: &str) -> Result<String> {
+    let name = raw.split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ");
+    let refuse = |why: String| Err(ServerError::BadRequest(format!("{why}. A name is letters and digits of any script, spaces, and - . _ '")));
+    if let Some(c) = name.chars().find(|c| !name_char(*c)) {
+        let shown = if c.is_control() || c.is_whitespace() || !c.is_alphanumeric() && c as u32 >= 0x2000 && c as u32 <= 0x206F {
+            format!("U+{:04X}", c as u32)
+        } else {
+            format!("\"{c}\" (U+{:04X})", c as u32)
         };
-        let key = self.add_key(user, &tag)?;
-        Ok((tag, key))
+        return refuse(format!("a name cannot contain {shown}"));
+    }
+    if !name.chars().any(char::is_alphanumeric) {
+        return refuse("a name needs at least one letter or digit".into());
+    }
+    if name.chars().count() > 32 {
+        return refuse("a name is at most 32 characters".into());
+    }
+    Ok(name)
+}
+
+fn name_char(c: char) -> bool {
+    if c.is_alphanumeric() || matches!(c, ' ' | '-' | '.' | '_' | '\'' | '·' | '・') {
+        return true;
+    }
+    // The marks scripts write letters with, which the standard library does not classify:
+    // accents typed separately, and the vowel signs and viramas of Hebrew, Arabic, the Indic
+    // scripts, Thai, Lao, Tibetan, Myanmar and Khmer. Without them `लक्ष्मी` or `ศักดิ์` would be
+    // refused. Whole blocks, since everything else in them is a letter anyway.
+    matches!(c as u32,
+        0x0300..=0x036F | 0x0483..=0x0489 | 0x0591..=0x05C7 | 0x0610..=0x061A | 0x064B..=0x065F | 0x0670
+        | 0x06D6..=0x06ED | 0x0900..=0x0DFF | 0x0E00..=0x0EFF | 0x0F00..=0x0FFF | 0x1000..=0x109F
+        | 0x1780..=0x17FF | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x3099..=0x309A | 0xFE20..=0xFE2F)
+}
+
+/// The letter a tag is made from: the name's first letter, as the plain letter people would
+/// write it with on an ASCII keyboard (`ßaskia` s, `Örkan` o, `Дмитрий` d, `Γιώργος` g). Scripts
+/// without such a letter -- Chinese, Japanese, Korean, Thai, ... -- would need a romanization
+/// dictionary for one; for those the first Latin letter elsewhere in the name serves (`王伟 Wang`
+/// w), else `x`. The tag only shows in handles (`#12-x1`); the team sees the name.
+fn initial(name: &str) -> char {
+    name.chars()
+        .find(|c| c.is_alphanumeric())
+        .and_then(plain_letter)
+        .or_else(|| name.chars().find(char::is_ascii_alphabetic).map(|c| c.to_ascii_lowercase()))
+        .unwrap_or('x')
+}
+
+fn plain_letter(c: char) -> Option<char> {
+    if c.is_ascii_alphabetic() {
+        return Some(c.to_ascii_lowercase());
+    }
+    let l = c.to_lowercase().next()?;
+    Some(match l {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' | 'ǎ' | 'æ' => 'a',
+        'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => 'c',
+        'ď' | 'đ' | 'ð' => 'd',
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => 'e',
+        'ĝ' | 'ğ' | 'ġ' | 'ģ' => 'g',
+        'ĥ' | 'ħ' => 'h',
+        'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => 'i',
+        'ĵ' => 'j',
+        'ķ' => 'k',
+        'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => 'l',
+        'ñ' | 'ń' | 'ņ' | 'ň' => 'n',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' | 'œ' => 'o',
+        'ŕ' | 'ŗ' | 'ř' => 'r',
+        'ß' | 'ś' | 'ŝ' | 'ş' | 'š' | 'ș' => 's',
+        'ţ' | 'ť' | 'ŧ' | 'ț' | 'þ' => 't',
+        'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => 'u',
+        'ŵ' => 'w',
+        'ý' | 'ÿ' | 'ŷ' => 'y',
+        'ź' | 'ż' | 'ž' => 'z',
+        // Greek
+        'α' | 'ά' => 'a', 'β' => 'b', 'γ' => 'g', 'δ' => 'd', 'ε' | 'έ' => 'e', 'ζ' => 'z',
+        'η' | 'ή' | 'ι' | 'ί' | 'ϊ' => 'i', 'θ' | 'τ' => 't', 'κ' => 'k', 'λ' => 'l', 'μ' => 'm',
+        'ν' => 'n', 'ξ' => 'x', 'ο' | 'ό' | 'ω' | 'ώ' => 'o', 'π' | 'ψ' => 'p', 'ρ' => 'r',
+        'σ' | 'ς' => 's', 'υ' | 'ύ' | 'ϋ' => 'y', 'φ' => 'f', 'χ' => 'c',
+        // Cyrillic
+        'а' => 'a', 'б' => 'b', 'в' => 'v', 'г' | 'ґ' => 'g', 'д' => 'd', 'е' | 'ё' | 'є' | 'э' => 'e',
+        'ж' | 'з' => 'z', 'и' | 'й' | 'і' | 'ї' => 'i', 'к' => 'k', 'л' => 'l', 'м' => 'm', 'н' => 'n',
+        'о' => 'o', 'п' => 'p', 'р' => 'r', 'с' | 'ш' | 'щ' => 's', 'т' => 't', 'у' => 'u', 'ф' => 'f',
+        'х' => 'h', 'ц' | 'ч' => 'c', 'ы' | 'ю' | 'я' => 'y',
+        _ => return None,
+    })
+}
+
+/// A name for a machine that never chose one, like `brave-otter`: something to tell people apart
+/// by until they pick their own.
+fn generated_name() -> Result<String> {
+    const ADJ: &[&str] = &[
+        "brave", "calm", "eager", "fond", "glad", "keen", "lucky", "merry", "nimble", "quiet",
+        "rapid", "sunny", "tidy", "witty", "bold", "clever",
+    ];
+    const ANIMAL: &[&str] = &[
+        "otter", "badger", "heron", "lynx", "marten", "osprey", "puffin", "raven", "stoat",
+        "tern", "vole", "wren", "beaver", "crane", "falcon", "hare",
+    ];
+    let mut b = [0u8; 2];
+    getrandom::fill(&mut b).map_err(|e| ServerError::Other(format!("no randomness: {e}")))?;
+    Ok(format!("{}-{}", ADJ[b[0] as usize % ADJ.len()], ANIMAL[b[1] as usize % ANIMAL.len()]))
+}
+
+impl ServerDb {
+    /// A key for one machine, to hand to whoever runs it. It has no tag yet: the tag is fixed
+    /// the first time the key is used, from the name its client chooses (`name_key`), or a
+    /// generated one. `label` is the admin's own note of who it was given to; the team never
+    /// sees it. Returns the key's id and the key, which exists only in this return value.
+    pub fn issue_key(&self, label: &str) -> Result<(i64, String)> {
+        let label = clean_text(label, 64);
+        if label.is_empty() {
+            return Err(ServerError::BadRequest("a key needs a label: who it is for, like \"volker laptop\"".into()));
+        }
+        let key = new_key()?;
+        self.conn.execute("INSERT INTO keys (tag, label, hash, created_at) VALUES (NULL, ?1, ?2, ?3)", params![label, hash_key(&key), now()])?;
+        Ok((self.conn.last_insert_rowid(), key))
     }
 
-    /// The tags `user` holds, oldest first: one per machine.
-    pub fn tags_of(&self, user: &str) -> Result<Vec<String>> {
-        let uid = self.user_id(user)?;
-        let mut st = self.conn.prepare("SELECT tag FROM tags WHERE user_id = ?1 ORDER BY created_at, tag")?;
-        let tags = st.query_map([uid], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-        Ok(tags)
-    }
-
-    /// Issues a key under a new origin tag and returns it. The plain key exists only in this
-    /// return value; the database keeps its hash.
-    ///
-    /// A tag belongs to one user forever, even after its keys are revoked: tasks published as
-    /// `#122-v1` keep that handle, and handing `v1` to someone else later would make their new
-    /// tasks collide with it.
-    pub fn add_key(&self, user: &str, tag: &str) -> Result<String> {
-        let uid = self.user_id(user)?;
+    /// A key already named and under a given tag, without the first-use step. For tests and
+    /// tools that need a known tag; the admin commands go through `issue_key`.
+    pub fn add_key(&self, name: &str, tag: &str) -> Result<String> {
         if !protocol::valid_tag(tag) {
             return Err(ServerError::BadRequest(format!(
                 "tag {tag:?}: a lowercase letter, then up to 7 lowercase letters or digits (no '-')"
@@ -273,34 +324,70 @@ impl ServerDb {
             return Err(ServerError::BadRequest(format!("tag {tag:?} is reserved for the server")));
         }
         let tx = self.conn.unchecked_transaction()?;
-        let owner: Option<String> = tx
-            .query_row("SELECT u.name FROM tags t JOIN users u ON u.id = t.user_id WHERE t.tag = ?1", [tag], |r| r.get(0))
-            .optional()?;
-        if let Some(owner) = owner {
-            return Err(ServerError::Conflict(format!(
-                "tag {tag} already belongs to {owner}. Tags are never reused; use `key rotate {tag}` for a new key under it"
-            )));
+        let taken: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM tags WHERE tag = ?1)", [tag], |r| r.get(0))?;
+        if taken {
+            return Err(ServerError::Conflict(format!("tag {tag} is taken. Tags are never reused; `key rotate {tag}` gives it a new key")));
         }
-        tx.execute("INSERT INTO tags (tag, user_id, created_at) VALUES (?1, ?2, ?3)", params![tag, uid, now()])?;
+        tx.execute("INSERT INTO tags (tag, name, created_at) VALUES (?1, ?2, ?3)", params![tag, name, now()])?;
         let key = new_key()?;
-        tx.execute("INSERT INTO keys (tag, hash, created_at) VALUES (?1, ?2, ?3)", params![tag, hash_key(&key), now()])?;
+        tx.execute("INSERT INTO keys (tag, label, hash, created_at) VALUES (?1, ?2, ?3, ?4)", params![tag, name, hash_key(&key), now()])?;
         tx.commit()?;
         Ok(key)
     }
 
-    /// A new key for an existing tag, revoking the old one. For a leaked or lost key: the
-    /// machine keeps its tag, so everything it published keeps its handles.
-    pub fn rotate_key(&self, tag: &str) -> Result<String> {
+    /// Sets the name the key's machine goes by. The first time, this fixes its tag: the name's
+    /// initial and the lowest free number (`Volker` gets `v1`, the next `v` name `v2`). After
+    /// that the tag never changes -- handles like `#122-v1` are published under it -- and only
+    /// the name does. Names may repeat; tags tell their owners apart.
+    pub fn name_key(&self, key_id: i64, name: &str) -> Result<Principal> {
+        let name = valid_name(name)?;
         let tx = self.conn.unchecked_transaction()?;
-        let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM tags WHERE tag = ?1)", [tag], |r| r.get(0))?;
-        if !exists {
-            return Err(ServerError::NotFound(format!("no tag {tag}")));
-        }
-        tx.execute("UPDATE keys SET revoked_at = ?2 WHERE tag = ?1 AND revoked_at IS NULL", params![tag, now()])?;
-        let key = new_key()?;
-        tx.execute("INSERT INTO keys (tag, hash, created_at) VALUES (?1, ?2, ?3)", params![tag, hash_key(&key), now()])?;
+        let tag: Option<String> = tx.query_row("SELECT tag FROM keys WHERE id = ?1", [key_id], |r| r.get(0))?;
+        let tag = match tag {
+            Some(tag) => {
+                tx.execute("UPDATE tags SET name = ?2 WHERE tag = ?1", params![tag, name])?;
+                tag
+            }
+            None => {
+                let initial = initial(&name);
+                let mut n = 1;
+                let tag = loop {
+                    let tag = format!("{initial}{n}");
+                    let taken: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM tags WHERE tag = ?1)", [&tag], |r| r.get(0))?;
+                    if !taken && tag != protocol::SERVER_TAG {
+                        break tag;
+                    }
+                    n += 1;
+                };
+                tx.execute("INSERT INTO tags (tag, name, created_at) VALUES (?1, ?2, ?3)", params![tag, name, now()])?;
+                tx.execute("UPDATE keys SET tag = ?2 WHERE id = ?1", params![key_id, tag])?;
+                tag
+            }
+        };
         tx.commit()?;
-        Ok(key)
+        Ok(Principal { user: name, tag, key_id })
+    }
+
+    /// The live key a selector means: a key id (`3`) or the tag it serves (`v1`). An unused key
+    /// has no tag yet, so it can only be named by its id.
+    pub fn key_id(&self, selector: &str) -> Result<i64> {
+        let found: Option<i64> = match selector.parse::<i64>() {
+            Ok(id) => self.conn.query_row("SELECT id FROM keys WHERE id = ?1 AND revoked_at IS NULL", [id], |r| r.get(0)).optional()?,
+            Err(_) => self.conn.query_row("SELECT id FROM keys WHERE tag = ?1 AND revoked_at IS NULL", [selector], |r| r.get(0)).optional()?,
+        };
+        found.ok_or_else(|| ServerError::NotFound(format!("no live key {selector} (a key id or a tag, from key list)")))
+    }
+
+    /// A new key in place of a lost or leaked one: same tag, name and label, so everything the
+    /// machine published keeps its handles. The old key stops working at once.
+    pub fn rotate_key(&self, key_id: i64) -> Result<(Option<String>, String)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let (tag, label): (Option<String>, String) = tx.query_row("SELECT tag, label FROM keys WHERE id = ?1", [key_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        tx.execute("UPDATE keys SET revoked_at = ?2 WHERE id = ?1", params![key_id, now()])?;
+        let key = new_key()?;
+        tx.execute("INSERT INTO keys (tag, label, hash, created_at) VALUES (?1, ?2, ?3, ?4)", params![tag, label, hash_key(&key), now()])?;
+        tx.commit()?;
+        Ok((tag, key))
     }
 
     pub fn revoke_key(&self, id: i64) -> Result<()> {
@@ -314,46 +401,68 @@ impl ServerDb {
         Ok(())
     }
 
-    pub fn keys(&self, user: Option<&str>) -> Result<Vec<KeyRow>> {
+    pub fn label_key(&self, id: i64, label: &str) -> Result<()> {
+        let label = clean_text(label, 64);
+        if label.is_empty() {
+            return Err(ServerError::BadRequest("a label needs at least one visible character".into()));
+        }
+        self.conn.execute("UPDATE keys SET label = ?2 WHERE id = ?1", params![id, label])?;
+        Ok(())
+    }
+
+    pub fn keys(&self) -> Result<Vec<KeyRow>> {
         let mut st = self.conn.prepare(
-            "SELECT k.id, u.name, k.tag, k.created_at, k.last_used_at, k.revoked_at
-               FROM keys k JOIN tags t ON t.tag = k.tag JOIN users u ON u.id = t.user_id
-              WHERE ?1 IS NULL OR u.name = ?1
-              ORDER BY u.name, k.tag, k.id",
+            "SELECT k.id, k.tag, t.name, k.label, k.created_at, k.last_used_at, k.revoked_at
+               FROM keys k LEFT JOIN tags t ON t.tag = k.tag
+              ORDER BY k.revoked_at IS NOT NULL, k.id",
         )?;
-        let rows = st.query_map([user], |r| {
+        let rows = st.query_map([], |r| {
             Ok(KeyRow {
                 id: r.get(0)?,
-                user: r.get(1)?,
-                tag: r.get(2)?,
-                created_at: r.get(3)?,
-                last_used_at: r.get(4)?,
-                revoked_at: r.get(5)?,
+                tag: r.get(1)?,
+                name: r.get(2)?,
+                label: r.get(3)?,
+                created_at: r.get(4)?,
+                last_used_at: r.get(5)?,
+                revoked_at: r.get(6)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The principal a bearer key belongs to, if the key is live and its user is not disabled.
-    pub fn authenticate(&self, key: &str) -> Result<Principal> {
-        let row: Option<(i64, String, String)> = self
+    /// The live key a bearer key is, without binding anything: the key's id and its tag and
+    /// name if it has them. For the naming route, which must run before the tag is fixed, and
+    /// for the debug log, which must not change what it watches.
+    pub fn lookup(&self, key: &str) -> Result<(i64, Option<(String, String)>)> {
+        let row: Option<(i64, Option<String>, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT k.id, k.tag, u.name
-                   FROM keys k JOIN tags t ON t.tag = k.tag JOIN users u ON u.id = t.user_id
-                  WHERE k.hash = ?1 AND k.revoked_at IS NULL AND u.disabled_at IS NULL",
+                "SELECT k.id, k.tag, t.name FROM keys k LEFT JOIN tags t ON t.tag = k.tag
+                  WHERE k.hash = ?1 AND k.revoked_at IS NULL",
                 [hash_key(key.trim())],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let (key_id, tag, user) = row.ok_or(ServerError::Unauthorized)?;
+        let (id, tag, name) = row.ok_or(ServerError::Unauthorized)?;
+        Ok((id, tag.zip(name)))
+    }
+
+    /// The principal a bearer key belongs to. A key used for the first time without having
+    /// been named gets a generated name, and with it its tag: a client from before names
+    /// (0.1.x) never sends one, and must still work with a key issued since.
+    pub fn authenticate(&self, key: &str) -> Result<Principal> {
+        let (key_id, named) = self.lookup(key)?;
+        let p = match named {
+            Some((tag, user)) => Principal { user, tag, key_id },
+            None => self.name_key(key_id, &generated_name()?)?,
+        };
         // Minute resolution is plenty for "when was this key last seen", and it keeps a
         // chatty client from turning every pull into a write.
         self.conn.execute(
             "UPDATE keys SET last_used_at = ?2 WHERE id = ?1 AND (last_used_at IS NULL OR last_used_at < ?2 - 60)",
             params![key_id, now()],
         )?;
-        Ok(Principal { user, tag, key_id })
+        Ok(p)
     }
 
     pub fn high_water(&self, tag: &str) -> Result<HighWater> {
@@ -378,11 +487,9 @@ impl ServerDb {
 // Rooms
 // ---------------------------------------------------------------------------
 
-/// A board name as other people's terminals will show it: no control characters, at most 64
-/// characters. Cleaned rather than refused -- a name is a hint, and a client must not fail to
-/// join over one.
+/// A board name as other people's terminals will show it.
 fn board_label(raw: &str) -> String {
-    raw.chars().filter(|c| !c.is_control()).take(64).collect::<String>().trim().to_string()
+    clean_text(raw, 64)
 }
 
 fn parse_room(raw: &str) -> Result<String> {
@@ -428,7 +535,7 @@ impl ServerDb {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         let mut st = self.conn.prepare(
-            "SELECT m.tag, u.name FROM members m JOIN tags t ON t.tag = m.tag JOIN users u ON u.id = t.user_id
+            "SELECT m.tag, t.name FROM members m JOIN tags t ON t.tag = m.tag
               WHERE m.room_id = ?1 AND m.left_at IS NULL ORDER BY m.tag",
         )?;
         let members = st
@@ -595,7 +702,7 @@ impl ServerDb {
                     return Err(ServerError::Conflict(format!(
                         "change id {} was already used for different content. This store looks restored \
                          from a backup or copied, or a second machine sharing one key: it needs a key of its own \
-                         (`ai-kanban-relay key add <user>`)",
+                         (`ai-kanban-relay key add <label>`)",
                         ch.cid
                     )));
                 }

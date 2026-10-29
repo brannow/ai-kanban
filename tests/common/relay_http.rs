@@ -22,9 +22,6 @@ impl HttpRelay {
         let db_path = dir.path().join("server.db");
         {
             let db = ServerDb::open(&db_path).unwrap();
-            for u in ["benny", "volker", "carla"] {
-                db.add_user(u).unwrap();
-            }
         }
         let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         let mut r = HttpRelay { url: format!("http://{addr}"), db_path, addr, stop: None, thread: None, _dir: dir };

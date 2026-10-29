@@ -24,6 +24,7 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 struct Args {
     pos: Vec<String>,
     key: Option<String>,
+    name: Option<String>,
     board: Option<String>,
     move_to: Option<String>,
     disconnect: bool,
@@ -42,6 +43,7 @@ fn args() -> Result<Args, String> {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
         match arg.as_str() {
             "--key" => a.key = Some(value("--key")?),
+            "--name" => a.name = Some(value("--name")?),
             "--board" => a.board = Some(value("--board")?),
             "--move" => a.move_to = Some(value("--move")?),
             "--disconnect" => a.disconnect = true,
@@ -117,10 +119,11 @@ pub fn remote_cmd() -> CliResult {
     if let Some(url) = &a.move_to {
         return remote_move(&store, url);
     }
-    match (a.pos.first(), &a.key) {
-        (None, None) => remote_show(&store),
-        (Some(url), Some(key)) => remote_set(&store, url, key),
-        _ => Err("usage: ai-kanban remote <url> --key <key>   |   ai-kanban remote   |   ai-kanban remote --move <url>   |   ai-kanban remote --disconnect".into()),
+    match (a.pos.first(), &a.key, &a.name) {
+        (None, None, None) => remote_show(&store),
+        (None, None, Some(name)) => remote_rename(name),
+        (Some(url), Some(key), name) => remote_set(&store, url, key, name.as_deref()),
+        _ => Err("usage: ai-kanban remote <url> --key <key> [--name <your name>]   |   ai-kanban remote   |   ai-kanban remote --name <new name>   |   ai-kanban remote --move <url>   |   ai-kanban remote --disconnect".into()),
     }
 }
 
@@ -147,7 +150,24 @@ fn remote_show(store: &Store) -> CliResult {
     Ok(())
 }
 
-fn remote_set(store: &Store, url: &str, key: &str) -> CliResult {
+/// What the team sees this machine as. The tag stays; only the name changes.
+fn remote_rename(name: &str) -> CliResult {
+    need_network()?;
+    let cfg = need_remote()?;
+    let who = client(&cfg).set_name(name).map_err(|e| match e {
+        RemoteError::NotFound(_) | RemoteError::Http(405, _) => {
+            format!("the relay at {} is older than names: it keeps the names its admin gave. Update the relay", cfg.url)
+        }
+        e => e.to_string(),
+    })?;
+    println!("ok: the team now sees you as {} (tag {}).", who.user, who.tag);
+    if config::wanted_name().is_some() {
+        println!("Your plugin settings name you too, and win at the next session start: change it there.");
+    }
+    Ok(())
+}
+
+fn remote_set(store: &Store, url: &str, key: &str, name: Option<&str>) -> CliResult {
     need_network()?;
     let url = config::normalize_url(url);
     let connected = store.connected_boards()?;
@@ -162,7 +182,18 @@ fn remote_set(store: &Store, url: &str, key: &str) -> CliResult {
     }
     let c = Client::new(&url, key, TIMEOUT);
     let hello = c.hello()?;
-    let who = c.whoami()?;
+    // Asked before anything else is sent: on a key not used yet, the first name fixes its tag.
+    let asked;
+    let setting = config::wanted_name();
+    let name = match name.or(setting.as_deref()) {
+        Some(n) => Some(n),
+        None if std::io::stdin().is_terminal() => {
+            asked = ask_as_typed("Your name, as the team sees you (Enter: keep yours, or get one like brave-otter):", "--name")?;
+            Some(asked.as_str()).filter(|n| !n.is_empty())
+        }
+        None => None,
+    };
+    let who = c.identify(name)?;
     if let Some(tag) = store.origin_tag()? {
         if tag != who.tag && !connected.is_empty() {
             return Err(format!(
@@ -176,6 +207,7 @@ fn remote_set(store: &Store, url: &str, key: &str) -> CliResult {
     let cfg = RemoteConfig { url: url.clone(), key: key.trim().into() };
     cfg.save()?;
     println!("ok: logged in as {}, origin tag {} (protocol {}, relay {})", who.user, who.tag, hello.protocol_max, hello.server_version);
+    println!("The team sees you as {}; change it any time: ai-kanban remote --name <name>", who.user);
     if let Err(RemoteError::Paused(why)) = check_identity(store, &c) {
         println!("\nsync paused: {why}");
     } else if connected.is_empty() {
@@ -255,7 +287,7 @@ fn room_list(store: &Store) -> CliResult {
     let now = crate::core::now();
     for r in rooms {
         let mine = store.board_of_room(&r.name)?.map(|pid| store.project(pid).map(|p| p.name)).transpose()?;
-        println!("{}", crate::render::room_line(&r, mine.as_deref(), now));
+        println!("{}", crate::render::safe(&crate::render::room_line(&r, mine.as_deref(), now)));
     }
     println!("\nWhat is in one: ai-kanban room show <room>");
     Ok(())
@@ -298,7 +330,7 @@ const PREVIEW_TAG: &str = "preview";
 fn preview(c: &Client, url: &str, info: &RoomInfo) -> Result<String, Box<dyn std::error::Error>> {
     let mut out = crate::render::room_header(info, url, crate::core::now());
     if info.changes == 0 {
-        return Ok(out);
+        return Ok(crate::render::safe(&out).into_owned());
     }
     let (tmp, pid) = Store::preview(&info.name, info.board.as_deref().unwrap_or(&info.name), PREVIEW_TAG)?;
     let mut since = 0;
@@ -321,7 +353,8 @@ fn preview(c: &Client, url: &str, info: &RoomInfo) -> Result<String, Box<dyn std
     tmp.sync_succeeded(pid, &members)?;
     out.push('\n');
     out.push_str(&crate::render::board(&tmp.board(pid, &BoardQuery::board())?));
-    Ok(out)
+    // Everything in it came from the room: through the same filter as every answer.
+    Ok(crate::render::safe(&out).into_owned())
 }
 
 /// Which board a room connects to: one that exists, or one made for it -- made only once the

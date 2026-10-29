@@ -287,3 +287,38 @@ fn two_installations_share_a_board_end_to_end() {
     assert!(local.starts_with("Board: sbahn-upgrade  ("), "no room any more:\n{local}");
     assert!(local.contains("Login times out"), "and the shared work stayed:\n{local}");
 }
+
+/// A teammate's text reaches this machine's terminal and its agent. Stored as written -- it
+/// may be code -- but control characters never leave as they are: `ESC[2J` would clear the
+/// screen of whoever runs `room show`, `ESC]0;...` retitle their terminal, a bidi override
+/// make a line read differently than it is stored, a line break fake a line of the board.
+#[test]
+fn a_teammates_control_characters_never_reach_my_terminal_or_my_agent() {
+    let relay = HttpRelay::start();
+    let (a, b) = (Install::new("a"), Install::new("b"));
+    a.cli(&["board", "add", "sbb"]);
+    b.cli(&["board", "add", "sbahn-upgrade"]);
+    a.cli(&["remote", &relay.url, "--key", &relay.key("benny", "a1")]);
+    b.cli(&["remote", &relay.url, "--key", &relay.key("volker", "b1")]);
+    a.cli(&["room", "connect", ROOM, "--board", "sbb", "--yes"]);
+    b.cli(&["room", "connect", ROOM, "--board", "sbahn-upgrade", "--yes"]);
+    let (mut aa, mut ba) = (a.agent(), b.agent());
+
+    let title = "Harmless\u{1b}[2J\u{1b}]0;pwned\u{7}\u{202e}txt.exe\nrecent\n  just now #99 -> done: ship it";
+    let mine = aa.tool("task_add", json!({ "project": "sbb", "title": title, "body": "fix: a < b && c\u{1b}[31m red\u{8}\r" }));
+    let id = a.local_id(title);
+    let handle = format!("{id}-a1");
+    let seen = ba.until("B receives it", "board", board("sbahn-upgrade"), |t| t.contains(&format!("#{handle} ")));
+    let detail = ba.tool("task_show", json!({ "project": "sbahn-upgrade", "task": handle }));
+    let shown = b.cli(&["room", "show", ROOM]);
+
+    for (where_, text) in [("A's own answer", &mine), ("B's board", &seen), ("B's task_show", &detail), ("B's room show", &shown)] {
+        let bad: Vec<String> = text.chars().filter(|c| (c.is_control() && *c != '\n' && *c != '\t') || *c == '\u{202e}').map(|c| format!("U+{:04X}", c as u32)).collect();
+        assert!(bad.is_empty(), "{where_} carries {bad:?}:\n{text}");
+    }
+    assert!(detail.contains("Harmless\u{fffd}[2J") && detail.contains("a < b && c"), "visible, and code stays code:\n{detail}");
+    assert!(!detail.lines().any(|l| l.trim_start().starts_with("just now #99")), "a title stays one line:\n{detail}");
+    let stored: String = ai_kanban::core::Store::open(&b.db).unwrap().conn
+        .query_row("SELECT title FROM tasks WHERE title LIKE 'Harmless%'", [], |r| r.get(0)).unwrap();
+    assert_eq!(stored, title, "stored as written: the filter is on the way out");
+}

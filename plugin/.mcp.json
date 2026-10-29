@@ -7,7 +7,8 @@
       ],
       "env": {
         "AI_KANBAN_PLUGIN_RELAY_URL": "${user_config.relay_url}",
-        "AI_KANBAN_PLUGIN_RELAY_KEY": "${user_config.relay_key}"
+        "AI_KANBAN_PLUGIN_RELAY_KEY": "${user_config.relay_key}",
+        "AI_KANBAN_PLUGIN_RELAY_NAME": "${user_config.relay_name}"
       }
     }
   }

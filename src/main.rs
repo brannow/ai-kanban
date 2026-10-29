@@ -31,7 +31,8 @@ USAGE:
     ai-kanban repo forget <repo>   Remove a repo from every board (dry run without --yes)
     ai-kanban merge <keep> <gone>  Repair a board that split into two
     ai-kanban where                Print the path to the store
-    ai-kanban remote <url> --key K Connect this machine to a sync relay (docs/sync.md)
+    ai-kanban remote <url> --key K Connect this machine to a sync relay (--name N: how the team sees you)
+    ai-kanban remote --name N      Change the name the team sees; your task numbers stay
     ai-kanban remote               Show it; --move <url>, --disconnect
     ai-kanban room list            Rooms on the relay: where each came from, who is in it
     ai-kanban room show <room>     What is in a room, as a board, without joining it
@@ -69,7 +70,7 @@ async fn main() {
     // list of candidates the person needs in Rust struct syntax.
     if let Err(e) = run().await {
         match e.downcast::<ai_kanban::core::Error>() {
-            Ok(core) => eprint!("{}", ai_kanban::render::error(&core)),
+            Ok(core) => eprint!("{}", ai_kanban::render::safe(&ai_kanban::render::error(&core))),
             Err(other) => eprintln!("ai-kanban: {other}"),
         }
         std::process::exit(1);
@@ -140,7 +141,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::from_str(&std::fs::read_to_string(&src)?)?;
             let store = Store::open_default()?;
             let report = store.import(&data)?;
-            print!("{}", ai_kanban::render::import_report(&report));
+            print!("{}", ai_kanban::render::safe(&ai_kanban::render::import_report(&report)));
             Ok(())
         }
         Some("projects") => {
@@ -148,7 +149,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // No cap: the point of this listing is spotting a board that should not exist,
             // and a truncated list is exactly where a split would hide.
             let (sums, _) = store.project_summaries(usize::MAX)?;
-            print!("{}", ai_kanban::render::project_list(&sums, ai_kanban::core::now()));
+            print!("{}", ai_kanban::render::safe(&ai_kanban::render::project_list(&sums, ai_kanban::core::now())));
             Ok(())
         }
         Some("merge") => {
@@ -165,7 +166,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let into = store.project_by_name_or_key(&keep)?;
             let from = store.project_by_name_or_key(&gone)?;
             let report = store.merge_projects(into.id, from.id)?;
-            print!("{}", ai_kanban::render::merge_report(&report));
+            print!("{}", ai_kanban::render::safe(&ai_kanban::render::merge_report(&report)));
             Ok(())
         }
         Some("repo") => repo_cmd(),
@@ -305,14 +306,14 @@ fn repo_cmd() -> Result<(), Box<dyn std::error::Error>> {
                 let repos: Vec<_> = store.all_repos()?.into_iter()
                     .map(|r| { let h = homes.get(&r.home_project_id).cloned().unwrap_or_default(); (r, h) })
                     .collect();
-                print!("{}", ai_kanban::render::repo_directory(&repos));
+                print!("{}", ai_kanban::render::safe(&ai_kanban::render::repo_directory(&repos)));
                 return Ok(());
             }
             let project = match a.arg(1) {
                 Some(name) => store.project_by_name_or_key(name)?,
                 None => board(&store)?,
             };
-            print!("{}", ai_kanban::render::repo_menu(&project.name, &store.repo_summaries(project.id)?));
+            print!("{}", ai_kanban::render::safe(&ai_kanban::render::repo_menu(&project.name, &store.repo_summaries(project.id)?)));
             Ok(())
         }
         Some("add") => {

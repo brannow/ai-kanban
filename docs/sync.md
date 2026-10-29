@@ -452,7 +452,7 @@ Sync stops for the whole store, never local work, when continuing would corrupt 
   store restored from a backup, or copied. Its next tasks would reuse numbers the room holds.
   A second machine using a copied key looks exactly the same, and is caught the same way.
   The way out: `ai-kanban room disconnect <room> --keep-foreign`, a key of its own from the
-  relay admin (`key add <user>`), `ai-kanban remote <url> --key <new key>`, then
+  relay admin (`key add <label>`), `ai-kanban remote <url> --key <new key>`, then
   `ai-kanban room connect` again. Work
   published under the old tag stays the store's own (`sync_own_tags`).
 
@@ -492,9 +492,9 @@ proxy. It has its own router with bearer auth on every route; `serve`'s loopback
 stay for `serve`.
 
 ```
-ai-kanban-relay user add volker                       # the user, tag v1 and a key, printed once
-ai-kanban-relay key add volker                        # a second machine: tag v2, its own key
-ai-kanban-relay key list | revoke <id> | rotate <user> [--tag v2]
+ai-kanban-relay key add volker laptop                 # a key, labelled; printed once with a message to send
+ai-kanban-relay key list                              # id, tag, the name its user chose, your label, last use
+ai-kanban-relay key rotate v1 | revoke v1 | label v1 <label>   # by tag, or by id for a key not used yet
 ai-kanban-relay room list | delete <room>               # rooms are created by connecting
 ai-kanban-relay forget <room> <handle>                 # the only forget in a room
 ai-kanban-relay snapshot                              # also scheduled: --snapshot-every 6h --keep 28
@@ -502,6 +502,29 @@ ai-kanban-relay snapshot                              # also scheduled: --snapsh
 
 - **Keys:** 32 random bytes, prefixed `akb_`, stored as SHA-256. Not JWT: one server with a
   database gains nothing from stateless tokens, and revoking a key is a row delete.
+- **The relay issues keys; people name themselves** (relay migration 3). There are no users on
+  the server. A key is issued with a label -- the admin's note of who has it, never shown to the
+  team -- and no tag. The tag is fixed the first time the key is used: from the name the client
+  sends first (`PUT /v1/me`; `remote --name`, the prompt, or the plugin's "Your name" setting),
+  else from a generated one like `brave-otter`. After that only the name changes; the tag, and
+  every handle published under it, stays. Names may repeat: `b1 benjamin, b2 benjamin`.
+  - Why the tag waits for the name: handles are read by people, and `#12-v1` for Volker says
+    more than `#12-k3`. Why it then never changes: it is in every handle already published.
+  - A name is a claim, not a proof: anyone can call themselves benjamin. The tag and the
+    admin's label are what can be relied on; `key list` shows all three.
+  - A key used without a name first gets the generated one. That is what keeps 0.1.x clients,
+    which never send a name, working with keys issued since.
+  - The plugin's name setting is sent on every start, so for a plugin user it is where the name
+    lives; `remote --name` holds while that setting is empty.
+  - **What a name may be is a list, not a list of exceptions:** letters and digits of any
+    script, the marks those scripts write with, single spaces, and `- . _ '`. So emoji, symbols,
+    control characters, invisible format characters (zero-width joiners, bidi overrides) and
+    markup (`< > & "`) are refused -- with the reason, not silently cleaned. The tag's letter is
+    the name's first letter as typed on an ASCII keyboard (`ßaskia` s, `örkan` o, `Дмитрий` d);
+    scripts without one use a Latin letter elsewhere in the name, else `x` (`王伟` x1).
+  - Gone with users: disabling a person. One key per machine and no person on the server means
+    locking someone out is revoking each of their keys, found by label in `key list`. The
+    migration revoked the keys of users who were disabled.
 - **v1:** every user on a server may join every room. A team is a server. Need separation? Run
   a second container.
 - **Routes:** `hello`, `whoami`, `rooms`, `rooms/{r}/join` (creates if missing), `rooms/{r}/changes`
@@ -542,13 +565,13 @@ The image is built by `Dockerfile` and published by `.github/workflows/relay-ima
 ```
 docker run -d --name kanban --restart unless-stopped \
   -v kanban-data:/data -p 127.0.0.1:7373:7373 ghcr.io/<owner>/ai-kanban-relay:latest
-docker exec kanban ai-kanban-relay user add benny   # prints benny's key once (tag b1)
+docker exec kanban ai-kanban-relay key add benny laptop   # prints the key once, with a message to send
 ```
 
 - **`deploy/relay/`** holds the compose file of the real deployment and `kanban`, a helper that
-  lives next to it: `./kanban` shows status, users and rooms; `./kanban invite <name>` creates
-  the user and prints a message to send them (plugin install, URL, key); the admin commands pass
-  through (`./kanban key rotate volker`). `./kanban help`, `./kanban help key` or `./kanban key
+  lives next to it: `./kanban` shows status, keys and rooms; `./kanban key add <label>` (or
+  `invite <label>`) issues a key and prints a message to send (plugin install, URL, key, name);
+  the admin commands pass through (`./kanban key rotate v1`). `./kanban help`, `./kanban help key` or `./kanban key
   --help` show what each does, with examples. Those pages and the messages come from the relay
   binary (`crates/relay/src/pages.rs`), so they match the running image; the helper passes the
   name it was called by and the public URL (`AI_KANBAN_RELAY_AS`, `AI_KANBAN_RELAY_URL`). It wraps `docker compose exec`, because the image has
@@ -557,19 +580,27 @@ docker exec kanban ai-kanban-relay user add benny   # prints benny's key once (t
   request, response and event-stream message, one line each: `HH:MM:SS.mmm #<n> > GET /v1/... user/tag
   <bytes> <body>`, then `#<n> < 200 3ms ...`, and for a stream `sse open`, each `sse head N`, `sse
   closed after Ns: <why>`. It is a middleware, so a request turned away before any handler (no key,
-  a body that is not JSON) shows too. The key never appears: a request shows the user/tag it
-  authenticated as, or the key's last four characters. Bodies do, so it is off unless asked for.
+  a body that is not JSON) shows too. The key never appears: a request shows the name/tag it
+  authenticated as, `(key N, not named yet)` for a key not used yet, or the last four characters
+  of a key the relay does not know. Looking up who sent it never names a key. Bodies do, so it is off unless asked for.
   The 30s keep-alives come from axum, not the stream, and do not show. `crates/relay/src/debug.rs`.
 - **Test clients on one machine:** `scripts/kanban-test` runs further clients next to your own
   plugin session, each with its own store, Claude Code config and plugin copy on this checkout's
   build (`kanban-test claude b2`), plus a local relay with `--debug` (`kanban-test relay`,
-  `kanban-test key <user>`). Its own config dir, not just another `AI_KANBAN_DB`: under your normal
+  `kanban-test key <label>`, `kanban-test admin <command>`). Its own config dir, not just another `AI_KANBAN_DB`: under your normal
   config the installed plugin loads too, its relay key is adopted by the fresh test store (one key,
   two stores, sync pauses), and the `install-cli` link is re-pointed at the test build. For the
   same reason a test client ignores the plugin's relay settings: its relay comes only from
-  `kanban-test cli <name> remote <url> --key K`, with a key of its own (`./kanban invite <user>
-  --machine`). On a freshly wiped relay the high-water check would not catch a shared key, since
+  `kanban-test cli <name> remote <url> --key K --name N`, with a key of its own (`./kanban key
+  add <label>`). On a freshly wiped relay the high-water check would not catch a shared key, since
   both stores start at zero.
+- **Teammates' text is outside input.** Board text is stored as written (it holds code), and
+  made safe where it is shown: `render::safe` turns control characters (other than line breaks
+  and tabs) and bidi controls into U+FFFD on every MCP answer (`call_tool` in
+  `src/mcp/server.rs`), hook output and CLI output, and titles are one line in every view. The
+  web page escapes and runs under a strict CSP (`docs/http-api.md`). Without it, a title with
+  `ESC[2J` clears the screen of whoever runs `room show`. Asserted end to end in
+  `tests/e2e_two_installs.rs`.
 - **Runs as non-root** (distroless, uid 65532) and owns `/data`. A bind mount instead of a named
   volume must be writable by that uid, or the container runs as the folder's owner instead
   (compose: `user: "1000:1000"`). Otherwise it stops at once with `unable to open database file`.

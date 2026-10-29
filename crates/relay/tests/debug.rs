@@ -20,7 +20,6 @@ fn traced(db: ServerDb) -> (Relay, Lines) {
 
 fn fixture() -> (Relay, Lines, String) {
     let db = ServerDb::open_in_memory().unwrap();
-    db.add_user("benny").unwrap();
     let key = db.add_key("benny", "b1").unwrap();
     let (relay, lines) = traced(db);
     (relay, lines, key)
@@ -132,4 +131,17 @@ async fn the_event_stream_still_streams_and_logs_open_heads_and_close() {
     assert!(log.contains("sse open benny/b1 room sbahn"), "{log}");
     assert!(log.contains("sse head 0"), "{log}");
     assert!(log.contains("sse closed after") && log.contains("client went away"), "{log}");
+}
+
+/// Debug mode is when people test; watching must not change what happens. Logging a request
+/// from an unnamed key once ran the authentication that gives it a generated name -- and its
+/// tag -- before the client's own name arrived.
+#[tokio::test]
+async fn logging_a_request_does_not_name_the_key() {
+    let db = ServerDb::open_in_memory().unwrap();
+    let (_, key) = db.issue_key("volker laptop").unwrap();
+    let (relay, lines) = traced(db);
+    let (s, v) = call(&relay, "PUT", "/v1/me", Some(&key), Some(json!({ "name": "Volker" }).to_string())).await;
+    assert_eq!((s, v["tag"].clone()), (StatusCode::OK, json!("v1")), "the tag comes from the chosen name: {v}");
+    assert!(log(&lines).contains("not named yet"), "{}", log(&lines));
 }

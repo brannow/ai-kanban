@@ -106,7 +106,7 @@ pub fn session_start() {
         let payload = serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": context,
+                "additionalContext": crate::render::safe(&context),
             }
         });
         println!("{payload}");
@@ -195,7 +195,7 @@ pub fn post_tool_use() {
         let payload = serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
-                "additionalContext": context,
+                "additionalContext": crate::render::safe(&context),
             }
         });
         println!("{payload}");

@@ -88,6 +88,25 @@ whole router, so a route added later is covered without anyone remembering to:
 
 `tests/http_api.rs` covers the rebinding read, the cross-site write and the page's own requests.
 
+### Teammates' text in the page
+
+Once a board is shared, its text is written by other people, so the page treats every string as
+hostile:
+
+- **Escaped on the way into the DOM.** Every field goes through `esc` (`& < > " '`) or
+  `textContent`. Board text is stored as written -- it holds code, and `a < b && c` must stay
+  what it says -- so escaping, not refusing characters, is the defence.
+- **A Content-Security-Policy that survives an escaping mistake.** `script-src 'self'`: no inline
+  script runs, so an injected `<img onerror=...>` stays inert. For that the page has none of its
+  own: the script is served as `/app.js` (`src/http/ui.js`), and no handler is written inline.
+  `connect-src 'self'` keeps anything from sending data elsewhere, `frame-ancestors 'none'` keeps
+  other sites from framing it. Inline styles stay allowed; CSS cannot run code.
+- `tests/http_api.rs` asserts the policy and that neither file holds an inline `<script>` or an
+  `on...=` handler -- the next one added would be blocked in the browser without anyone noticing.
+
+The terminal and the agent have their own counterpart, `render::safe` (control characters and
+bidi controls become U+FFFD on every MCP answer, hook and CLI output); see `docs/sync.md`.
+
 ## Resources
 
 ```

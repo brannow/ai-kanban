@@ -17,8 +17,6 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let db = ServerDb::open_in_memory().unwrap();
-    db.add_user("benny").unwrap();
-    db.add_user("volker").unwrap();
     let benny = db.add_key("benny", "b1").unwrap();
     let volker = db.add_key("volker", "v1").unwrap();
     Fixture { relay: Relay::new(db), benny, volker }
@@ -106,25 +104,25 @@ async fn whoami_names_the_user_and_tag_behind_a_key() {
 #[tokio::test]
 async fn tags_are_validated_reserved_and_never_reused() {
     let db = ServerDb::open_in_memory().unwrap();
-    db.add_user("benny").unwrap();
-    db.add_user("volker").unwrap();
     assert!(db.add_key("benny", "b-1").is_err(), "'-' would break handle parsing");
     assert!(db.add_key("benny", "srv").is_err(), "the server's own tag");
     db.add_key("benny", "b1").unwrap();
     let err = db.add_key("volker", "b1").unwrap_err().to_string();
-    assert!(err.contains("already belongs to benny"), "{err}");
+    assert!(err.contains("is taken"), "{err}");
 }
 
 #[tokio::test]
-async fn revoked_keys_and_disabled_users_are_locked_out_but_rotation_keeps_the_tag() {
+async fn revoked_keys_are_locked_out_but_rotation_keeps_the_tag() {
     let f = fixture();
-    let new_key = f.relay.db.lock().unwrap().rotate_key("b1").unwrap();
+    let id = f.relay.db.lock().unwrap().key_id("b1").unwrap();
+    let (_, new_key) = f.relay.db.lock().unwrap().rotate_key(id).unwrap();
     let (s, _) = call(&f.relay, "GET", "/v1/whoami", Some(&f.benny), None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "the rotated-away key is dead");
     let (s, v) = call(&f.relay, "GET", "/v1/whoami", Some(&new_key), None).await;
     assert_eq!((s, v["tag"].clone()), (StatusCode::OK, json!("b1")), "same tag under the new key");
 
-    f.relay.db.lock().unwrap().disable_user("volker").unwrap();
+    let id = f.relay.db.lock().unwrap().key_id("v1").unwrap();
+    f.relay.db.lock().unwrap().revoke_key(id).unwrap();
     let (s, _) = call(&f.relay, "GET", "/v1/whoami", Some(&f.volker), None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 }
@@ -203,7 +201,59 @@ fn a_version_1_database_upgrades_and_keeps_its_rooms() {
     let rooms = db.rooms().unwrap();
     assert_eq!((rooms[0].name.as_str(), rooms[0].board.as_deref()), ("sbahn", None));
     let v: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(v, 2);
+    assert_eq!(v, 3);
+}
+
+/// Version 3 rebuilds the key tables and drops users. Run on a database shaped like the live
+/// one: what it held must still mean the same, and a disabled user must not come back.
+#[tokio::test]
+async fn the_move_to_issued_keys_keeps_tags_names_and_rooms_and_disabled_users_stay_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.db");
+    let (benny, volker) = ("akb_benny", "akb_volker");
+    let hash = |k: &str| {
+        use sha2::Digest;
+        sha2::Sha256::digest(k.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(include_str!("../src/schema.sql")).unwrap();
+        c.execute_batch(include_str!("../src/migrate_002_room_board.sql")).unwrap();
+        c.execute_batch(&format!(
+            "PRAGMA user_version = 2; PRAGMA application_id = 1095459411;
+             INSERT INTO users (id, name, created_at, disabled_at) VALUES (1, 'benny', 1, NULL), (2, 'volker', 1, 5);
+             INSERT INTO tags (tag, user_id, created_at) VALUES ('b1', 1, 1), ('b2', 1, 2), ('v1', 2, 1);
+             INSERT INTO keys (id, tag, label, hash, created_at, revoked_at) VALUES
+                 (1, 'b1', '', '{}', 1, NULL), (2, 'v1', '', '{}', 1, NULL), (3, 'b2', '', 'old', 2, 3);
+             INSERT INTO rooms (id, name, created_at, created_by, board) VALUES (1, 'sbahn', 1, 'benny', 'sbb');
+             INSERT INTO members (room_id, tag, joined_at) VALUES (1, 'b1', 1), (1, 'v1', 1);
+             INSERT INTO high_water (tag, kind, value) VALUES ('b1', 'task', 5);",
+            hash(benny),
+            hash(volker)
+        ))
+        .unwrap();
+    }
+    let db = ServerDb::open(&path).unwrap();
+    let keys = db.keys().unwrap();
+    let k = |id: i64| keys.iter().find(|k| k.id == id).unwrap();
+    assert_eq!((k(1).tag.as_deref(), k(1).name.as_deref(), k(1).label.as_str()), (Some("b1"), Some("benny"), "benny"), "ids kept, the user's name as name and label");
+    assert!(k(2).revoked_at.is_some(), "the disabled user's key is revoked, not revived");
+    assert!(k(3).revoked_at.is_some());
+    assert_eq!(db.high_water("b1").unwrap().task, 5);
+    let rooms = db.rooms().unwrap();
+    let members: Vec<(&str, &str)> = rooms[0].members.iter().map(|m| (m.tag.as_str(), m.user.as_str())).collect();
+    assert_eq!(members, [("b1", "benny"), ("v1", "volker")]);
+
+    let p = db.authenticate(benny).unwrap();
+    assert_eq!((p.tag.as_str(), p.user.as_str()), ("b1", "benny"));
+    assert!(db.authenticate(volker).is_err());
+    assert!(db.member_head("sbahn", &p).is_ok(), "membership still holds, so the stream can open");
+    let (id, _) = db.issue_key("carla").unwrap();
+    assert!(id > 3, "new keys never take an old id: {id}");
+    let fk: i64 = db.conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
+    assert_eq!(fk, 0);
+    let on: i64 = db.conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
+    assert_eq!(on, 1, "foreign keys are back on after migrating");
 }
 
 #[tokio::test]
@@ -386,7 +436,6 @@ async fn the_event_stream_announces_changes_made_by_another_process() {
     let path = dir.path().join("server.db");
     let (key, relay) = {
         let db = ServerDb::open(&path).unwrap();
-        db.add_user("benny").unwrap();
         let key = db.add_key("benny", "b1").unwrap();
         (key, Relay::new(db))
     };
@@ -431,7 +480,6 @@ async fn the_event_stream_ends_when_its_key_is_revoked() {
     let path = dir.path().join("server.db");
     let (key, relay) = {
         let db = ServerDb::open(&path).unwrap();
-        db.add_user("benny").unwrap();
         let key = db.add_key("benny", "b1").unwrap();
         (key, Relay::new(db))
     };
@@ -476,7 +524,6 @@ async fn the_event_stream_ends_when_its_key_is_revoked() {
 
 fn db_with_benny() -> (ServerDb, String) {
     let db = ServerDb::open_in_memory().unwrap();
-    db.add_user("benny").unwrap();
     let key = db.add_key("benny", "b1").unwrap();
     (db, key)
 }
@@ -484,48 +531,119 @@ fn db_with_benny() -> (ServerDb, String) {
 #[test]
 fn admin_commands_refuse_what_does_not_exist_or_already_happened() {
     let (db, _) = db_with_benny();
-    assert!(db.add_user("benny").unwrap_err().to_string().contains("exists"));
-    for bad in ["", "Benny", "a b", "-x"] {
-        assert!(db.add_user(bad).is_err(), "user name {bad:?}");
-    }
-    assert!(db.add_key("nobody", "n1").unwrap_err().to_string().contains("no user"));
-    assert!(db.rotate_key("zz").unwrap_err().to_string().contains("no tag"));
+    assert!(db.issue_key("  ").unwrap_err().to_string().contains("label"), "a key says who it is for");
+    assert!(db.key_id("zz").unwrap_err().to_string().contains("no live key"));
+    assert!(db.key_id("99").is_err());
 
-    let key_id = db.keys(Some("benny")).unwrap()[0].id;
+    let key_id = db.key_id("b1").unwrap();
     db.revoke_key(key_id).unwrap();
     assert!(db.revoke_key(key_id).is_err(), "revoking twice");
-    db.disable_user("benny").unwrap();
-    assert!(db.disable_user("benny").is_err(), "disabling twice");
-    assert!(db.users().unwrap()[0].disabled_at.is_some());
+    assert!(db.key_id("b1").is_err(), "a revoked key is not live");
 }
 
 #[test]
-fn a_key_lists_its_user_tag_and_state() {
+fn a_key_lists_its_tag_name_label_and_state() {
     let (db, key) = db_with_benny();
     db.authenticate(&key).unwrap();
-    let k = &db.keys(None).unwrap()[0];
-    assert_eq!((k.user.as_str(), k.tag.as_str(), k.revoked_at), ("benny", "b1", None));
+    let (id, _) = db.issue_key("volker laptop").unwrap();
+    let keys = db.keys().unwrap();
+    let k = &keys[0];
+    assert_eq!((k.tag.as_deref(), k.name.as_deref(), k.label.as_str(), k.revoked_at), (Some("b1"), Some("benny"), "benny", None));
     assert!(k.last_used_at.is_some(), "authenticating records when the key was last seen");
-    assert_eq!(db.users().unwrap()[0].tags, ["b1"]);
+    let fresh = keys.iter().find(|k| k.id == id).unwrap();
+    assert_eq!((fresh.tag.as_deref(), fresh.name.as_deref(), fresh.label.as_str()), (None, None, "volker laptop"), "not used yet");
 }
 
-#[test]
-fn issued_keys_pick_the_tag_one_per_machine_and_never_reuse_one() {
+/// Keys are issued; people name themselves. The first name fixes the tag, from its initial;
+/// after that only the name changes. Names may repeat -- the tag tells people apart.
+#[tokio::test]
+async fn a_key_gets_its_tag_from_the_first_name_its_user_chooses() {
     let db = ServerDb::open_in_memory().unwrap();
-    for u in ["volker", "vera", "42bot"] {
-        db.add_user(u).unwrap();
+    let (_, volker) = db.issue_key("volker laptop").unwrap();
+    let (_, other) = db.issue_key("the other volker").unwrap();
+    let relay = Relay::new(db);
+    let name = |key: String, n: &str| {
+        let relay = relay.clone();
+        let body = json!({ "name": n });
+        async move { call(&relay, "PUT", "/v1/me", Some(&key), Some(body)).await }
+    };
+
+    let (s, v) = name(volker.clone(), "Volker").await;
+    assert_eq!((s, v["tag"].clone(), v["user"].clone()), (StatusCode::OK, json!("v1"), json!("Volker")), "{v}");
+    let (_, v) = name(other.clone(), "Volker").await;
+    assert_eq!((v["tag"].clone(), v["user"].clone()), (json!("v2"), json!("Volker")), "the same name, another tag");
+    let (_, v) = name(volker.clone(), "Volker K.").await;
+    assert_eq!((v["tag"].clone(), v["user"].clone()), (json!("v1"), json!("Volker K.")), "renaming keeps the tag");
+
+    let (_, v) = call(&relay, "POST", "/v1/rooms/sbahn/join", Some(&volker), None).await;
+    assert_eq!(v["room"]["members"][0]["user"], "Volker K.", "the team sees the chosen name");
+
+    let rotated = {
+        let db = relay.db.lock().unwrap();
+        let (_, key) = db.rotate_key(db.key_id("v1").unwrap()).unwrap();
+        let k = db.keys().unwrap().into_iter().find(|k| k.tag.as_deref() == Some("v1") && k.revoked_at.is_none()).unwrap();
+        assert_eq!((k.name.as_deref(), k.label.as_str()), (Some("Volker K."), "volker laptop"), "rotation keeps name and label");
+        key
+    };
+    let (_, v) = call(&relay, "GET", "/v1/whoami", Some(&rotated), None).await;
+    assert_eq!((v["tag"].clone(), v["user"].clone()), (json!("v1"), json!("Volker K.")));
+
+    let (s, _) = name(rotated.clone(), " \u{7}\n ").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a name needs something visible");
+}
+
+/// The tag comes from the name's first letter as people would type it on an ASCII keyboard;
+/// scripts without one fall back to a Latin letter elsewhere in the name, else `x`.
+#[test]
+fn every_script_gives_a_tag_from_the_letter_people_expect() {
+    let db = ServerDb::open_in_memory().unwrap();
+    for (name, tag) in [
+        ("ßaskia", "s1"), ("örkan", "o1"), ("Ümit", "u1"), ("Éric", "e1"), ("Łukasz", "l1"), ("Øyvind", "o2"),
+        ("Дмитрий", "d1"), ("Γιώργος", "g1"), ("王伟", "x1"), ("さくら", "x2"), ("김민준", "x3"),
+        ("สมศักดิ์", "x4"), ("लक्ष्मी", "x5"), ("王伟 Wang", "w1"), ("42", "x6"),
+    ] {
+        let (id, _) = db.issue_key("x").unwrap();
+        let p = db.name_key(id, name).unwrap_or_else(|e| panic!("{name:?} refused: {e}"));
+        assert_eq!((p.tag.as_str(), p.user.as_str()), (tag, name), "{name:?}");
     }
-    let (t1, k1) = db.issue_key("volker").unwrap();
-    let (t2, _) = db.issue_key("vera").unwrap();
-    let (t3, _) = db.issue_key("volker").unwrap();
-    assert_eq!((t1.as_str(), t2.as_str(), t3.as_str()), ("v1", "v2", "v3"), "initial, then the lowest free number");
-    assert_eq!(db.tags_of("volker").unwrap(), ["v1", "v3"]);
-    assert_eq!(db.issue_key("42bot").unwrap().0, "u1", "a name that starts with no letter still gets a valid tag");
-    assert_eq!(db.authenticate(&k1).unwrap().tag, "v1");
-    // A revoked tag stays taken: handles published under it outlive its keys.
-    db.revoke_key(db.keys(Some("volker")).unwrap()[0].id).unwrap();
-    assert_eq!(db.issue_key("vera").unwrap().0, "v4");
-    assert!(db.issue_key("nobody").is_err());
+}
+
+/// A name is shown in other people's terminals and pages. What it may hold is a list --
+/// letters, digits, their marks, spaces, `- . _ '` -- so emoji, markup, control and invisible
+/// characters are refused, with the reason, instead of quietly changed.
+#[test]
+fn names_with_emoji_markup_or_invisible_characters_are_refused() {
+    let db = ServerDb::open_in_memory().unwrap();
+    let (id, _) = db.issue_key("x").unwrap();
+    for bad in [
+        "🦊 fox", "😀", "1\u{fe0f}\u{20e3}", "   ", "", "a\nb", "tab\there", "bell\u{7}", "\u{1b}[31mred",
+        "<b>bold</b>", "a&b", "say \"hi\"", "back`tick", "evil\u{202e}txt", "zero\u{200b}width", "join\u{200d}ed",
+        "nbsp\u{a0}name", "--", &"x".repeat(33),
+    ] {
+        let err = db.name_key(id, bad).map(|p| p.user).expect_err(bad);
+        assert!(err.to_string().contains("A name is letters"), "{bad:?}: {err}");
+    }
+    assert_eq!(db.keys().unwrap()[0].tag, None, "a refused name fixes no tag");
+    for good in ["O'Brien", "Jean-Luc", "j.doe", "ジョン・スミス", "Ana María"] {
+        assert_eq!(db.name_key(id, good).unwrap().user, good);
+    }
+    assert_eq!(db.name_key(id, "  Volker   K.  ").unwrap().user, "Volker K.", "spaces are tidied, not refused");
+}
+
+/// A 0.1.x client never names itself: its first request with a new key gets a generated
+/// name, and with it a tag, so old plugins work with keys issued since.
+#[tokio::test]
+async fn a_client_that_never_names_itself_gets_a_generated_name() {
+    let db = ServerDb::open_in_memory().unwrap();
+    let (id, key) = db.issue_key("old plugin").unwrap();
+    let relay = Relay::new(db);
+    let (s, v) = call(&relay, "GET", "/v1/whoami", Some(&key), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (tag, user) = (v["tag"].as_str().unwrap().to_string(), v["user"].as_str().unwrap().to_string());
+    assert!(ai_kanban_protocol::valid_tag(&tag) && user.contains('-'), "a usable tag and a name like brave-otter: {v}");
+    let (_, again) = call(&relay, "GET", "/v1/whoami", Some(&key), None).await;
+    assert_eq!(again["tag"], tag.as_str(), "fixed from then on");
+    assert_eq!(relay.db.lock().unwrap().keys().unwrap().iter().find(|k| k.id == id).unwrap().tag.as_deref(), Some(tag.as_str()));
 }
 
 #[tokio::test]
@@ -729,7 +847,7 @@ async fn forgetting_is_idempotent_and_refuses_what_cannot_be_forgotten() {
 fn snapshots_are_consistent_copies_and_only_the_newest_are_kept() {
     let dir = tempfile::tempdir().unwrap();
     let db = ServerDb::open(&dir.path().join("server.db")).unwrap();
-    db.add_user("benny").unwrap();
+    db.add_key("benny", "b1").unwrap();
     let snaps = dir.path().join("snapshots");
     std::fs::create_dir_all(&snaps).unwrap();
     for t in [100, 200, 300] {
@@ -743,7 +861,7 @@ fn snapshots_are_consistent_copies_and_only_the_newest_are_kept() {
     assert_eq!(left.len(), 3, "{left:?}");
     assert!(left.contains(&"server-300.db".to_string()) && left.contains(&"unrelated.txt".to_string()), "{left:?}");
     let copy = ServerDb::open(&newest).unwrap();
-    assert_eq!(copy.users().unwrap()[0].name, "benny", "the snapshot is a working relay database");
+    assert_eq!(copy.keys().unwrap()[0].tag.as_deref(), Some("b1"), "the snapshot is a working relay database");
     assert!(db.snapshot(&newest).is_err(), "never overwrites");
 }
 

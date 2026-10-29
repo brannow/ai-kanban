@@ -24,8 +24,14 @@
     "relay_key": {
       "type": "string",
       "title": "Team relay key (optional)",
-      "description": "This machine's key from the relay admin (ai-kanban-relay user add). Kept in your system keychain, never in a file you share.",
+      "description": "This machine's key from the relay admin. Kept in your system keychain, never in a file you share.",
       "sensitive": true,
+      "required": false
+    },
+    "relay_name": {
+      "type": "string",
+      "title": "Your name on the team relay (optional)",
+      "description": "How your teammates see you. Left empty, the relay gives you one like brave-otter. Change it here any time; your task numbers stay the same.",
       "required": false
     }
   }

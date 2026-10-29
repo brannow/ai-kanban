@@ -96,6 +96,14 @@ pub enum Adoption {
 /// arrive empty, or as the unsubstituted `${user_config.…}` reference.
 const PLUGIN_URL: &str = "AI_KANBAN_PLUGIN_RELAY_URL";
 const PLUGIN_KEY: &str = "AI_KANBAN_PLUGIN_RELAY_KEY";
+const PLUGIN_NAME: &str = "AI_KANBAN_PLUGIN_RELAY_NAME";
+
+/// The name from the plugin's settings, if one is filled in. Sent on every start, so the
+/// settings are where a plugin user's name lives: a rename with `ai-kanban remote --name` holds
+/// only while the setting is empty.
+pub fn wanted_name() -> Option<String> {
+    setting(std::env::var(PLUGIN_NAME).ok())
+}
 
 fn setting(raw: Option<String>) -> Option<String> {
     raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty() && !v.starts_with("${"))

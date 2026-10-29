@@ -817,6 +817,25 @@ impl ServerHandler for AiKanban {
         })
     }
 
+    /// What the macro would generate, plus one step on the way out: every answer, and every
+    /// error, passes through `render::safe`. Here rather than in each tool so that no tool --
+    /// including the next one written -- can hand a teammate's control characters to the agent.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        match Self::tool_router().call(tcc).await {
+            Ok(rmcp::model::CallToolResponse::Complete(result)) => Ok(rmcp::model::CallToolResponse::Complete(safe_result(result))),
+            Ok(other) => Ok(other),
+            Err(mut e) => {
+                e.message = render::safe(&e.message).into_owned().into();
+                Err(e)
+            }
+        }
+    }
+
     fn get_info(&self) -> ServerInfo {
         // Both ServerInfo and Implementation are #[non_exhaustive], so they are built
         // through their constructors and then adjusted.
@@ -838,4 +857,24 @@ impl ServerHandler for AiKanban {
         );
         info
     }
+}
+
+/// A tool's result with every string in it through `render::safe`: whatever shape the content
+/// takes, text is a string somewhere in it.
+fn safe_result(result: rmcp::model::CallToolResult) -> rmcp::model::CallToolResult {
+    fn walk(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::String(s) => {
+                if let std::borrow::Cow::Owned(clean) = render::safe(s) {
+                    *s = clean;
+                }
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(walk),
+            serde_json::Value::Object(o) => o.values_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    let Ok(mut v) = serde_json::to_value(&result) else { return result };
+    walk(&mut v);
+    serde_json::from_value(v).unwrap_or(result)
 }

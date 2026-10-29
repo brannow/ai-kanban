@@ -43,10 +43,31 @@ impl Api {
 /// The web UI. Embedded in the binary rather than served from disk: "one file to install"
 /// is the pitch, and a UI that needs its assets next to it is no longer one file.
 const INDEX: &str = include_str!("ui.html");
+const APP: &str = include_str!("ui.js");
+
+/// What the page may load and run. Board text is teammates' text now, so the page is built to
+/// survive an escaping mistake: no inline script runs (the script is `/app.js`), nothing is
+/// fetched from or sent to another origin, and no other site may frame it. Inline styles stay
+/// allowed -- the page uses them, and CSS cannot run code.
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; \
+                   img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+fn page(content_type: &'static str, body: &'static str) -> impl axum::response::IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CONTENT_SECURITY_POLICY, CSP),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        body,
+    )
+}
 
 pub fn router(api: Api) -> Router {
     Router::new()
-        .route("/", get(|| async { axum::response::Html(INDEX) }))
+        .route("/", get(|| async { page("text/html; charset=utf-8", INDEX) }))
+        .route("/app.js", get(|| async { page("text/javascript; charset=utf-8", APP) }))
         .route("/api/meta", get(routes::meta))
         .route("/api/projects", get(routes::projects))
         .route("/api/all/board", get(routes::all_board))

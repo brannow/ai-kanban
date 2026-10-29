@@ -76,8 +76,10 @@ pub(crate) async fn trace(State(r): State<Relay>, req: Request, next: Next) -> R
 fn who(r: &Relay, headers: &HeaderMap) -> String {
     match bearer(headers) {
         None => "(no key)".into(),
-        Some(key) => match r.db().authenticate(key) {
-            Ok(p) => format!("{}/{}", p.user, p.tag),
+        // `lookup`, not `authenticate`: watching must not give an unnamed key its name.
+        Some(key) => match r.db().lookup(key) {
+            Ok((_, Some((tag, name)))) => format!("{name}/{tag}"),
+            Ok((id, None)) => format!("(key {id}, not named yet)"),
             Err(_) => {
                 let key = key.trim();
                 format!("(unknown key ...{})", &key[key.len().saturating_sub(4)..])

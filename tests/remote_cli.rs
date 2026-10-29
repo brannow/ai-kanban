@@ -32,6 +32,10 @@ impl Machine {
             .env_remove("AI_KANBAN_SERVER_URL")
             .env_remove("AI_KANBAN_SERVER_KEY")
             .env_remove("AI_KANBAN_SYNC")
+            // A developer's own plugin settings must not reach the tests.
+            .env_remove("AI_KANBAN_PLUGIN_RELAY_URL")
+            .env_remove("AI_KANBAN_PLUGIN_RELAY_KEY")
+            .env_remove("AI_KANBAN_PLUGIN_RELAY_NAME")
             .stdin(Stdio::null());
         for (k, v) in env {
             c.env(k, v);
@@ -152,6 +156,73 @@ fn a_room_can_be_looked_into_without_joining_and_connected_to_a_new_board() {
     let vp = volker.store().project_by_name_or_key("sbahn").unwrap().id;
     let got: Vec<String> = volker.store().board(vp, &BoardQuery::board()).unwrap().tasks.into_iter().map(|t| t.title).collect();
     assert_eq!(got, ["Timetable import fails on DST"]);
+}
+
+/// Keys are issued without a name; the person names themselves when setting the remote, and
+/// that first name fixes the tag. Renaming later changes only the name.
+#[test]
+fn the_first_name_fixes_the_tag_and_a_rename_keeps_it() {
+    let relay = HttpRelay::start();
+    let (volker, other) = (Machine::new(), Machine::new());
+    let (_, key) = relay.admin().issue_key("volker laptop").unwrap();
+    let out = volker.ok(&["remote", &relay.url, "--key", &key, "--name", "Volker"]);
+    assert!(out.contains("origin tag v1") && out.contains("sees you as Volker"), "{out}");
+    assert!(!out.contains(&key), "the key is never printed");
+
+    let out = volker.ok(&["remote", "--name", "Volker K."]);
+    assert!(out.contains("Volker K. (tag v1)"), "{out}");
+    assert_eq!(volker.store().origin_tag().unwrap().as_deref(), Some("v1"));
+
+    // Without a name and without a terminal, the relay gives one.
+    let (_, key) = relay.admin().issue_key("someone").unwrap();
+    let out = other.ok(&["remote", &relay.url, "--key", &key]);
+    assert!(out.contains("sees you as ") && out.contains('-'), "a name like brave-otter: {out}");
+}
+
+/// A plugin user names themselves in the settings. That name must reach the relay before
+/// anything else, or a generated one would pick the tag.
+#[test]
+fn the_name_from_the_plugin_settings_picks_the_tag() {
+    let relay = HttpRelay::start();
+    let m = Machine::new();
+    let (_, key) = relay.admin().issue_key("carla desktop").unwrap();
+    let out = m.run_env(&["remote", &relay.url, "--key", &key], &[("AI_KANBAN_PLUGIN_RELAY_NAME", "Carla")]);
+    let out = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.contains("origin tag c1") && out.contains("sees you as Carla"), "{out}");
+}
+
+/// The real order for a plugin user: URL, key and name in the settings, a session starts (the
+/// MCP server has the settings), and later Claude runs `room connect` in its shell -- which
+/// does not. The name has to have reached the relay before that, with no board connected yet.
+#[test]
+fn the_session_sends_the_settings_name_before_any_board_is_connected() {
+    let relay = HttpRelay::start();
+    let m = Machine::new();
+    let (_, key) = relay.admin().issue_key("volker laptop").unwrap();
+    let mut mcp = Command::new(env!("CARGO_BIN_EXE_ai-kanban"))
+        .arg("mcp")
+        .current_dir(m.dir.path())
+        .env("AI_KANBAN_DB", &m.db)
+        .env_remove("AI_KANBAN_SYNC")
+        .env("AI_KANBAN_PLUGIN_RELAY_URL", &relay.url)
+        .env("AI_KANBAN_PLUGIN_RELAY_KEY", &key)
+        .env("AI_KANBAN_PLUGIN_RELAY_NAME", "Volker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let named = (0..50).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        relay.admin().keys().unwrap().iter().any(|k| k.tag.as_deref() == Some("v1") && k.name.as_deref() == Some("Volker"))
+    });
+    mcp.kill().unwrap();
+    let _ = mcp.wait();
+    assert!(named, "the session named the key from the settings: {:?}", relay.admin().keys().unwrap());
+
+    let out = m.ok(&["room", "connect", "sbahn", "--new-board", "--yes"]);
+    assert!(out.contains("connected."), "{out}");
+    assert_eq!(m.store().origin_tag().unwrap().as_deref(), Some("v1"), "the shell's connect did not pick another tag");
 }
 
 #[test]

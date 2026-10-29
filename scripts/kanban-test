@@ -31,14 +31,15 @@ kanban-test -- extra ai-kanban clients on this machine (see the top of this scri
     kanban-test where [name]           where everything is
 
 A test client next to your own session on the team relay, in this order:
-    1. on the server: ./kanban invite benjamin --machine        (a key with its own tag, b2)
-    2. kanban-test cli b2 remote https://kanban.work.rannow.de --key <that key>
+    1. on the server: ./kanban key add benjamin test client      (a key of its own)
+    2. kanban-test cli b2 remote https://kanban.work.rannow.de --key <that key> --name "benjamin (test)"
     3. kanban-test claude b2                                     (/login once, then as usual)
 The plugin's relay settings are ignored by test clients; leave them empty there.
 
     kanban-test relay                  a local relay on 127.0.0.1:7399, --debug, in the foreground
-    kanban-test key <user>             a key from that relay: a new user, or another machine of one
-                                         then: kanban-test cli <name> remote http://127.0.0.1:7399 --key K
+    kanban-test key <label>            a key from that relay, labelled with who it is for
+                                         then: kanban-test cli <name> remote http://127.0.0.1:7399 --key K --name N
+    kanban-test admin <args>           any admin command on that relay, e.g. kanban-test admin key list
 EOF
 }
 
@@ -57,7 +58,7 @@ prepare() {
 # Test client "$name" (scripts/kanban-test): always its own store, never yours. And never the
 # plugin settings' relay key: that is your machine's key, and a fresh test store adopting it
 # would publish under your tag. The relay comes only from: kanban-test cli $name remote ...
-unset AI_KANBAN_PLUGIN_RELAY_URL AI_KANBAN_PLUGIN_RELAY_KEY
+unset AI_KANBAN_PLUGIN_RELAY_URL AI_KANBAN_PLUGIN_RELAY_KEY AI_KANBAN_PLUGIN_RELAY_NAME
 AI_KANBAN_DB='$home/kanban.db' exec '$repo/target/release/ai-kanban' "\$@"
 EOF
 	chmod +x "$home/plugin/bin/ai-kanban"
@@ -94,18 +95,12 @@ case "$cmd" in
 		mkdir -p "$(dirname "$relay_db")"
 		exec "$repo/target/release/ai-kanban-relay" --db "$relay_db" --listen "127.0.0.1:$relay_port" --debug
 		;;
-	key)
-		user=${1:-}
-		[ -n "$user" ] || { echo "usage: kanban-test key <user>" >&2; exit 2; }
+	key | admin)
+		[ "$cmd" = admin ] || set -- key add "$@"
 		build ai-kanban-relay
 		mkdir -p "$(dirname "$relay_db")"
-		r="$repo/target/release/ai-kanban-relay"
-		export AI_KANBAN_RELAY_AS="kanban-test key" AI_KANBAN_RELAY_URL="http://127.0.0.1:$relay_port"
-		if "$r" --db "$relay_db" user list | awk '{print $1}' | grep -qx "$user"; then
-			"$r" --db "$relay_db" key add "$user"
-		else
-			"$r" --db "$relay_db" user add "$user"
-		fi
+		export AI_KANBAN_RELAY_AS="kanban-test admin" AI_KANBAN_RELAY_URL="http://127.0.0.1:$relay_port"
+		exec "$repo/target/release/ai-kanban-relay" --db "$relay_db" "$@"
 		;;
 	where)
 		if [ -n "${1:-}" ]; then

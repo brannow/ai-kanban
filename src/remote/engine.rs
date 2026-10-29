@@ -35,7 +35,8 @@ pub fn check_identity(store: &Store, client: &Client) -> Result<(), RemoteError>
         pause(store, &why);
         return Err(RemoteError::Paused(why));
     }
-    let who = client.whoami()?;
+    // The name first: on a key not used yet, it is what the tag is made from.
+    let who = client.identify(super::config::wanted_name().as_deref())?;
     let mut tag = store.origin_tag().ok().flatten();
     // A store with no tag has never published, so it holds no numbers under any tag: it takes
     // the key's, as `ai-kanban remote` would. That lets a key from the plugin's settings be saved
@@ -59,7 +60,7 @@ pub fn check_identity(store: &Store, client: &Client) -> Result<(), RemoteError>
             "this store is behind what the relay already has from {tag}, so its next tasks would reuse numbers the \
              room holds. Either this key is in use on another machine (every machine needs its own), or the store was \
              restored from a backup. Disconnect its boards (`ai-kanban room disconnect`), ask the relay admin for a \
-             key of its own (`ai-kanban-relay key add <user>`), run `ai-kanban remote <url> --key <new key>`, then \
+             key of its own (`ai-kanban-relay key add <label>`), run `ai-kanban remote <url> --key <new key>`, then \
              connect again",
             tag = who.tag
         );

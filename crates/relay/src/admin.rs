@@ -14,7 +14,6 @@ struct Args {
     pos: Vec<String>,
     db: Option<PathBuf>,
     listen: Option<String>,
-    tag: Option<String>,
     snapshot_every: Option<String>,
     snapshot_dir: Option<PathBuf>,
     keep: Option<String>,
@@ -25,7 +24,7 @@ struct Args {
 
 fn args() -> Result<Args, String> {
     let mut a = Args {
-        pos: vec![], db: None, listen: None, tag: None,
+        pos: vec![], db: None, listen: None,
         snapshot_every: None, snapshot_dir: None, keep: None, yes: false, debug: false, help: false,
     };
     let mut it = std::env::args().skip(1);
@@ -34,7 +33,6 @@ fn args() -> Result<Args, String> {
         match arg.as_str() {
             "--db" => a.db = Some(PathBuf::from(value("--db")?)),
             "--listen" => a.listen = Some(value("--listen")?),
-            "--tag" => a.tag = Some(value("--tag")?),
             "--snapshot-every" => a.snapshot_every = Some(value("--snapshot-every")?),
             "--snapshot-dir" => a.snapshot_dir = Some(PathBuf::from(value("--snapshot-dir")?)),
             "--keep" => a.keep = Some(value("--keep")?),
@@ -145,7 +143,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             super::serve(opts).await
         }
         Some("help") => help(a.arg(1)),
-        Some("user") => user(&a),
         Some("key") => key(&a),
         Some("room") => room(&a),
         Some("forget") => forget(&a),
@@ -159,81 +156,57 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn user(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    // Alone, it is the page -- listing told nobody what else the command does -- and that
-    // needs no database.
-    if matches!(a.arg(1), None | Some("help")) {
-        return help(Some("user"));
-    }
-    let db = a.open()?;
-    match a.arg(1) {
-        Some("add") => {
-            let name = a.arg(2).ok_or_else(|| usage("user add <name>"))?;
-            db.add_user(name)?;
-            let (tag, key) = db.issue_key(name)?;
-            print!("{}", pages::welcome(&format!("User {name} added, tag {tag}. Their tasks show as #N-{tag}."), name, &key));
-        }
-        Some("list") => {
-            let users = db.users()?;
-            if users.is_empty() {
-                println!("no users yet. {} user add <name>", prog());
-            }
-            for u in users {
-                let state = if u.disabled_at.is_some() { "  (disabled)" } else { "" };
-                let tags = if u.tags.is_empty() { "no keys".into() } else { format!("tags {}", u.tags.join(", ")) };
-                println!("{:<16} {}{}", u.name, tags, state);
-            }
-        }
-        Some("disable") => {
-            let name = a.arg(2).ok_or_else(|| usage("user disable <name>"))?;
-            db.disable_user(name)?;
-            println!("user {name} disabled. Their keys stop working; their published work stays.");
-        }
-        Some(other) => return Err(unknown("user", other)),
-        None => unreachable!("the page, above"),
-    }
-    Ok(())
-}
-
 fn key(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // Alone, it is the page -- listing told nobody what else the command does -- and that
     // needs no database.
     if matches!(a.arg(1), None | Some("help")) {
         return help(Some("key"));
     }
+    // A label may be several words without quotes: `key add volker laptop`.
+    let rest = |from: usize| a.pos.get(from..).map(|w| w.join(" ")).unwrap_or_default();
     let db = a.open()?;
     match a.arg(1) {
         Some("add") => {
-            let user = a.arg(2).ok_or_else(|| usage("key add <user>"))?;
-            let (tag, key) = db.issue_key(user)?;
-            print!("{}", pages::welcome(&format!("A key for another of {user}'s machines, tag {tag}."), user, &key));
+            let label = rest(2);
+            if label.trim().is_empty() {
+                return Err(usage("key add <label>   (who it is for, like: volker laptop)"));
+            }
+            let (id, key) = db.issue_key(&label)?;
+            print!("{}", pages::welcome(id, &label, &key));
         }
         Some("list") => {
-            for k in db.keys(a.arg(2))? {
+            let keys = db.keys()?;
+            if keys.is_empty() {
+                println!("no keys yet. {} key add <label>", prog());
+            } else {
+                println!("{:>4}  {:<8} {:<20} {:<24} {}", "id", "tag", "name (theirs)", "label (yours)", "");
+            }
+            for k in keys {
                 let state = match k.revoked_at {
                     Some(_) => "revoked".to_string(),
+                    None if k.tag.is_none() => "not used yet".to_string(),
                     None => format!("last used {}", ago(k.last_used_at)),
                 };
-                println!("{:>4}  {:<16} {:<8} {}", k.id, k.user, k.tag, state);
+                let (tag, name) = (k.tag.unwrap_or_else(|| "-".into()), k.name.unwrap_or_else(|| "-".into()));
+                println!("{:>4}  {:<8} {:<20} {:<24} {}", k.id, tag, name, k.label, state);
             }
         }
         Some("revoke") => {
-            let id: i64 = a.arg(2).and_then(|s| s.parse().ok()).ok_or_else(|| usage("key revoke <id>"))?;
+            let id = db.key_id(a.arg(2).ok_or_else(|| usage("key revoke <tag|id>"))?)?;
             db.revoke_key(id)?;
-            println!("key {id} revoked.");
+            println!("key {id} revoked. Its tag is not given out again.");
         }
         Some("rotate") => {
-            let user = a.arg(2).ok_or_else(|| usage("key rotate <user> [--tag <tag>]"))?;
-            let tags = db.tags_of(user)?;
-            let tag = match (a.tag.as_deref(), tags.as_slice()) {
-                (Some(t), _) if tags.iter().any(|x| x == t) => t.to_string(),
-                (Some(t), _) => return Err(format!("{user} has no tag {t}; theirs: {}", tags.join(", ")).into()),
-                (None, [only]) => only.clone(),
-                (None, []) => return Err(format!("{user} has no key yet: {} key add {user}", prog()).into()),
-                (None, _) => return Err(format!("{user} has one key per machine ({}); say which: --tag <tag>", tags.join(", ")).into()),
-            };
-            let key = db.rotate_key(&tag)?;
-            print!("{}", pages::rotated(user, &tag, &key));
+            let id = db.key_id(a.arg(2).ok_or_else(|| usage("key rotate <tag|id>"))?)?;
+            let label = db.keys()?.into_iter().find(|k| k.id == id).map(|k| k.label).unwrap_or_default();
+            let (tag, key) = db.rotate_key(id)?;
+            print!("{}", pages::rotated(&label, tag.as_deref(), &key));
+        }
+        Some("label") => {
+            let id = db.key_id(a.arg(2).ok_or_else(|| usage("key label <tag|id> <label>"))?)?;
+            let label = rest(3);
+            db.label_key(id, &label)?;
+            println!("key {id} is now labelled \"{}\".", label.trim());
         }
         Some(other) => return Err(unknown("key", other)),
         None => unreachable!("the page, above"),

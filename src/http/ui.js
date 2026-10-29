@@ -1,0 +1,811 @@
+const $ = s => document.querySelector(s);
+let META = null, PROJECT = null, CURSOR = 0, BOARD = null, SKEW = 0, OPEN_TASK = null;
+// Status -> how many rows the person has expanded that column to. A live tick refetches the
+// board, which comes back one page deep, so without this every event silently collapses a
+// column the reader had opened. Cleared whenever the board being looked at changes.
+let EXPANDED = {};
+// Board name -> id. Recall hits name their project; every other call needs the id.
+const PROJECTS = new Map();
+// The picker's value for the All Projects view. Every other value is a board id.
+const ALL = 'all';
+function isAll() { return PROJECT === ALL; }
+// Every board, most recently active first -- {id, name, open} -- for pickers that need ids.
+let BOARDS = [];
+// The live stream. Replaced whenever the view changes, since it is filtered by board.
+let ES = null;
+// The board the repos menu is showing, and its rows. Its own state rather than BOARD's: in
+// All Projects there is no one board on screen, so the menu picks one.
+let REPO_BOARD = null;
+function tasksUrl() { return isAll() ? '/api/all/tasks' : `/api/projects/${PROJECT}/tasks`; }
+
+// ---- helpers ---------------------------------------------------------------
+
+function fail(msg) {
+  const el = $('#err');
+  el.textContent = msg;
+  el.hidden = false;
+  clearTimeout(fail._t);
+  fail._t = setTimeout(() => { el.hidden = true; }, 6000);
+}
+
+// How tasks are named on boards shared through a room (#122-v1), and teammates' text as it is
+// shown, collected from every answer that carries them. Empty on a store that shares nothing,
+// and then every task is the plain #id it always was. Stored text is never rewritten: these are
+// for showing only, never for an edit field.
+const HANDLES = {};
+const TEXTS = {};
+function tref(id) { return HANDLES[id] || ('#' + id); }
+function shown(key, raw) { return Object.prototype.hasOwnProperty.call(TEXTS, key) ? TEXTS[key] : raw; }
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, opts);
+  if (res.status === 204) return null;
+  const body = await res.json().catch(() => null);
+  if (body && body.handles) Object.assign(HANDLES, body.handles);
+  if (body && body.texts) Object.assign(TEXTS, body.texts);
+  if (!res.ok) {
+    const e = body && body.error || {};
+    let msg = e.message || `${res.status} ${res.statusText}`;
+    if (e.code === 'conflict') {
+      msg = 'Someone else changed this while you had it open. Reloading.';
+    } else if (e.code === 'claimed') {
+      msg += ` — if it is the same work, merge the boards first: ai-kanban merge <this board> ${e.key}`;
+    } else if (e.valid) {
+      msg += ` — valid: ${e.valid.join(', ')}`;
+    }
+    const err = new Error(msg);
+    err.code = e.code;
+    err.etag = res.headers.get('etag');
+    throw err;
+  }
+  return { body, etag: res.headers.get('etag') };
+}
+
+// Raw timestamps come from the server with its `now`, so relative times tick here without
+// refetching. Mirrors render::ago on the Rust side.
+function ago(ts) {
+  let d = Math.floor(Date.now() / 1000) - SKEW - ts;
+  if (d < 45) return 'just now';
+  if (d < 5400) return `${Math.round(d / 60)}m`;
+  if (d < 86400) return `${Math.round(d / 3600)}h`;
+  if (d < 2592000) return `${Math.round(d / 86400)}d`;
+  if (d < 31536000) return `${Math.round(d / 2592000)}mo`;
+  return `${Math.round(d / 31536000)}y`;
+}
+// Absolute time, for the hover title. The relative number is the scannable one; this is
+// what you check when it surprises you.
+function when(ts) { return new Date(ts * 1000).toLocaleString(); }
+
+// The newest thing that happened on a task, which is NOT updated_at: a `log` entry records a
+// comment without touching the task row, deliberately -- the board sorts by updated_at, so
+// letting a remark bump it would float a task nobody actually moved to the top of a column.
+function lastActivity(events) {
+  return events && events.length ? Math.max(...events.map(e => e.ts)) : null;
+}
+
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function fillSelect(el, values, selected) {
+  el.innerHTML = values.map(v => `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(v)}</option>`).join('');
+}
+
+// ---- board -----------------------------------------------------------------
+
+async function loadBoard() {
+  if (!PROJECT) return;
+  const { body } = await api(isAll() ? '/api/all/board' : `/api/projects/${PROJECT}/board`);
+  BOARD = body;
+  // Reset, not merged: a board reload is the authoritative set for what it lists, and
+  // keeping stale entries would show a tag on a task it was removed from.
+  TAGS = {};
+  mergeTags(body.task_tags);
+  LINKS = {};
+  mergeLinks(body.task_links);
+  SKEW =Math.floor(Date.now() / 1000) - body.now;
+  CURSOR = body.cursor;
+  await restoreExpanded();
+  render();
+}
+
+// Re-opens the columns the reader had expanded, in ONE request each rather than by replaying
+// the pages they clicked through. A cursor walk would cost a round trip per page on every
+// event; asking for the rows directly costs one per expanded column and needs no bookkeeping
+// beyond a row count.
+//
+// The server caps `limit` at 200, so a column expanded past that comes back at 200 and the
+// button reappears for the rest. That is a worse outcome than remembering exactly, and a much
+// better one than silently dropping back to 50.
+async function restoreExpanded() {
+  for (const col of BOARD.columns) {
+    const want = EXPANDED[col.status];
+    if (!want || want <= col.tasks.length) continue;
+    try {
+      const { body } = await api(tasksUrl()
+        + `?status=${encodeURIComponent(col.status)}&limit=${Math.min(want, 200)}`);
+      col.tasks = body.tasks;
+      col.next = body.next;
+      mergeTags(body.task_tags);
+      mergeLinks(body.task_links);
+    } catch (e) {
+      // A column that fails to re-expand is not worth losing the rest of the board over --
+      // it simply comes back one page deep, which is the old behaviour.
+      fail(e.message);
+    }
+  }
+}
+
+// Options for a workstream picker. The empty value means two different things depending on
+// where it is used -- "the whole board" in the topbar, "no workstream" in the new-task
+// dialog -- so the label is passed in rather than assumed.
+//
+// Lists only. Creating a workstream is the AGENT's job: it starts one when you tell it what
+// you are working on, which is the moment the name is actually known. Offering "+ new" here
+// would invite a name typed in isolation, and a near-miss spelling is how one workstream
+// quietly becomes two. The server refuses unknown names for the same reason, so this is not
+// the only thing holding the rule up.
+function workstreamOptions(blank, selected) {
+  const list = (BOARD && BOARD.workstreams) || [];
+  const opts = list.map(w => {
+    const name = w.workstream.name;
+    const on = name === selected ? ' selected' : '';
+    return `<option value="${esc(name)}"${on}>${esc(name)} (${w.open})</option>`;
+  });
+  return `<option value=""${selected ? '' : ' selected'}>${esc(blank)}</option>` + opts.join('');
+}
+
+function renderWorkstream() {
+  const current = BOARD.workstream ? BOARD.workstream.name : '';
+  $('#workstream').innerHTML = workstreamOptions('all work', current);
+}
+
+// A card holds only its blocker's id, so it cannot tell whether that blocker is still
+// blocking. Without this a finished blocker keeps the card reading "do not pick this up",
+// and every blocker is eventually finished -- so the board gets less true over time.
+// Tags come alongside the rows, not on them: `tags` is out of TASK_COLS server-side, so a
+// listed task does not carry it. Merged rather than replaced, because a paged-in column
+// brings the tags for its own rows only.
+let TAGS = {};
+function mergeTags(map) { Object.assign(TAGS, map || {}); }
+function tagsOf(id) { return TAGS[String(id)] || []; }
+
+// Repos and the external ref ride beside the rows for the reason tags do -- neither is in
+// TASK_COLS server-side -- and are merged rather than replaced for the same reason too.
+let LINKS = {};
+function mergeLinks(map) { Object.assign(LINKS, map || {}); }
+function linksOf(id) { return LINKS[String(id)] || { repos: [], external_ref: null }; }
+// Whether the repos menu is what the side panel shows, so a live tick can redraw it.
+let REPOS_OPEN = false;
+
+// "no repo set" only on a board that tracks repos, and only on open work -- the rule the
+// agent's board line follows, so the two views never disagree about which tickets need one.
+// Whether the task's own board tracks repos. In one board's view that is the board on
+// screen; in All Projects each card answers by its own board's rule.
+function tracksRepos(t) {
+  return isAll() ? (BOARD.boards_with_repos || []).includes(t.project_id) : (BOARD.repos || []).length > 0;
+}
+
+function boardName(pid) {
+  const p = (BOARD.projects || []).find(x => x.id === pid);
+  return p ? p.name : `board ${pid}`;
+}
+
+function repoChips(t) {
+  const l = linksOf(t.id);
+  let out = l.repos.map(r => `<span class="repo">${esc(r)}</span>`).join('');
+  if (!l.repos.length && tracksRepos(t) && META.open_statuses.includes(t.status)) {
+    out += '<span class="norepo">no repo set</span>';
+  }
+  if (l.external_ref) out += `<span class="xref">ref ${esc(l.external_ref)}${refLink(l.external_ref)}</span>`;
+  return out;
+}
+
+// A ↗ to the issue in its tracker, when the server was given a link template (`{ref}` is
+// replaced; without one the ref is appended). stopPropagation: it sits on a card, and a
+// click on the card opens the ticket.
+function refUrl(raw) {
+  const r = String(raw || '').trim().replace(/^#/, '').trim();
+  const tpl = META.ref_url;
+  if (!tpl || !r) return null;
+  const enc = encodeURIComponent(r);
+  return tpl.includes('{ref}') ? tpl.split('{ref}').join(enc) : tpl + enc;
+}
+function refLink(r) {
+  const url = refUrl(r);
+  return url ? ` <a class="xref" href="${esc(url)}" target="_blank" rel="noopener" title="open ${esc(r)} in its tracker">↗</a>` : '';
+}
+
+// Checkboxes rather than a free-text field: a ticket can only name repos this board owns,
+// and a typed name that almost matches is exactly the error a picker cannot make.
+function repoPicker(selected, list = (BOARD && BOARD.repos) || []) {
+  if (!list.length) return '<span class="dim2">no repos on this board yet — add them under “repos”</span>';
+  return list.map(r => `<label class="pick"><input type="checkbox" value="${r.repo.id}"${
+    selected.includes(r.repo.id) ? ' checked' : ''}>${esc(r.repo.name)}</label>`).join('');
+}
+function pickedRepos(el) {
+  return [...el.querySelectorAll('input[type=checkbox]:checked')].map(c => Number(c.value));
+}
+
+function blockerDone(id) {
+  const row = (BOARD.blocker_status || []).find(b => b.id === id);
+  return row && (row.status === 'done' || row.status === 'archived');
+}
+
+function render() {
+  const b = BOARD;
+  renderWorkstream();
+  // A workstream is a slice of ONE board, so All Projects has none to offer. The repos menu
+  // stays: there it asks which board.
+  $('#workstream').closest('label').hidden = isAll();
+  $('#columns').innerHTML = b.columns.map(col => {
+    const cards = col.tasks.map(t => `
+      <div class="card ${esc(t.task_type)}" data-id="${t.id}" data-pid="${t.project_id}">
+        <span class="t">${esc(tref(t.id))} ${esc(t.title)}</span>
+        <span class="m">
+          ${isAll() ? `<span class="board">${esc(boardName(t.project_id))}</span>` : ''}
+          <span>${esc(t.task_type)}</span>
+          ${t.priority !== 'normal' ? `<span class="pri-${esc(t.priority)}">${esc(t.priority)}</span>` : ''}
+          ${t.origin === 'user' ? '<span class="badge-user">user</span>' : ''}
+          ${t.blocked_by ? `<span>blocked by ${esc(tref(t.blocked_by))}${blockerDone(t.blocked_by) ? ' (done)' : ''}</span>` : ''}
+          ${repoChips(t)}
+          ${tagsOf(t.id).map(g => `<span class="tag">${esc(g)}</span>`).join('')}
+          <span class="dim2" title="updated ${when(t.updated_at)}&#10;created ${when(t.created_at)}">upd ${ago(t.updated_at)}</span>
+        </span>
+      </div>`).join('');
+    // A column lists at most one page while its header counts every task in that status,
+    // so a truncated column has to SAY it is truncated. An unqualified "75" above 50 cards
+    // is how a task becomes invisible with nothing on screen looking wrong -- you cannot
+    // scroll to it, and browser find cannot see it, because it was never in the document.
+    // "50 / 75", not "50 of 75": the header is uppercased and letter-spaced, which turns a
+    // word into something that reads as a code rather than a sentence. A slash survives it.
+    const shown = col.tasks.length < col.total ? `${col.tasks.length} / ${col.total}` : `${col.total}`;
+    const rest = col.total - col.tasks.length;
+    // Two ways to the same action: the header, where you notice rows are missing, and the
+    // foot of the column, where you arrive after scrolling the ones that are there.
+    const count = col.next
+      ? `<button class="count-more" data-more="${esc(col.status)}" title="load the remaining ${rest}">${shown}</button>`
+      : `<span>${shown}</span>`;
+    const more = col.next
+      ? `<button class="more" data-more="${esc(col.status)}">load ${rest} more</button>`
+      : '';
+    return `<div class="col ${esc(col.status)}">
+      <h2><span>${esc(col.status)}</span>${count}</h2>
+      <div class="cards">${cards || '<div class="empty">nothing here</div>'}</div>
+      ${more}
+    </div>`;
+  }).join('');
+
+  // A click on the tracker link inside a card follows the link, not the card.
+  document.querySelectorAll('.card').forEach(c =>
+    c.onclick = e => !e.target.closest('a') && confirmLeave() && openTask(Number(c.dataset.id), Number(c.dataset.pid)));
+  document.querySelectorAll('[data-more]').forEach(b =>
+    b.onclick = () => loadMore(b.dataset.more));
+}
+
+// Appends the next page into the column already on screen. The server scopes `/tasks` to the
+// same current workstream the board is scoped to, so page two cannot pull in rows the header
+// did not count.
+//
+// A live-stream tick calls loadBoard and collapses the column back to one page. That is
+// deliberate: keeping it expanded means replaying N pages on every event, and the state to
+// get that wrong costs more than re-clicking a button.
+async function loadMore(status) {
+  const col = BOARD && BOARD.columns.find(c => c.status === status);
+  if (!col || !col.next) return;
+  try {
+    const { body } = await api(tasksUrl()
+      + `?status=${encodeURIComponent(status)}&cursor=${encodeURIComponent(col.next)}`);
+    col.tasks = col.tasks.concat(body.tasks);
+    col.next = body.next;
+    mergeTags(body.task_tags);
+    mergeLinks(body.task_links);
+    EXPANDED[status] = col.tasks.length;
+    render();
+  } catch (e) { fail(e.message); }
+}
+
+// ---- workstream ------------------------------------------------------------
+
+// Setting the scope is an explicit PUT, not a side effect of looking. The agent enters a
+// workstream by asking to see it, because for an agent an extra call is one that gets
+// skipped -- but a person clicking a control is already stating intent, and making the
+// change implicit would move where their work is filed without them knowing.
+async function setWorkstream(name) {
+  if (!confirmLeave()) { renderWorkstream(); return; }
+  try {
+    await api(`/api/projects/${PROJECT}/workstream`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: name || null }),
+    });
+    $('#panel').hidden = true;
+    REPOS_OPEN = false;
+    // A different slice of the board is a different set of columns; carrying the expansion
+    // over would re-open something the reader never expanded here.
+    EXPANDED = {};
+    await loadBoard();
+  } catch (e) { fail(e.message); }
+}
+
+$('#workstream').onchange = e => setWorkstream(e.target.value);
+
+// ---- task detail -----------------------------------------------------------
+
+// ---- the side panel: unsaved edits ------------------------------------------
+
+// Everything the task form can send, as one comparable value. Taken when the panel opens,
+// compared on every input: equal means there is nothing to save and nothing to lose.
+function taskFormState() {
+  return JSON.stringify([$('#st').value, $('#pr').value, $('#ws').value, $('#tags').value.trim(),
+    $('#xref').value.trim(), pickedRepos($('#repopick')), $('#log').value.trim()]);
+}
+
+function panelDirty() {
+  if ($('#panel').hidden) return false;
+  if (OPEN_TASK && OPEN_TASK.clean !== undefined && $('#st')) return taskFormState() !== OPEN_TASK.clean;
+  if (REPOS_OPEN) return !!(($('#rpath') && $('#rpath').value.trim()) || ($('#rname') && $('#rname').value.trim()));
+  return false;
+}
+
+// True when it is fine to leave the panel -- nothing typed, or the person said to drop it.
+function confirmLeave() {
+  return !panelDirty() || confirm('You have unsaved changes in the open panel. Discard them?');
+}
+
+function closePanel() {
+  if (!confirmLeave()) return;
+  $('#panel').hidden = true;
+  OPEN_TASK = null;
+  REPOS_OPEN = false;
+}
+
+// A click outside the drawer closes it, through the same unsaved-edit guard as Esc.
+$('#scrim').onclick = closePanel;
+
+// Esc closes the panel -- but not while the new-task dialog is up, which handles Esc itself.
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape' || $('#panel').hidden || $('#newdlg').open) return;
+  e.preventDefault();
+  closePanel();
+});
+
+window.addEventListener('beforeunload', e => {
+  if (panelDirty()) { e.preventDefault(); e.returnValue = ''; }
+});
+
+// `pid` is the task's board. In one board's view that is the board on screen; in All Projects
+// every card carries its own, and cards inside the panel (blocker, blocking) share the open
+// task's.
+async function openTask(id, pid) {
+  pid = pid || (isAll() ? OPEN_TASK && OPEN_TASK.pid : PROJECT);
+  const { body, etag } = await api(`/api/projects/${pid}/tasks/${id}`);
+  // A task can only name its OWN board's repos. In one board's view they came with the
+  // board; in All Projects there is no one board on screen, so they are asked for.
+  const boardRepos = isAll()
+    ? (await api(`/api/projects/${pid}/repos`)).body.repos
+    : (BOARD.repos || []);
+  OPEN_TASK = { id, pid, version: body.task.version, etag };
+  REPOS_OPEN = false;
+  const t = body.task;
+
+  const statuses = META.statuses.map(s => s.value);
+  $('#panel').innerHTML = `
+    <div class="row" style="justify-content:space-between">
+      <h2>${esc(tref(t.id))} ${esc(t.title)}</h2>
+      <button id="close">close</button>
+    </div>
+    <div class="m dim2" style="font-size:11px">
+      board ${esc(body.project.name)} · ${esc(t.task_type)} · ${esc(t.origin)} · v${t.version}<br>
+      created ${ago(t.created_at)} ago · updated ${ago(t.updated_at)} ago${lastActivity(body.events) !== null
+        ? ` · last activity ${ago(lastActivity(body.events))} ago` : ''}
+    </div>
+
+    <section>
+      <div class="row">
+        <select id="st"></select>
+        <select id="pr"></select>
+        <select id="ws"></select>
+        <input id="log" class="grow" placeholder="why (recorded in history)">
+        <button id="save" class="primary">save</button>
+      </div>
+      <div class="row" style="margin-top:7px">
+        <!-- Freeform on purpose: tags exist so the status set can stay fixed, and a
+             picker would quietly turn them back into a controlled vocabulary. -->
+        <input id="tags" class="grow" placeholder="tags, comma separated (in review, waiting-on-vendor)">
+      </div>
+      <div class="row" style="margin-top:7px">
+        <input id="xref" size="16" placeholder="tracker issue">
+        <a id="xreflink" class="xref" target="_blank" rel="noopener" title="open in its tracker" hidden>↗</a>
+        <span id="repopick" class="row"></span>
+      </div>
+    </section>
+
+    ${body.repos && body.repos.length ? `<section><h3>repos</h3>${body.repos.map(r => `
+      <div class="reporow"><b>${esc(r.name)}</b><span class="p">${esc(r.path)}</span></div>`).join('')}</section>` : ''}
+
+    ${t.body ? `<section><h3>detail</h3><pre class="body">${esc(shown('task:' + t.id, t.body))}</pre></section>` : ''}
+
+    ${body.blocker ? `<section><h3>blocked by</h3><div class="card" data-id="${body.blocker.id}">
+      <span class="t">${esc(tref(body.blocker.id))} ${esc(body.blocker.title)}</span></div></section>` : ''}
+
+    ${body.blocking.length ? `<section><h3>blocking</h3>${body.blocking.map(x =>
+      `<div class="card" data-id="${x.id}"><span class="t">${esc(tref(x.id))} ${esc(x.title)}</span></div>`).join('')}</section>` : ''}
+
+    ${body.notes.length ? `<section><h3>notes</h3>${body.notes.map(n => `
+      <div class="note">
+        <b>#${n.id} ${esc(n.title)}</b> <span class="dim2">${ago(n.updated_at)}</span>
+        ${n.body ? `<div style="margin-top:5px">${esc(n.body)}</div>` : ''}
+        ${n.paths.length ? `<div class="paths">${n.paths.map(esc).join(' · ')}</div>` : ''}
+      </div>`).join('')}</section>` : ''}
+
+    <section><h3>history</h3>${body.events.map(e => `
+      <div class="ev">
+        <span class="dim2">${ago(e.ts)}</span>
+        <span class="k">${esc(e.kind)}</span>
+        <span class="dim2">${esc(e.actor)}</span>
+        <div>${esc(shown('event:' + e.id, e.body))}</div>
+      </div>`).reverse().join('') || '<div class="empty">nothing yet</div>'}
+    </section>
+
+    <section>
+      <h3>danger</h3>
+      <button id="forget" class="danger">forget permanently</button>
+      <div class="dim2" style="margin-top:6px; font-size:11px">
+        Deletes this task and its history. Notes written while working on it survive.
+        Not recoverable except from a backup.
+      </div>
+    </section>`;
+
+  fillSelect($('#st'), statuses, t.status);
+  fillSelect($('#pr'), META.priorities, t.priority);
+  // Preselected with the task's OWN workstream, not the board's -- this control moves the
+  // task, and defaulting it to the current scope would silently re-file everything the
+  // panel touched.
+  $('#ws').innerHTML = workstreamOptions('no workstream',
+    body.workstream ? body.workstream.name : '');
+  $('#tags').value = (body.tags || []).join(', ');
+  $('#xref').value = body.external_ref || '';
+  $('#repopick').innerHTML = repoPicker((body.repos || []).map(r => r.id), boardRepos);
+  // Workstreams are slices of ONE board; All Projects has none to offer.
+  $('#ws').hidden = isAll();
+  $('#panel').hidden = false;
+  $('#close').onclick = closePanel;
+  $('#save').onclick = () => saveTask(id);
+  // The link follows the field as it is typed, so it always opens the number shown.
+  const syncRefLink = () => {
+    const url = refUrl($('#xref').value);
+    $('#xreflink').hidden = !url;
+    if (url) $('#xreflink').href = url;
+  };
+  $('#xref').addEventListener('input', syncRefLink);
+  syncRefLink();
+  $('#forget').onclick = () => forgetTask(id, t.title);
+  $('#panel').querySelectorAll('.card').forEach(c =>
+    c.onclick = () => confirmLeave() && openTask(Number(c.dataset.id)));
+  // What "unsaved" is measured against, and what keeps save from being pressed with nothing
+  // to save -- the server refuses to record that too, but a button that does nothing is noise.
+  OPEN_TASK.clean = taskFormState();
+  const sync = () => { if ($('#st')) $('#save').disabled = taskFormState() === OPEN_TASK.clean; };
+  $('#panel').oninput = sync;
+  $('#panel').onchange = sync;
+  sync();
+}
+
+async function saveTask(id) {
+  const pid = OPEN_TASK.pid;
+  try {
+    await api(`/api/projects/${pid}/tasks/${id}`, {
+      method: 'PATCH',
+      // The version this edit is based on. Without it the server refuses the write rather
+      // than silently overwriting a change made while the panel was open.
+      headers: { 'content-type': 'application/json', 'if-match': `"${OPEN_TASK.version}"` },
+      body: JSON.stringify({
+        status: $('#st').value,
+        priority: $('#pr').value,
+        // Always sent: the control shows the task's current workstream, so leaving it
+        // alone and moving it are both explicit rather than one being an omission.
+        // Not sent from All Projects, where the control is hidden: absent leaves it alone.
+        workstream: isAll() ? undefined : $('#ws').value,
+        // Always sent, like `workstream`: the field shows the current set, so clearing it
+        // and leaving it alone are both explicit rather than one being an omission.
+        tags: $('#tags').value.split(',').map(t => t.trim()).filter(Boolean),
+        // Always sent, like tags: the controls show the current values, so clearing and
+        // leaving alone are both explicit. "" is the API's "no external ref"; the server
+        // normalizes the rest and says what it refused.
+        repos: pickedRepos($('#repopick')),
+        external_ref: $('#xref').value.trim(),
+        log: $('#log').value || null,
+      }),
+    });
+    await loadBoard();
+    await openTask(id, pid);
+  } catch (e) {
+    fail(e.message);
+    if (e.code === 'conflict') { await loadBoard(); await openTask(id, pid); }
+  }
+}
+
+async function forgetTask(id, title) {
+  if (!confirm(`Permanently forget #${id} "${title}" and its history?\n\nThis cannot be undone.`)) return;
+  try {
+    await api(`/api/projects/${OPEN_TASK.pid}/tasks/${id}`, { method: 'DELETE' });
+    $('#panel').hidden = true;
+    OPEN_TASK = null;
+    await loadBoard();
+  } catch (e) { fail(e.message); }
+}
+
+// ---- search ----------------------------------------------------------------
+
+let searchTimer;
+$('#search').oninput = e => {
+  clearTimeout(searchTimer);
+  const q = e.target.value.trim();
+  if (!q) { $('#panel').hidden = true; return; }
+  searchTimer = setTimeout(() => runSearch(q), 250);
+};
+
+async function runSearch(q) {
+  // Results replace the panel, so they wait rather than wipe an edit in progress. A
+  // confirm() here would fire on every keystroke of the search.
+  if (panelDirty()) { fail('Save or close the open panel before searching.'); return; }
+  try {
+    const { body } = await api(`/api/recall?q=${encodeURIComponent(q)}`);
+    REPOS_OPEN = false;
+    OPEN_TASK = null;
+    $('#panel').innerHTML = `
+      <div class="row" style="justify-content:space-between">
+        <h2>recall: ${esc(q)}</h2><button id="close">close</button>
+      </div>
+      <div class="dim2" style="font-size:11px">${esc(body.scope)} · ${body.hits.length} hits${body.omitted ? ` (+${body.omitted} more)` : ''}</div>
+      <section>${body.hits.map((h, i) => `
+        <div class="hit${h.task_id ? ' open' : ''}" ${h.task_id ? `data-hit="${i}"` : ''}>
+          <div class="dim2" style="font-size:11px">
+            ${esc(h.kind)} · ${esc(h.project)} ${h.task_id ? `· ${esc(tref(h.task_id))}` : ''} · ${ago(h.ts)}
+          </div>
+          <b>${esc(h.title)}</b>
+          <div style="margin-top:4px">${esc(shown('hit:' + i, h.snippet)).replace(/&gt;&gt;/g, '<mark>').replace(/&lt;&lt;/g, '</mark>')}</div>
+        </div>`).join('') || '<div class="empty">nothing found</div>'}
+      </section>`;
+    $('#panel').hidden = false;
+    $('#close').onclick = () => { $('#panel').hidden = true; };
+    // Only hits that point at a task are clickable. Note hits and title-only event hits have
+    // no task_id, and a result that looks openable and does nothing is worse than a plain one.
+    $('#panel').querySelectorAll('.hit.open').forEach(el =>
+      el.onclick = () => openHit(body.hits[Number(el.dataset.hit)]));
+  } catch (e) { fail(e.message); }
+}
+
+// Follows a hit to its task. Recall searches EVERY board, so a hit can belong to a project
+// that is not the one on screen, and it carries a project *name* rather than an id -- hence
+// the lookup built at boot.
+//
+// The board switch goes through the picker's own onchange rather than being repeated here:
+// that handler is what closes the current event stream and opens a new one. Switching
+// inline would leave the old EventSource attached to the previous board.
+async function openHit(h) {
+  try {
+    const hitBoard = PROJECTS.get(h.project);
+    const here = BOARD && BOARD.project && BOARD.project.name;
+    // All Projects already shows every board, so a hit opens in place.
+    if (!isAll() && h.project !== here) {
+      const id = hitBoard;
+      if (!id) { fail(`board "${h.project}" is not in the picker`); return; }
+      const sel = $('#project');
+      sel.value = String(id);
+      // A <select> silently keeps its old value when assigned one no option carries, and
+      // onchange would then read the wrong board -- or `Number("")` = 0, fetching
+      // /api/projects/0. Cannot happen today (the map and the options are filled from one
+      // response and neither is refreshed), which is exactly why it would go unnoticed the
+      // day one of them starts refreshing without the other.
+      if (sel.value !== String(id)) { fail(`board "${h.project}" is no longer listed`); return; }
+      await sel.onchange();
+    }
+    // openTask is otherwise only reached from a card that provably exists. From a search
+    // result the task may have been forgotten since it was indexed, so a 404 is reachable
+    // and would otherwise surface as nothing at all.
+    await openTask(h.task_id, hitBoard);
+  } catch (e) { fail(e.message); }
+}
+
+// ---- repos -----------------------------------------------------------------
+
+// Read-only, like the rest of this page: repos are registered and managed by the agent
+// (`repo_add`) or from a terminal (`ai-kanban repo ...`), never from here. This page is for
+// looking at what the agent's board holds, not for running the work.
+async function openRepos(pid) {
+  REPOS_OPEN = true;
+  OPEN_TASK = null;
+  REPO_BOARD = pid;
+  let list = [];
+  try { list = (await api(`/api/projects/${pid}/repos`)).body.repos; } catch (e) { fail(e.message); }
+  const title = (BOARDS.find(b => b.id === pid) || {}).name || `board ${pid}`;
+  const me = pid;
+  $('#panel').innerHTML = `
+    <div class="row" style="justify-content:space-between">
+      <h2>repos · ${isAll() ? `<select id="rboard">${boardOptions(pid)}</select>` : esc(title)}</h2>
+      <button id="close">close</button>
+    </div>
+    <div class="dim2" style="font-size:11px">
+      The local checkouts this board's tickets live in. A repo can be on several boards, but its
+      folder opens on one of them, its home: that is where an agent opening it lands. An open
+      ticket naming none of this board's repos shows “no repo set”.
+    </div>
+    <section><h3>on this board</h3>${list.map(r => {
+      const home = r.repo.home_project_id === me;
+      return `
+      <div class="reporow">
+        <b>${esc(r.repo.name)}</b>
+        <span class="p">${esc(r.repo.path)}<br>${home ? 'opens here' : `opens on ${esc(r.home_board)}`}${
+          r.other_boards.length ? ` · also on ${r.other_boards.map(esc).join(', ')}` : ''}</span>
+        <span class="dim2">${r.open} open / ${r.total} tickets</span>
+      </div>`;
+    }).join('') || '<div class="empty">none yet</div>'}
+    </section>
+    <div class="dim2" style="font-size:11px">
+      Changed by the agent, or in a terminal: <code>ai-kanban repo add|rm|rename|home|forget</code>,
+      <code>ai-kanban board add|forget</code>.
+    </div>`;
+  $('#panel').hidden = false;
+  $('#close').onclick = closePanel;
+  $('#panel').oninput = $('#panel').onchange = null;
+  if ($('#rboard')) $('#rboard').onchange = e => openRepos(Number(e.target.value));
+}
+
+// In All Projects the menu opens on the board it showed last, else the most recently active.
+$('#repobtn').onclick = () => {
+  if (!BOARD || !BOARDS.length) return;
+  const pid = isAll() ? (BOARDS.some(b => b.id === REPO_BOARD) ? REPO_BOARD : BOARDS[0].id) : PROJECT;
+  openRepos(pid);
+};
+
+// ---- new task --------------------------------------------------------------
+
+function boardOptions(selected) {
+  return BOARDS.map(b => `<option value="${b.id}"${b.id === selected ? ' selected' : ''}>${esc(b.name)}</option>`).join('');
+}
+
+async function fillNewRepos(pid) {
+  try {
+    const { body } = await api(`/api/projects/${pid}/repos`);
+    $('#newrepos').innerHTML = repoPicker([], body.repos);
+  } catch (e) { fail(e.message); }
+}
+
+$('#new').onclick = async () => {
+  if (!BOARDS.length) { fail('No board yet: an agent working in a repo creates one, or run `ai-kanban board add <name>`.'); return; }
+  const f = $('#newdlg form');
+  f.reset();
+  fillSelect(f.type, META.types, 'task');
+  fillSelect(f.priority, META.priorities, 'normal');
+  fillSelect(f.status, META.open_statuses, 'backlog');
+  // In All Projects there is no board on screen, so the dialog asks which one -- and shows no
+  // workstream, which only exists inside one board. The ticket then inherits that board's
+  // current workstream, as the agent's filing does.
+  const all = isAll();
+  $('#newboardfield').hidden = !all;
+  $('#newwsfield').hidden = all;
+  if (all) {
+    f.board.innerHTML = boardOptions(BOARDS[0].id);
+    f.board.onchange = () => fillNewRepos(Number(f.board.value));
+    await fillNewRepos(Number(f.board.value));
+  } else {
+    // Prefilled with the board's current workstream and shown, never silent. A task landing
+    // in a scope the person could not see is the whole bug this UI change exists to fix.
+    f.workstream.innerHTML = workstreamOptions('no workstream (general)',
+      BOARD && BOARD.workstream ? BOARD.workstream.name : '');
+    $('#newrepos').innerHTML = repoPicker([]);
+  }
+  $('#newdlg').showModal();
+};
+
+$('#newdlg').addEventListener('close', async () => {
+  const d = $('#newdlg');
+  if (d.returnValue !== 'ok') return;
+  const f = d.querySelector('form');
+  if (!f.title.value.trim()) return;
+  const pid = isAll() ? Number(f.board.value) : PROJECT;
+  try {
+    await api(`/api/projects/${pid}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        title: f.title.value, body: f.body.value,
+        type: f.type.value, priority: f.priority.value, status: f.status.value,
+        // Always sent in one board's view, including as "" for general work: the field is on
+        // screen, so the choice shown is the choice made. Omitted in All Projects, where
+        // there is no field and the board's current workstream is inherited.
+        workstream: isAll() ? undefined : f.workstream.value,
+        repos: pickedRepos($('#newrepos')),
+        external_ref: f.xref.value.trim(),
+      }),
+    });
+    await refreshProjects();
+    await loadBoard();
+  } catch (e) { fail(e.message); }
+});
+
+// ---- live updates ----------------------------------------------------------
+
+// The stream carries a cursor, never rows: we refetch what we are showing. See
+// docs/http-api.md for why that is cheaper than maintaining a second representation of
+// every mutation.
+function connect() {
+  const es = new EventSource(isAll() ? '/api/stream' : `/api/stream?project=${PROJECT}`);
+  const mark = (on, text) => { $('#live').className = on ? 'on' : ''; $('#live').textContent = text; };
+
+  es.onopen = () => mark(true, 'live');
+  es.onerror = () => mark(false, 'reconnecting');
+  const onChange = async ev => {
+    const d = JSON.parse(ev.data);
+    if (d.reset || d.cursor > CURSOR) {
+      // The picker's "(N open)" counts move with every change, on any board.
+      try { await refreshProjects(); } catch { /* the board itself still refreshes */ }
+      await loadBoard();
+      // Never redraw over an edit in progress: the refresh would silently throw it away.
+      if (panelDirty()) { /* keep what is being typed */ }
+      else if (OPEN_TASK) { try { await openTask(OPEN_TASK.id, OPEN_TASK.pid); } catch { /* it may be gone */ } }
+      // Counts in the menu change whenever an agent links a ticket, so it redraws too.
+      else if (REPOS_OPEN) openRepos(REPO_BOARD);
+    }
+    mark(true, 'live');
+  };
+  es.addEventListener('change', onChange);
+  es.addEventListener('reset', onChange);
+  return es;
+}
+
+// ---- boot ------------------------------------------------------------------
+
+// Rebuilds the board picker from /api/projects. `select` is what it shows afterwards -- a
+// board just created -- and defaults to what is on screen.
+async function refreshProjects(select) {
+  const { body } = await api('/api/projects');
+  BOARDS = body.projects.map(p => ({ id: p.project.id, name: p.project.name, open: p.open }));
+  PROJECTS.clear();
+  BOARDS.forEach(b => PROJECTS.set(b.name, b.id));
+  const total = BOARDS.reduce((n, b) => n + b.open, 0);
+  const sel = $('#project');
+  sel.innerHTML = `<option value="${ALL}">All projects (${total} open)</option>`
+    + BOARDS.map(b => `<option value="${b.id}">${esc(b.name)} (${b.open} open)</option>`).join('');
+  sel.value = String(select ?? PROJECT ?? '');
+}
+
+async function onProjectChange() {
+  const sel = $('#project');
+  if (!confirmLeave()) { sel.value = String(PROJECT); return; }
+  PROJECT = sel.value === ALL ? ALL : Number(sel.value);
+  history.replaceState(null, '', `?project=${PROJECT}`);
+  $('#panel').hidden = true;
+  REPOS_OPEN = false;
+  OPEN_TASK = null;
+  EXPANDED = {};
+  if (ES) ES.close();
+  await loadBoard();
+  ES = connect();
+}
+
+(async function boot() {
+  try {
+    META = (await api('/api/meta')).body;
+    await refreshProjects(null);
+    const sel = $('#project');
+    sel.onchange = onProjectChange;
+    if (!BOARDS.length) {
+      $('#columns').innerHTML = '<div class="empty">No boards yet. Create one with “+ board”, or an agent creates one the first time it uses ai-kanban in a project.</div>';
+      return;
+    }
+    // The board named in the URL, else All Projects. Falling back to the most recently
+    // active board made the landing page depend on whichever repo an agent touched last.
+    const wanted = new URLSearchParams(location.search).get('project');
+    const known = wanted === ALL || BOARDS.some(b => String(b.id) === wanted);
+    sel.value = known ? wanted : ALL;
+    PROJECT = sel.value === ALL ? ALL : Number(sel.value);
+    ES = connect();
+
+    await loadBoard();
+    // Re-render once a minute so relative times stay honest on an idle board.
+    setInterval(() => { if (BOARD) render(); }, 60000);
+  } catch (e) {
+    fail(e.message);
+  }
+})();
