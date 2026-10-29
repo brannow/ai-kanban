@@ -1,6 +1,6 @@
 [package]
 name = "ai-kanban-relay"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "The relay a team shares ai-kanban boards through. See docs/sync.md."
 license-file = "../../LICENSE"
