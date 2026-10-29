@@ -484,6 +484,17 @@ different reasons.
   and auth, and stores the rest unread. So a new status or field needs only client upgrades, and
   members upgrade at their own pace.
 - Breaking the envelope means `/v2`, served alongside `/v1` for a transition.
+- **Each client says what it is**: `User-Agent: ai-kanban/0.2.0 (protocol 1)`
+  (`protocol::client_agent`). The relay records it per key (`key list` shows the version,
+  "older" for a 0.1.x client, which sent its HTTP library's), and the debug log shows it per
+  request. That is how the admin sees who would be stopped before raising
+  `MIN_PROTOCOL_VERSION`.
+- **Both sides enforce the range.** The client checks `hello` before every round and pauses
+  itself when it falls outside. The relay refuses with `426 Upgrade Required` a client that says
+  it speaks less than the minimum -- so it does not rest on every client checking. A
+  `User-Agent` that does not say (an older ai-kanban, another program) passes, as there is
+  nothing to refuse it on. A client given a 426 pauses, with the relay's message, until an
+  update lets `check_identity` pass again.
 
 ## Server
 

@@ -179,7 +179,7 @@ fn key(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
             if keys.is_empty() {
                 println!("no keys yet. {} key add <label>", prog());
             } else {
-                println!("{:>4}  {:<8} {:<20} {:<24} {}", "id", "tag", "name (theirs)", "label (yours)", "");
+                println!("{:>4}  {:<8} {:<20} {:<24} {:<10} {}", "id", "tag", "name (theirs)", "label (yours)", "runs", "");
             }
             for k in keys {
                 let state = match k.revoked_at {
@@ -188,7 +188,12 @@ fn key(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     None => format!("last used {}", ago(k.last_used_at)),
                 };
                 let (tag, name) = (k.tag.unwrap_or_else(|| "-".into()), k.name.unwrap_or_else(|| "-".into()));
-                println!("{:>4}  {:<8} {:<20} {:<24} {}", k.id, tag, name, k.label, state);
+                // The version an ai-kanban says it is; "older" for one from before it said (0.1.x).
+                let runs = match k.client.as_deref() {
+                    None => "-".to_string(),
+                    Some(a) => ai_kanban_protocol::parse_client_agent(a).map(|c| c.version).unwrap_or_else(|| "older".into()),
+                };
+                println!("{:>4}  {:<8} {:<20} {:<24} {:<10} {}", k.id, tag, name, k.label, runs, state);
             }
         }
         Some("revoke") => {

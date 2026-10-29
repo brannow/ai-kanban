@@ -25,6 +25,29 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// envelope first changes; a breaking change gets a new route prefix instead (`/v2`).
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
+/// The `User-Agent` an ai-kanban client sends: `ai-kanban/0.2.0 (protocol 1)`. The relay records
+/// it per key, so its admin can see who runs what before raising `MIN_PROTOCOL_VERSION`, and it
+/// refuses a client that says it speaks less than that.
+pub fn client_agent(version: &str) -> String {
+    format!("ai-kanban/{version} (protocol {PROTOCOL_VERSION})")
+}
+
+/// What a `User-Agent` from `client_agent` says. `None` for anything else -- an older ai-kanban,
+/// which sent its HTTP library's, or another program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientAgent {
+    pub version: String,
+    pub protocol: u32,
+}
+
+pub fn parse_client_agent(agent: &str) -> Option<ClientAgent> {
+    let rest = agent.trim().strip_prefix("ai-kanban/")?;
+    let (version, rest) = rest.split_once(' ')?;
+    let protocol = rest.strip_prefix("(protocol ")?.strip_suffix(')')?.parse().ok()?;
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+');
+    (!version.is_empty() && version.len() <= 32 && version.chars().all(plain)).then(|| ClientAgent { version: version.to_string(), protocol })
+}
+
 /// The tag the server signs its own changes with -- admin forget tombstones. Reserved so no
 /// key can be issued under it, which is what makes a `srv` change trustworthy.
 pub const SERVER_TAG: &str = "srv";
@@ -245,6 +268,14 @@ mod tests {
 
     /// Clients and the relay update at different times. A 0.1.1 plugin reads what a newer relay
     /// sends, and a newer client reads what a 0.1.1 relay sends.
+    #[test]
+    fn a_client_agent_reads_back_and_nothing_else_passes_for_one() {
+        assert_eq!(parse_client_agent(&client_agent("0.2.0")), Some(ClientAgent { version: "0.2.0".into(), protocol: PROTOCOL_VERSION }));
+        for other in ["ureq/3.5.0", "ai-kanban/0.2.0", "ai-kanban/ (protocol 1)", "ai-kanban/0.2.0 (protocol x)", "ai-kanban/0.2\u{1b}[31m (protocol 1)", "curl/8"] {
+            assert_eq!(parse_client_agent(other), None, "{other:?}");
+        }
+    }
+
     #[test]
     fn room_info_reads_across_versions_both_ways() {
         let old = r#"{"name":"sbahn","created_at":1,"created_by":"benny","members":[],"changes":0,"head":0}"#;

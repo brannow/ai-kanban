@@ -89,7 +89,8 @@ machines on one key would hand out the same ones.
         A new key, labelled with who it is for. Prints a message to send them.
 
     {p} key list
-        Every key: id, tag, the name its user chose, your label, and when it was last used.
+        Every key: id, tag, the name its user chose, your label, which ai-kanban its machine
+        runs (\"older\": from before 0.2, which did not say), and when it was last used.
 
     {p} key rotate <tag|id>
         For a lost or leaked key: a new key with the same tag, name and label, and the old

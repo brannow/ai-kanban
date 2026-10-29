@@ -67,9 +67,33 @@ impl Relay {
     }
 
     fn auth(&self, headers: &HeaderMap) -> Result<Principal, ServerError> {
+        let agent = client_check(headers)?;
         let key = bearer(headers).ok_or(ServerError::Unauthorized)?;
-        self.db().authenticate(key)
+        let db = self.db();
+        let p = db.authenticate(key)?;
+        if let Some(agent) = agent {
+            db.saw_client(p.key_id, agent)?;
+        }
+        Ok(p)
     }
+}
+
+/// The client's `User-Agent`, refused if it says it speaks a protocol older than this relay
+/// accepts. Clients check `hello` themselves and pause first; this is for one that does not,
+/// so the relay does not have to trust that every client does. One that does not say what it
+/// is (an older ai-kanban, another program) passes: there is nothing to refuse it on.
+fn client_check(headers: &HeaderMap) -> Result<Option<&str>, ServerError> {
+    let Some(agent) = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()) else { return Ok(None) };
+    if let Some(c) = protocol::parse_client_agent(agent) {
+        if c.protocol < protocol::MIN_PROTOCOL_VERSION {
+            return Err(ServerError::UpgradeRequired(format!(
+                "this relay needs ai-kanban speaking protocol {} or newer; this is ai-kanban {} (protocol {}). \
+                 Update it: /plugin -> ai-kanban -> update, or the binary you run",
+                protocol::MIN_PROTOCOL_VERSION, c.version, c.protocol
+            )));
+        }
+    }
+    Ok(Some(agent))
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -107,6 +131,7 @@ impl IntoResponse for ServerError {
             ServerError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             ServerError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             ServerError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
+            ServerError::UpgradeRequired(_) => (StatusCode::UPGRADE_REQUIRED, "upgrade_required"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "error"),
         };
         let body = serde_json::json!({ "error": { "code": code, "message": self.to_string() } });
@@ -136,10 +161,14 @@ async fn whoami(State(r): State<Relay>, headers: HeaderMap) -> ApiResult<WhoAmI>
 /// from it, which is why it reads the key without `auth`: that would give an unnamed key a
 /// generated name, and its tag, first.
 async fn set_name(State(r): State<Relay>, headers: HeaderMap, Json(body): Json<protocol::SetName>) -> ApiResult<WhoAmI> {
+    let agent = client_check(&headers)?;
     let key = bearer(&headers).ok_or(ServerError::Unauthorized)?;
     let db = r.db();
     let (key_id, _) = db.lookup(key)?;
     let p = db.name_key(key_id, &body.name)?;
+    if let Some(agent) = agent {
+        db.saw_client(key_id, agent)?;
+    }
     let high_water = db.high_water(&p.tag)?;
     Ok(Json(WhoAmI { user: p.user, tag: p.tag, high_water }))
 }

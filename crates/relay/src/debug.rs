@@ -72,8 +72,19 @@ pub(crate) async fn trace(State(r): State<Relay>, req: Request, next: Next) -> R
     Response::from_parts(parts, Body::from(bytes))
 }
 
-/// Who a request is from, without the key.
+/// Who a request is from, without the key, and what it says it runs.
 fn who(r: &Relay, headers: &HeaderMap) -> String {
+    let runs = match headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()) {
+        Some(a) => match ai_kanban_protocol::parse_client_agent(a) {
+            Some(c) => format!(" [{} p{}]", c.version, c.protocol),
+            None => format!(" [{}]", a.chars().filter(|c| !c.is_control()).take(40).collect::<String>()),
+        },
+        None => String::new(),
+    };
+    format!("{}{runs}", key_owner(r, headers))
+}
+
+fn key_owner(r: &Relay, headers: &HeaderMap) -> String {
     match bearer(headers) {
         None => "(no key)".into(),
         // `lookup`, not `authenticate`: watching must not give an unnamed key its name.

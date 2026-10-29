@@ -145,3 +145,16 @@ async fn logging_a_request_does_not_name_the_key() {
     assert_eq!((s, v["tag"].clone()), (StatusCode::OK, json!("v1")), "the tag comes from the chosen name: {v}");
     assert!(log(&lines).contains("not named yet"), "{}", log(&lines));
 }
+
+#[tokio::test]
+async fn the_log_says_what_each_client_runs() {
+    let (relay, lines, key) = fixture();
+    let req = Request::builder()
+        .uri("/v1/whoami")
+        .header("authorization", format!("Bearer {key}"))
+        .header("user-agent", "ai-kanban/0.2.0 (protocol 1)")
+        .body(Body::empty())
+        .unwrap();
+    router(relay).oneshot(req).await.unwrap();
+    assert!(log(&lines).contains("> GET /v1/whoami benny/b1 [0.2.0 p1]"), "{}", log(&lines));
+}

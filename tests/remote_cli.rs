@@ -169,6 +169,9 @@ fn the_first_name_fixes_the_tag_and_a_rename_keeps_it() {
     assert!(out.contains("origin tag v1") && out.contains("sees you as Volker"), "{out}");
     assert!(!out.contains(&key), "the key is never printed");
 
+    let runs = relay.admin().keys().unwrap().into_iter().find(|k| k.tag.as_deref() == Some("v1")).unwrap().client;
+    assert_eq!(runs, Some(format!("ai-kanban/{} (protocol 1)", env!("CARGO_PKG_VERSION"))), "the relay knows what this machine runs");
+
     let out = volker.ok(&["remote", "--name", "Volker K."]);
     assert!(out.contains("Volker K. (tag v1)"), "{out}");
     assert_eq!(volker.store().origin_tag().unwrap().as_deref(), Some("v1"));

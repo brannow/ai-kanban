@@ -95,6 +95,12 @@ fn finish(store: &Store, project_id: i64, result: Result<Synced, RemoteError>) -
     match &result {
         // A pause is the store's state, reported once by the header, not as this board's error.
         Err(RemoteError::Paused(_)) | Ok(_) => {}
+        // Sync cannot go on with this build: stop, and say so, until an update. The next
+        // `check_identity` that passes lifts it.
+        Err(e @ RemoteError::Upgrade(msg)) => {
+            pause(store, msg);
+            let _ = store.sync_failed(project_id, &e.recorded());
+        }
         // A reused change id means this store was restored: stop until it has a new tag.
         Err(e @ RemoteError::Conflict(msg)) => {
             pause(store, msg);

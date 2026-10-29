@@ -31,6 +31,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("schema.sql"),
     include_str!("migrate_002_room_board.sql"),
     include_str!("migrate_003_keys_and_names.sql"),
+    include_str!("migrate_004_key_client.sql"),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +44,9 @@ pub enum ServerError {
     Unauthorized,
     #[error("{0}")]
     BadRequest(String),
+    /// The client says it speaks a protocol older than this relay accepts (426).
+    #[error("{0}")]
+    UpgradeRequired(String),
     #[error("{0}")]
     NotFound(String),
     /// The request contradicts what the server already holds -- a reused change id, a tag
@@ -73,6 +77,8 @@ pub struct KeyRow {
     pub name: Option<String>,
     /// The admin's note of who it was given to.
     pub label: String,
+    /// The `User-Agent` its machine last sent, if any.
+    pub client: Option<String>,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
     pub revoked_at: Option<i64>,
@@ -412,7 +418,7 @@ impl ServerDb {
 
     pub fn keys(&self) -> Result<Vec<KeyRow>> {
         let mut st = self.conn.prepare(
-            "SELECT k.id, k.tag, t.name, k.label, k.created_at, k.last_used_at, k.revoked_at
+            "SELECT k.id, k.tag, t.name, k.label, k.created_at, k.last_used_at, k.revoked_at, k.client
                FROM keys k LEFT JOIN tags t ON t.tag = k.tag
               ORDER BY k.revoked_at IS NOT NULL, k.id",
         )?;
@@ -425,9 +431,18 @@ impl ServerDb {
                 created_at: r.get(4)?,
                 last_used_at: r.get(5)?,
                 revoked_at: r.get(6)?,
+                client: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Records what a key's machine says it runs (its `User-Agent`). Written only when it
+    /// changed, so a client's every pull is not also a write.
+    pub fn saw_client(&self, key_id: i64, agent: &str) -> Result<()> {
+        let agent = clean_text(agent, 80);
+        self.conn.execute("UPDATE keys SET client = ?2 WHERE id = ?1 AND client IS NOT ?2", params![key_id, agent])?;
+        Ok(())
     }
 
     /// The live key a bearer key is, without binding anything: the key's id and its tag and

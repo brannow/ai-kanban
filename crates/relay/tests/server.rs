@@ -201,7 +201,7 @@ fn a_version_1_database_upgrades_and_keeps_its_rooms() {
     let rooms = db.rooms().unwrap();
     assert_eq!((rooms[0].name.as_str(), rooms[0].board.as_deref()), ("sbahn", None));
     let v: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(v, 3);
+    assert_eq!(v, 4, "every migration ran");
 }
 
 /// Version 3 rebuilds the key tables and drops users. Run on a database shaped like the live
@@ -888,4 +888,36 @@ async fn the_event_stream_needs_a_key_and_membership() {
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let (s, _) = call(&f.relay, "GET", "/v1/rooms/sbahn/events", Some(&f.volker), None).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+/// What a key's machine runs is recorded from its `User-Agent`, so the admin sees who would be
+/// stopped before raising the protocol a relay needs; a client saying it speaks less than that
+/// is refused, whether or not it checked `hello` itself.
+#[tokio::test]
+async fn the_relay_records_what_each_machine_runs_and_refuses_a_protocol_too_old() {
+    let f = fixture();
+    let ask = |agent: &'static str, key: String| {
+        let relay = f.relay.clone();
+        async move {
+            let req = Request::builder().uri("/v1/whoami").header("authorization", format!("Bearer {key}")).header("user-agent", agent);
+            let res = router(relay).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+            (status, String::from_utf8_lossy(&body).to_string())
+        }
+    };
+    let client = |tag: &str| f.relay.db.lock().unwrap().keys().unwrap().into_iter().find(|k| k.tag.as_deref() == Some(tag)).unwrap().client;
+
+    let (s, _) = ask("ai-kanban/0.2.0 (protocol 1)", f.benny.clone()).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(client("b1").as_deref(), Some("ai-kanban/0.2.0 (protocol 1)"));
+
+    let (s, _) = ask("ureq/3.5.0", f.volker.clone()).await;
+    assert_eq!(s, StatusCode::OK, "an ai-kanban from before it said what it is still works");
+    assert_eq!(client("v1").as_deref(), Some("ureq/3.5.0"));
+
+    let (s, body) = ask("ai-kanban/0.0.1 (protocol 0)", f.benny.clone()).await;
+    assert_eq!(s, StatusCode::UPGRADE_REQUIRED, "{body}");
+    assert!(body.contains("protocol 1 or newer") && body.contains("ai-kanban 0.0.1"), "says what to do: {body}");
+    assert_eq!(client("b1").as_deref(), Some("ai-kanban/0.2.0 (protocol 1)"), "a refused request records nothing");
 }

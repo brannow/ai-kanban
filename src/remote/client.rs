@@ -26,6 +26,9 @@ pub enum RemoteError {
     /// Sync is stopped for this store until a person acts; the message says what to do.
     #[error("sync paused: {0}")]
     Paused(String),
+    /// The relay needs a newer ai-kanban than this one (426).
+    #[error("{0}")]
+    Upgrade(String),
 }
 
 impl RemoteError {
@@ -39,6 +42,7 @@ impl RemoteError {
             RemoteError::Conflict(_) => "conflict",
             RemoteError::BadRequest(_) | RemoteError::Http(..) => "relay error",
             RemoteError::Paused(_) => "paused",
+            RemoteError::Upgrade(_) => "update needed",
         }
     }
 
@@ -68,6 +72,9 @@ impl Client {
             .timeout_global(Some(timeout))
             .timeout_connect(Some(timeout.min(Duration::from_secs(5))))
             .http_status_as_error(false)
+            // Which ai-kanban this is, for the relay's admin (`key list`) and for the relay to
+            // refuse one too old for it.
+            .user_agent(crate::sync::protocol::client_agent(env!("CARGO_PKG_VERSION")))
             .build()
             .into();
         Client { url: super::config::normalize_url(url), key: key.trim().to_string(), agent }
@@ -171,6 +178,9 @@ impl Client {
             .timeout_connect(Some(Duration::from_secs(5)))
             .timeout_recv_body(Some(Duration::from_secs(75)))
             .http_status_as_error(false)
+            // Which ai-kanban this is, for the relay's admin (`key list`) and for the relay to
+            // refuse one too old for it.
+            .user_agent(crate::sync::protocol::client_agent(env!("CARGO_PKG_VERSION")))
             .build()
             .into();
         let res = agent.get(self.room_url(room, "events")).header("authorization", self.bearer()).call().map_err(offline)?;
@@ -214,6 +224,7 @@ fn read<T: serde::de::DeserializeOwned>(mut res: ureq::http::Response<ureq::Body
         404 => RemoteError::NotFound(message),
         409 => RemoteError::Conflict(message),
         400 | 413 => RemoteError::BadRequest(message),
+        426 => RemoteError::Upgrade(message),
         _ => RemoteError::Http(status, message),
     })
 }
