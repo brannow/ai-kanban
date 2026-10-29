@@ -7,7 +7,7 @@
 #[tokio::main]
 async fn main() {
     if let Err(e) = ai_kanban_relay::admin::run().await {
-        eprintln!("ai-kanban-relay: {e}");
+        eprintln!("{}: {e}", ai_kanban_relay::pages::prog());
         std::process::exit(1);
     }
 }

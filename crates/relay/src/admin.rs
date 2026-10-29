@@ -5,35 +5,10 @@
 //! an admin API would add a second way in that needs its own protection.
 
 use super::store::{Removal, ServerDb};
+use super::pages::{self, prog};
 use super::{Options, EMPTY_ROOM_AGE};
 use ai_kanban_protocol::{Handle, Ref};
 use std::path::PathBuf;
-
-pub const USAGE: &str = "\
-ai-kanban-relay -- the relay a team shares boards through
-
-USAGE:
-    ai-kanban-relay [--listen ADDR] [--snapshot-every DUR] [--keep N] [--snapshot-dir DIR]
-        Run the relay. ADDR defaults to 127.0.0.1:7373; the container passes 0.0.0.0:7373.
-        DUR is like 30m, 6h or 1d. Snapshots go to <db dir>/snapshots by default.
-
-    ai-kanban-relay user add <name>              the user and their key, printed once
-    ai-kanban-relay user list
-    ai-kanban-relay user disable <name>
-    ai-kanban-relay key add <user>               a key for the user's next machine
-    ai-kanban-relay key list [user]
-    ai-kanban-relay key revoke <id>
-    ai-kanban-relay key rotate <user> [--tag T]  new key, same tag, old key revoked
-    ai-kanban-relay room list
-    ai-kanban-relay room delete <room> [--yes]   dry run without --yes
-    ai-kanban-relay room cleanup                 remove rooms empty for 7 days now
-    ai-kanban-relay forget <room> task|note <id>-<tag> [--yes]
-    ai-kanban-relay snapshot [--snapshot-dir DIR]
-    ai-kanban-relay health [--listen ADDR]       exit 0 if the relay answers
-
-Every command takes --db <file> (default: $AI_KANBAN_SERVER_DB, else /data/server.db).
-It never falls back to the personal store.
-";
 
 struct Args {
     pos: Vec<String>,
@@ -44,12 +19,14 @@ struct Args {
     snapshot_dir: Option<PathBuf>,
     keep: Option<String>,
     yes: bool,
+    debug: bool,
+    help: bool,
 }
 
 fn args() -> Result<Args, String> {
     let mut a = Args {
         pos: vec![], db: None, listen: None, tag: None,
-        snapshot_every: None, snapshot_dir: None, keep: None, yes: false,
+        snapshot_every: None, snapshot_dir: None, keep: None, yes: false, debug: false, help: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -62,7 +39,10 @@ fn args() -> Result<Args, String> {
             "--snapshot-dir" => a.snapshot_dir = Some(PathBuf::from(value("--snapshot-dir")?)),
             "--keep" => a.keep = Some(value("--keep")?),
             "--yes" => a.yes = true,
-            "-h" | "--help" => a.pos.push("help".into()),
+            "--debug" => a.debug = true,
+            // A flag, not a word among the arguments: `key rotate volker --help` must show the
+            // page, not rotate a user called "help".
+            "-h" | "--help" => a.help = true,
             s if s.starts_with("--") => return Err(format!("unknown flag {s}")),
             _ => a.pos.push(arg),
         }
@@ -88,7 +68,25 @@ impl Args {
 }
 
 fn usage(line: &str) -> Box<dyn std::error::Error> {
-    format!("usage: ai-kanban-relay {line}").into()
+    let topic = line.split(' ').next().unwrap_or_default();
+    format!("usage: {} {line}   (more: {} help {topic})", prog(), prog()).into()
+}
+
+/// A command's page, or the overview.
+fn help(topic: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    match topic {
+        None => print!("{}", pages::overview()),
+        Some(t) => match pages::page(t) {
+            Some(text) => print!("{text}"),
+            None => return Err(format!("no command {t:?}. One of: {}", pages::TOPICS.join(", ")).into()),
+        },
+    }
+    Ok(())
+}
+
+/// The error for a word that is not one of a command's own, with that command's page.
+fn unknown(topic: &str, word: &str) -> Box<dyn std::error::Error> {
+    format!("unknown {topic} command {word:?}\n\n{}", pages::page(topic).unwrap_or_default()).into()
 }
 
 /// `30m`, `6h`, `1d`, or plain seconds.
@@ -125,6 +123,9 @@ fn ago(ts: Option<i64>) -> String {
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let a = args()?;
+    if a.help {
+        return help(a.arg(0).filter(|t| pages::TOPICS.contains(t)));
+    }
     match a.arg(0) {
         None => {
             let listen = a.listen.as_deref().unwrap_or("127.0.0.1:7373");
@@ -137,13 +138,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     Some(k) => k.parse().map_err(|_| format!("--keep {k:?}: expected a number"))?,
                     None => 28,
                 },
+                // The variable too, so compose can switch it in `environment:` without
+                // repeating the image's command.
+                debug: a.debug || std::env::var("AI_KANBAN_RELAY_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0"),
             };
             super::serve(opts).await
         }
-        Some("help") => {
-            print!("{USAGE}");
-            Ok(())
-        }
+        Some("help") => help(a.arg(1)),
         Some("user") => user(&a),
         Some("key") => key(&a),
         Some("room") => room(&a),
@@ -154,23 +155,28 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Some("health") => health(a.listen.as_deref().unwrap_or("127.0.0.1:7373")),
-        Some(other) => Err(format!("unknown command {other:?}\n\n{USAGE}").into()),
+        Some(other) => Err(format!("unknown command {other:?}\n\n{}", pages::overview()).into()),
     }
 }
 
 fn user(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    // Alone, it is the page -- listing told nobody what else the command does -- and that
+    // needs no database.
+    if matches!(a.arg(1), None | Some("help")) {
+        return help(Some("user"));
+    }
     let db = a.open()?;
     match a.arg(1) {
         Some("add") => {
             let name = a.arg(2).ok_or_else(|| usage("user add <name>"))?;
             db.add_user(name)?;
             let (tag, key) = db.issue_key(name)?;
-            print_key(&key, &format!("user {name} added, origin tag {tag}. Their tasks show as #N-{tag}."));
+            print!("{}", pages::welcome(&format!("User {name} added, tag {tag}. Their tasks show as #N-{tag}."), name, &key));
         }
-        Some("list") | None => {
+        Some("list") => {
             let users = db.users()?;
             if users.is_empty() {
-                println!("no users yet. ai-kanban-relay user add <name>");
+                println!("no users yet. {} user add <name>", prog());
             }
             for u in users {
                 let state = if u.disabled_at.is_some() { "  (disabled)" } else { "" };
@@ -183,26 +189,26 @@ fn user(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
             db.disable_user(name)?;
             println!("user {name} disabled. Their keys stop working; their published work stays.");
         }
-        Some(other) => return Err(format!("unknown user command {other:?}").into()),
+        Some(other) => return Err(unknown("user", other)),
+        None => unreachable!("the page, above"),
     }
     Ok(())
 }
 
-/// The key alone on stdout, so it can be piped; what it is on stderr.
-fn print_key(key: &str, what: &str) {
-    println!("{key}");
-    eprintln!("{what}\nShown once -- it cannot be recovered, only rotated. On their machine: ai-kanban remote <url> --key <key>");
-}
-
 fn key(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    // Alone, it is the page -- listing told nobody what else the command does -- and that
+    // needs no database.
+    if matches!(a.arg(1), None | Some("help")) {
+        return help(Some("key"));
+    }
     let db = a.open()?;
     match a.arg(1) {
         Some("add") => {
             let user = a.arg(2).ok_or_else(|| usage("key add <user>"))?;
             let (tag, key) = db.issue_key(user)?;
-            print_key(&key, &format!("a key for another of {user}'s machines, origin tag {tag}. Every machine needs its own."));
+            print!("{}", pages::welcome(&format!("A key for another of {user}'s machines, tag {tag}."), user, &key));
         }
-        Some("list") | None => {
+        Some("list") => {
             for k in db.keys(a.arg(2))? {
                 let state = match k.revoked_at {
                     Some(_) => "revoked".to_string(),
@@ -223,21 +229,27 @@ fn key(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 (Some(t), _) if tags.iter().any(|x| x == t) => t.to_string(),
                 (Some(t), _) => return Err(format!("{user} has no tag {t}; theirs: {}", tags.join(", ")).into()),
                 (None, [only]) => only.clone(),
-                (None, []) => return Err(format!("{user} has no key yet: ai-kanban-relay key add {user}").into()),
+                (None, []) => return Err(format!("{user} has no key yet: {} key add {user}", prog()).into()),
                 (None, _) => return Err(format!("{user} has one key per machine ({}); say which: --tag <tag>", tags.join(", ")).into()),
             };
             let key = db.rotate_key(&tag)?;
-            print_key(&key, &format!("new key for {user}, tag {tag}; the previous one is revoked."));
+            print!("{}", pages::rotated(user, &tag, &key));
         }
-        Some(other) => return Err(format!("unknown key command {other:?}").into()),
+        Some(other) => return Err(unknown("key", other)),
+        None => unreachable!("the page, above"),
     }
     Ok(())
 }
 
 fn room(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    // Alone, it is the page -- listing told nobody what else the command does -- and that
+    // needs no database.
+    if matches!(a.arg(1), None | Some("help")) {
+        return help(Some("room"));
+    }
     let db = a.open()?;
     match a.arg(1) {
-        Some("list") | None => {
+        Some("list") => {
             let rooms = db.rooms()?;
             if rooms.is_empty() {
                 println!("no rooms yet. They are created by connecting a board to one.");
@@ -267,7 +279,8 @@ fn room(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 println!("removed: {}", gone.join(", "));
             }
         }
-        Some(other) => return Err(format!("unknown room command {other:?}").into()),
+        Some(other) => return Err(unknown("room", other)),
+        None => unreachable!("the page, above"),
     }
     Ok(())
 }

@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# kanban -- run and administer the ai-kanban relay from next to its docker-compose.yml.
+#
+# The image is distroless: no shell, no sqlite3. Every admin action is therefore the relay
+# binary run inside the running container (docker compose exec), which is what this wraps.
+# It may be linked from anywhere on PATH; it finds its compose directory through the link.
+#
+# The help pages and the messages to send people come from the relay itself
+# (crates/relay/src/pages.rs), so they match the binary in the running image. This script
+# tells it what it is called here and the public URL, which the relay cannot know.
+set -euo pipefail
+
+# How the admin called this, for the pages: `./kanban`, or `kanban` when it is on PATH.
+prog=$0
+if [ "$(command -v "${prog##*/}" 2>/dev/null)" = "$prog" ]; then prog=${prog##*/}; fi
+
+cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+SERVICE=${KANBAN_SERVICE:-kanban}
+
+usage() {
+	cat <<EOF
+$prog -- the ai-kanban relay in this directory
+
+The container:
+    $prog                          status: container, health, users, rooms
+    $prog logs [-f]                the last 100 log lines (-f: follow)
+    $prog update                   pull the image and restart on it (debug stays as it was)
+    $prog restart
+    $prog debug on|off             log all traffic, bodies included; watch: logs -f
+    $prog backup                   a snapshot now, into data/snapshots
+
+    $prog invite <name>            = user add <name>: a new user, and a message to send them
+    $prog invite <name> --machine  = key add <name>: a key for their next machine
+
+EOF
+	if [ -n "$(docker compose ps -q --status running "$SERVICE" 2>/dev/null)" ]; then
+		relay help
+	else
+		echo "(The relay's own commands -- users, keys, rooms -- are listed here once it runs.)"
+	fi
+	cat <<EOF
+
+KANBAN_URL overrides the URL the messages show (default: the Traefik Host rule).
+EOF
+}
+
+relay() {
+	docker compose exec -T -e AI_KANBAN_RELAY_AS="$prog" -e AI_KANBAN_RELAY_URL="$(url)" \
+		"$SERVICE" ai-kanban-relay "$@"
+}
+
+running() {
+	if [ -z "$(docker compose ps -q --status running "$SERVICE")" ]; then
+		echo "The relay is not running. Start it: docker compose up -d" >&2
+		exit 1
+	fi
+}
+
+# The public URL, read from the Traefik rule so it is written down once.
+url() {
+	if [ -n "${KANBAN_URL:-}" ]; then echo "$KANBAN_URL"; return; fi
+	local host
+	host=$(sed -n 's/.*Host(`\([^`]*\)`).*/\1/p' docker-compose.yml | head -n1)
+	if [ -n "$host" ]; then echo "https://$host"; else echo "<relay url>"; fi
+}
+
+# Whether the running container was started with debug on. Read from the container, not the
+# compose file, which holds only the default.
+debugging() {
+	docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$(docker compose ps -q "$SERVICE")" 2>/dev/null |
+		grep -qx 'AI_KANBAN_RELAY_DEBUG=1'
+}
+
+# Recreates the container; compose reads KANBAN_DEBUG into AI_KANBAN_RELAY_DEBUG.
+up() {
+	KANBAN_DEBUG=$1 docker compose up -d --wait "$SERVICE"
+}
+
+status() {
+	docker compose ps
+	running
+	echo
+	if relay health >/dev/null 2>&1; then echo "health: ok"; else echo "health: NOT ANSWERING"; fi
+	echo "url:    $(url)"
+	if debugging; then echo "debug:  ON -- every request is logged, bodies included ($prog debug off)"; fi
+	echo
+	echo "users:"
+	relay user list
+	echo
+	echo "rooms:"
+	relay room list
+	echo
+	echo "Every command: $prog help"
+}
+
+case "${1:-status}" in
+	status) status ;;
+	invite)
+		[ -n "${2:-}" ] || { echo "usage: $prog invite <name> [--machine]" >&2; exit 2; }
+		running
+		if [ "${3:-}" = "--machine" ]; then relay key add "$2"; else relay user add "$2"; fi
+		;;
+	logs)
+		shift
+		docker compose logs --tail=100 "$@" "$SERVICE"
+		;;
+	update)
+		docker compose pull "$SERVICE"
+		if debugging; then d=1; else d=0; fi
+		# --wait returns once the healthcheck passes, so a broken image shows here, not later.
+		up "$d"
+		docker compose images "$SERVICE"
+		;;
+	debug)
+		case "${2:-}" in
+			on) up 1 && echo "debug on. Watch: $prog logs -f   Off again: $prog debug off" ;;
+			off) up 0 && echo "debug off" ;;
+			*) if debugging; then echo on; else echo off; fi ;;
+		esac
+		;;
+	restart) docker compose restart "$SERVICE" ;;
+	backup)
+		running
+		relay snapshot
+		ls -lt data/snapshots | head -n 4
+		echo "data/ is what to copy off this host."
+		;;
+	user | key | room | forget | snapshot | health)
+		running
+		relay "$@"
+		;;
+	help | -h | --help)
+		if [ -n "${2:-}" ]; then running; relay help "$2"; else usage; fi
+		;;
+	*)
+		echo "$prog: unknown command \"$1\". Every command: $prog help" >&2
+		exit 2
+		;;
+esac

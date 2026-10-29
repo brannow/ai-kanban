@@ -315,7 +315,11 @@ fn room_connect(store: &Store, room: &str, a: &Args) -> CliResult {
 fn pick_board(store: &Store, room: &str) -> Result<i64, Box<dyn std::error::Error>> {
     let connected: Vec<i64> = store.connected_boards()?.into_iter().map(|(p, _)| p).collect();
     let here = std::env::current_dir().ok().and_then(|d| store.find_project(&d).ok().flatten()).map(|p| p.id);
-    let mut boards: Vec<_> = store.all_projects()?.into_iter().filter(|p| !connected.contains(&p.id)).collect();
+    let all = store.all_projects()?;
+    if all.is_empty() {
+        return Err("there is no board on this machine yet. One is created when an agent first uses ai-kanban in a project folder, or by `ai-kanban board add <name>`".into());
+    }
+    let mut boards: Vec<_> = all.into_iter().filter(|p| !connected.contains(&p.id)).collect();
     if boards.is_empty() {
         return Err("every board on this machine is already connected to a room".into());
     }

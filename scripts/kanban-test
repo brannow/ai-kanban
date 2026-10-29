@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# kanban-test -- extra ai-kanban clients on this machine, for testing sync next to your own.
+#
+# Each test client <name> is a store, a Claude Code config and a copy of the plugin, kept in
+# ~/.ai-kanban-test/<name>/ (AI_KANBAN_TEST_HOME moves it), running this checkout's build.
+# Your own plugin session and its store are not touched.
+#
+# Why a config dir of its own and not just another AI_KANBAN_DB: a session under your normal
+# config would load your installed plugin too, with its relay key -- which a fresh test store
+# adopts (one key on two stores, and sync pauses) -- and it would re-point the link that
+# /ai-kanban:install-cli made at the test build. The price is one /login per test client.
+#
+# Why the store is wired into the plugin copy's bin/ai-kanban and not only exported: the hook,
+# the MCP server and Claude's own `ai-kanban` calls all run through that wrapper, so none of
+# them can reach your real store, whatever environment Claude Code passes down.
+set -euo pipefail
+
+repo=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+base=${AI_KANBAN_TEST_HOME:-$HOME/.ai-kanban-test}
+relay_db=$base/relay/server.db
+relay_port=7399
+
+usage() {
+	cat <<'EOF'
+kanban-test -- extra ai-kanban clients on this machine (see the top of this script)
+
+    kanban-test claude <name> [args]   Claude Code as test client <name>, in this folder
+    kanban-test cli <name> <args>      ai-kanban on its store, e.g.
+                                         kanban-test cli b2 remote https://kanban.work.rannow.de --key K
+    kanban-test web <name> [port]      its web UI (default port 7374; yours is 7373)
+    kanban-test where [name]           where everything is
+
+A test client next to your own session on the team relay, in this order:
+    1. on the server: ./kanban invite benjamin --machine        (a key with its own tag, b2)
+    2. kanban-test cli b2 remote https://kanban.work.rannow.de --key <that key>
+    3. kanban-test claude b2                                     (/login once, then as usual)
+The plugin's relay settings are ignored by test clients; leave them empty there.
+
+    kanban-test relay                  a local relay on 127.0.0.1:7399, --debug, in the foreground
+    kanban-test key <user>             a key from that relay: a new user, or another machine of one
+                                         then: kanban-test cli <name> remote http://127.0.0.1:7399 --key K
+EOF
+}
+
+build() { cargo build --release -q --manifest-path "$repo/Cargo.toml" -p "$1"; }
+
+# The plugin copy for <name>: everything but the wrapper as in plugin/, so the test session
+# runs what you are working on. Rebuilt on every start, so plugin/ edits arrive too.
+prepare() {
+	local name=$1 home=$base/$1
+	mkdir -p "$home/claude"
+	rm -rf "$home/plugin"
+	cp -R "$repo/plugin" "$home/plugin"
+	rm -rf "$home/plugin/libexec"
+	cat >"$home/plugin/bin/ai-kanban" <<EOF
+#!/bin/sh
+# Test client "$name" (scripts/kanban-test): always its own store, never yours. And never the
+# plugin settings' relay key: that is your machine's key, and a fresh test store adopting it
+# would publish under your tag. The relay comes only from: kanban-test cli $name remote ...
+unset AI_KANBAN_PLUGIN_RELAY_URL AI_KANBAN_PLUGIN_RELAY_KEY
+AI_KANBAN_DB='$home/kanban.db' exec '$repo/target/release/ai-kanban' "\$@"
+EOF
+	chmod +x "$home/plugin/bin/ai-kanban"
+}
+
+client() {
+	local name=${1:-}
+	[[ $name =~ ^[A-Za-z0-9_-]+$ ]] || { echo "kanban-test: name the test client (letters, digits, - and _)" >&2; exit 2; }
+}
+
+cmd=${1:-}
+shift || true
+case "$cmd" in
+	claude)
+		client "${1:-}"; name=$1; shift
+		build ai-kanban
+		prepare "$name"
+		echo "Test client $name: store $base/$name/kanban.db -- first start asks for /login" >&2
+		CLAUDE_CONFIG_DIR=$base/$name/claude AI_KANBAN_DB=$base/$name/kanban.db \
+			exec claude --plugin-dir "$base/$name/plugin" "$@"
+		;;
+	cli)
+		client "${1:-}"; name=$1; shift
+		build ai-kanban
+		AI_KANBAN_DB=$base/$name/kanban.db exec "$repo/target/release/ai-kanban" "$@"
+		;;
+	web)
+		client "${1:-}"
+		build ai-kanban
+		AI_KANBAN_DB=$base/$1/kanban.db exec "$repo/target/release/ai-kanban" serve --port "${2:-7374}"
+		;;
+	relay)
+		build ai-kanban-relay
+		mkdir -p "$(dirname "$relay_db")"
+		exec "$repo/target/release/ai-kanban-relay" --db "$relay_db" --listen "127.0.0.1:$relay_port" --debug
+		;;
+	key)
+		user=${1:-}
+		[ -n "$user" ] || { echo "usage: kanban-test key <user>" >&2; exit 2; }
+		build ai-kanban-relay
+		mkdir -p "$(dirname "$relay_db")"
+		r="$repo/target/release/ai-kanban-relay"
+		export AI_KANBAN_RELAY_AS="kanban-test key" AI_KANBAN_RELAY_URL="http://127.0.0.1:$relay_port"
+		if "$r" --db "$relay_db" user list | awk '{print $1}' | grep -qx "$user"; then
+			"$r" --db "$relay_db" key add "$user"
+		else
+			"$r" --db "$relay_db" user add "$user"
+		fi
+		;;
+	where)
+		if [ -n "${1:-}" ]; then
+			client "$1"
+			printf 'store   %s\nclaude  %s\nplugin  %s\n' "$base/$1/kanban.db" "$base/$1/claude" "$base/$1/plugin"
+		else
+			echo "test clients in $base:"
+			find "$base" -mindepth 1 -maxdepth 1 -type d ! -name relay -exec basename {} \; 2>/dev/null | sed 's/^/  /'
+			echo "local relay db: $relay_db (port $relay_port)"
+		fi
+		;;
+	-h | --help | help | "") usage ;;
+	*)
+		usage >&2
+		exit 2
+		;;
+esac

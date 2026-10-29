@@ -113,7 +113,9 @@ impl Client {
         let res = self.agent
             .post(self.room_url(room, "changes"))
             .header("authorization", self.bearer())
-            .send_json(Push { changes: changes.to_vec() })
+            .header("content-type", "application/json")
+            // Not `send_json`: ureq pretty-prints it, which about doubles every push.
+            .send(serde_json::to_vec(&Push { changes: changes.to_vec() }).map_err(|e| RemoteError::Http(0, e.to_string()))?)
             .map_err(offline)?;
         read(res)
     }

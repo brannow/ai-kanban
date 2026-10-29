@@ -513,6 +513,31 @@ docker run -d --name kanban --restart unless-stopped \
 docker exec kanban ai-kanban-relay user add benny   # prints benny's key once (tag b1)
 ```
 
+- **`deploy/relay/`** holds the compose file of the real deployment and `kanban`, a helper that
+  lives next to it: `./kanban` shows status, users and rooms; `./kanban invite <name>` creates
+  the user and prints a message to send them (plugin install, URL, key); the admin commands pass
+  through (`./kanban key rotate volker`). `./kanban help`, `./kanban help key` or `./kanban key
+  --help` show what each does, with examples. Those pages and the messages come from the relay
+  binary (`crates/relay/src/pages.rs`), so they match the running image; the helper passes the
+  name it was called by and the public URL (`AI_KANBAN_RELAY_AS`, `AI_KANBAN_RELAY_URL`). It wraps `docker compose exec`, because the image has
+  no shell or sqlite3 to administer it with otherwise.
+- **`--debug`** (or `AI_KANBAN_RELAY_DEBUG=1`; on the server `./kanban debug on|off`) logs every
+  request, response and event-stream message, one line each: `HH:MM:SS.mmm #<n> > GET /v1/... user/tag
+  <bytes> <body>`, then `#<n> < 200 3ms ...`, and for a stream `sse open`, each `sse head N`, `sse
+  closed after Ns: <why>`. It is a middleware, so a request turned away before any handler (no key,
+  a body that is not JSON) shows too. The key never appears: a request shows the user/tag it
+  authenticated as, or the key's last four characters. Bodies do, so it is off unless asked for.
+  The 30s keep-alives come from axum, not the stream, and do not show. `crates/relay/src/debug.rs`.
+- **Test clients on one machine:** `scripts/kanban-test` runs further clients next to your own
+  plugin session, each with its own store, Claude Code config and plugin copy on this checkout's
+  build (`kanban-test claude b2`), plus a local relay with `--debug` (`kanban-test relay`,
+  `kanban-test key <user>`). Its own config dir, not just another `AI_KANBAN_DB`: under your normal
+  config the installed plugin loads too, its relay key is adopted by the fresh test store (one key,
+  two stores, sync pauses), and the `install-cli` link is re-pointed at the test build. For the
+  same reason a test client ignores the plugin's relay settings: its relay comes only from
+  `kanban-test cli <name> remote <url> --key K`, with a key of its own (`./kanban invite <user>
+  --machine`). On a freshly wiped relay the high-water check would not catch a shared key, since
+  both stores start at zero.
 - **Runs as non-root** (distroless, uid 65532) and owns `/data`. A bind mount instead of a named
   volume must be writable by that uid, or the container runs as the folder's owner instead
   (compose: `user: "1000:1000"`). Otherwise it stops at once with `unable to open database file`.

@@ -1,0 +1,31 @@
+# The relay behind Traefik, as deployed at kanban.work.rannow.de. Put this file and `kanban`
+# (the admin helper) in one directory, adjust the Host rule, then: docker compose up -d
+services:
+  kanban:
+    # :edge follows main -- the experimental phase. Pin a release (:0.1, :latest) once the
+    # protocol settles.
+    image: ghcr.io/brannow/ai-kanban-relay:edge
+    container_name: "ai-kanban-server"
+    # The bind-mounted ./data belongs to the host user, not the image's uid 65532; without
+    # this the relay stops at once with "unable to open database file".
+    user: "1000:1000"
+    restart: unless-stopped
+    command: ["--listen", "0.0.0.0:7373", "--snapshot-every", "6h", "--keep", "28"]
+    environment:
+      # `./kanban debug on|off` sets KANBAN_DEBUG: every request, response and stream event
+      # in the log, bodies included. Off unless asked for.
+      - AI_KANBAN_RELAY_DEBUG=${KANBAN_DEBUG:-0}
+    volumes:
+      - ./data:/data              # database + snapshots/ -- include in the off-site backup
+    networks:
+      - traefik-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.kanban.rule=Host(`kanban.work.rannow.de`)"
+      - "traefik.http.routers.kanban.tls=true"
+      - "traefik.http.routers.kanban.entrypoints=https"
+      - "traefik.http.services.kanban.loadbalancer.server.port=7373"
+
+networks:
+  traefik-net:
+    external: true

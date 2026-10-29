@@ -77,7 +77,8 @@ AI_KANBAN_DB=/tmp/x.db ./target/release/ai-kanban serve   # web UI on :7373
 make install-dev                # plugin running this checkout's build, so a global install
                                 # cannot shadow the build you are testing
 make where                      # every path an install would touch
-cargo run -p ai-kanban-relay -- --db /tmp/r.db   # the sync relay (docs/sync.md)
+cargo run -p ai-kanban-relay -- --db /tmp/r.db --debug   # the sync relay, logging all traffic
+scripts/kanban-test claude b2   # a second client next to yours: own store, config, this build
 ```
 
 **Set `AI_KANBAN_DB` when running anything by hand.** Without it you are writing to your real

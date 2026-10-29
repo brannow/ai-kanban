@@ -15,15 +15,17 @@
 //! it seldom needs upgrading in step with clients.
 
 pub mod admin;
+pub mod debug;
+pub mod pages;
 pub mod store;
 
 use ai_kanban_protocol::{self as protocol, Hello, Push, WhoAmI};
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{middleware, Json, Router};
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -33,7 +35,7 @@ pub use store::{Principal, ServerDb, ServerError};
 
 /// A push is at most `MAX_BATCH` changes. Bodies are prose-sized, so 8 MiB is generous for a
 /// full batch and still refuses a client gone wrong before it is parsed.
-const BODY_LIMIT: usize = 8 * 1024 * 1024;
+pub(crate) const BODY_LIMIT: usize = 8 * 1024 * 1024;
 
 /// How often each notification stream checks its room. Changes arrive through other requests
 /// and through `docker exec` admin commands in another process, so nothing can tell a stream
@@ -46,11 +48,18 @@ pub const EMPTY_ROOM_AGE: i64 = 7 * 24 * 3600;
 #[derive(Clone)]
 pub struct Relay {
     pub db: Arc<Mutex<ServerDb>>,
+    /// Set by `--debug`: where every request and stream event is written (`debug.rs`).
+    pub trace: Option<debug::Sink>,
 }
 
 impl Relay {
     pub fn new(db: ServerDb) -> Self {
-        Self { db: Arc::new(Mutex::new(db)) }
+        Self { db: Arc::new(Mutex::new(db)), trace: None }
+    }
+
+    pub fn with_trace(mut self, sink: debug::Sink) -> Self {
+        self.trace = Some(sink);
+        self
     }
 
     fn db(&self) -> std::sync::MutexGuard<'_, ServerDb> {
@@ -58,19 +67,22 @@ impl Relay {
     }
 
     fn auth(&self, headers: &HeaderMap) -> Result<Principal, ServerError> {
-        let key = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            // The scheme is case-insensitive (RFC 9110), so `bearer` from a hand-written client
-            // must work as well as `Bearer`.
-            .and_then(|v| v.split_once(' ').filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer")).map(|(_, k)| k))
-            .ok_or(ServerError::Unauthorized)?;
+        let key = bearer(headers).ok_or(ServerError::Unauthorized)?;
         self.db().authenticate(key)
     }
 }
 
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        // The scheme is case-insensitive (RFC 9110), so `bearer` from a hand-written client
+        // must work as well as `Bearer`.
+        .and_then(|v| v.split_once(' ').filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer")).map(|(_, k)| k))
+}
+
 pub fn router(relay: Relay) -> Router {
-    Router::new()
+    let routes = Router::new()
         .route("/v1/hello", get(hello))
         .route("/v1/whoami", get(whoami))
         .route("/v1/rooms", get(rooms))
@@ -78,8 +90,13 @@ pub fn router(relay: Relay) -> Router {
         .route("/v1/rooms/{room}/leave", post(leave))
         .route("/v1/rooms/{room}/changes", get(pull).post(push))
         .route("/v1/rooms/{room}/events", get(events))
-        .layer(DefaultBodyLimit::max(BODY_LIMIT))
-        .with_state(relay)
+        .layer(DefaultBodyLimit::max(BODY_LIMIT));
+    // Outermost, so it also sees what the body limit and the extractors turn away.
+    let routes = match relay.trace {
+        Some(_) => routes.layer(middleware::from_fn_with_state(relay.clone(), debug::trace)),
+        None => routes,
+    };
+    routes.with_state(relay)
 }
 
 impl IntoResponse for ServerError {
@@ -165,9 +182,11 @@ async fn events(
     State(r): State<Relay>,
     headers: HeaderMap,
     Path(room): Path<String>,
+    traced: Option<Extension<debug::Traced>>,
 ) -> Result<impl IntoResponse, ServerError> {
     let p = r.auth(&headers)?;
     let (room_id, head) = r.db().member_head(&room, &p)?;
+    let log = r.trace.clone().zip(traced).map(|(sink, Extension(t))| debug::StreamLog::new(sink, t.0, &format!("{}/{}", p.user, p.tag), &room));
     let (tag, key_id) = (p.tag.clone(), p.key_id);
     // Its own connection, opened per tick, like `http::stream`: a reader polling through the
     // shared mutex would contend with every push. In-memory databases (tests) have no path, so
@@ -175,7 +194,10 @@ async fn events(
     let path: Option<PathBuf> = r.db().path().map(PathBuf::from);
     let db = r.db.clone();
     let stream = async_stream::stream! {
+        // Moved in, so it is dropped -- and logs the close -- with the stream.
+        let mut log = log;
         let mut last = head;
+        if let Some(l) = &log { l.head(last) }
         yield Ok::<_, Infallible>(SseEvent::default().event("head").data(last.to_string()));
         loop {
             tokio::time::sleep(POLL).await;
@@ -187,9 +209,13 @@ async fn events(
             };
             // None means the room was deleted, or the key, the user or the membership is gone:
             // end the stream, and the client's next request says which.
-            let Some(now) = now else { break };
+            let Some(now) = now else {
+                if let Some(l) = &mut log { l.why = "access gone (room, membership, key or user)" }
+                break;
+            };
             if now != last {
                 last = now;
+                if let Some(l) = &log { l.head(last) }
                 yield Ok(SseEvent::default().event("head").data(last.to_string()));
             }
         }
@@ -230,11 +256,16 @@ pub struct Options {
     pub snapshot_every: Option<u64>,
     pub snapshot_dir: PathBuf,
     pub keep: usize,
+    /// Log every request and stream event (`debug.rs`).
+    pub debug: bool,
 }
 
 pub async fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let db = ServerDb::open(&opts.db)?;
-    let relay = Relay::new(db);
+    let mut relay = Relay::new(db);
+    if opts.debug {
+        relay = relay.with_trace(debug::stdout());
+    }
 
     spawn_housekeeping(relay.clone(), opts.snapshot_every, opts.snapshot_dir.clone(), opts.keep);
 
@@ -244,6 +275,9 @@ pub async fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     match opts.snapshot_every {
         Some(s) => println!("snapshots: every {}s into {}, keeping {}", s, opts.snapshot_dir.display(), opts.keep),
         None => println!("snapshots: off (pass --snapshot-every)"),
+    }
+    if opts.debug {
+        println!("debug: logging every request, response and stream event, bodies included -- turn it off when done");
     }
     axum::serve(listener, router(relay)).await?;
     Ok(())
