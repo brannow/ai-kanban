@@ -102,8 +102,9 @@ remote is set.
 ```
 ai-kanban remote https://sync.board.rannow.de --key akb_…   set the remote, check the key
 ai-kanban remote                                            show it: URL, user, origin tag, protocol
-ai-kanban room list                                         rooms on the remote, and which local board each is connected to
-ai-kanban room connect sbahn [--board sbb] [--yes]          connect a local board to a room
+ai-kanban room list                                         rooms on the remote: origin board, creator, last activity, members, your board
+ai-kanban room show sbahn                                   what is in a room, rendered as a board, without joining it
+ai-kanban room connect sbahn [--board sbb | --new-board] [--yes]   connect a local board to a room
 ai-kanban room disconnect sbahn [--keep-foreign|--wipe-foreign] [--yes]
 ai-kanban remote --disconnect [...same flags]               disconnect every room, then forget the key
 ```
@@ -118,7 +119,14 @@ disconnect first. Moving the domain is `remote --move <new-url>`, the same serve
 
 ```
 $ ai-kanban room connect sbahn
+Room "sbahn" on https://…: created by volker from board "sbahn upgrade" 3d ago, last change 4m ago
+Connected: v1 volker
+
+Board: sbahn upgrade @sbahn  (11 open, 2 doing)
+…                                       (the room as a board: what room show prints)
+
 Connect which local board to room "sbahn"?
+  0) a new board
   1) sbb            (this folder)
   2) ai-kanban
   3) eee-web
@@ -131,8 +139,25 @@ backup written: ~/…/kanban-before-connect-sbahn.db
 connected. Board header now shows: Board: sbb @sbahn
 ```
 
+- **What is in the room comes first** (`room show`), so whoever answers the questions knows which
+  room they answer them about. The client pulls the room's log into a throwaway in-memory store
+  (`Store::preview`, under the tag `preview`, which the relay never issues) and renders it with
+  the ordinary board view; the relay interprets nothing. It only pulls and applies: `sync_board`
+  would push the temporary board's creation into the room. That is why **reading a room needs
+  only a key, not membership** -- any key holder may join any room anyway, and looking must not
+  put the looker in the member list. Writing and the event stream still need membership.
+- **Rooms remember the board they were created from** (relay migration 2, `?board=` on the join
+  that creates it; a later joiner's name does not replace it). Cleaned of control characters and
+  cut to 64 characters, since it is printed in other people's terminals.
 - **The picker is a numbered list read from stdin**, so no crate is needed. The board found from the
-  current folder is preselected. Boards already in a room are not listed.
+  current folder is preselected. Boards already in a room are not listed. **0 makes a new board**,
+  named after the room unless another name is typed, and is the only choice when no board is free.
+  It is created only after the confirmation, so cancelling leaves nothing. A new board has no
+  folder, and a board no session opens is one nobody reads, so the current folder is offered when
+  it belongs to no board yet (default no), and otherwise the `repo add` hint is printed.
+- **Without a terminal** the missing answer is an error naming the flag: `--board <name>` or
+  `--new-board`. `--board` with an unknown name never creates one: a typo would put a stray board
+  into a team room.
 - A board connects to at most one room, and a room to at most one board on this client. Both are
   enforced, and the refusal names the existing link.
 - The publish summary and the confirmation are mandatory, because connecting publishes the board's
@@ -357,6 +382,13 @@ Each mutation on a connected board writes, **in the same transaction**, one chan
   customer-x").
 - **Disconnecting drops unsent changes and unrecords them**, so reconnecting publishes those
   edits after all instead of finding "nothing changed".
+- **`--wipe-foreign` also unmaps what it wiped**: the rows' `sync_ids` and that room's
+  `sync_fields`. Left behind, they made the room's changes look already applied, and connecting
+  the room again -- to any board -- brought nothing back while the cursor reached the head (#1077).
+  What comes back is everything other members wrote. This store's own entries on their tasks do
+  not: a change under the store's own tag is skipped as an echo, which the wipe made untrue (#1078).
+  Only the wiped rows: a row deleted while connected keeps its mapping until its deletion is
+  published.
 
 ### When it happens
 

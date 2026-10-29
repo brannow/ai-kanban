@@ -661,6 +661,47 @@ fn wiping_on_disconnect_takes_only_tasks_others_created_and_keeps_their_findings
     assert!(benny.store.recent_events(benny.pid, 50).unwrap().iter().any(|e| e.body == "their board-level decision"));
 }
 
+/// The wipe once left the wiped rows' ids and clocks behind, so the room's changes looked
+/// "already applied" on the next connect: the cursor reached the head and the board stayed
+/// empty, with nothing reporting it.
+#[test]
+fn reconnecting_after_a_wipe_brings_the_rooms_tasks_back_to_any_board() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    let theirs = volker.store.create_task(volker.pid, TaskDraft::new("theirs")).unwrap();
+    volker.store.log_on(volker.pid, Some(theirs.id), Actor::Agent, "their finding").unwrap();
+    volker.store.create_note(volker.pid, NoteDraft { task_id: Some(theirs.id), ..NoteDraft::new("their note") }, Actor::Agent).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    let on_theirs = task_by_title(&benny, "theirs");
+    benny.store.log_on(benny.pid, Some(on_theirs.id), Actor::Agent, "my finding on their task").unwrap();
+    converge(&relay, &[&benny, &volker]);
+
+    benny.store.disconnect_board(benny.pid, true).unwrap();
+    benny.store.connect_board(benny.pid, ROOM).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    let back = task_by_title(&benny, "theirs");
+    let detail = benny.store.task_detail(benny.pid, back.id).unwrap();
+    assert!(detail.events.iter().any(|e| e.body == "their finding"), "{:?}", detail.events);
+    // Not yet: a change under this store's own tag is skipped as an echo of what it already
+    // has, which a wipe made untrue. Pinned so the day it changes is noticed (#1078).
+    assert!(!detail.events.iter().any(|e| e.body == "my finding on their task"), "{:?}", detail.events);
+    assert_eq!(detail.notes.len(), 1, "their note came back too");
+    // Equal but for that one entry of benny's own.
+    let mut theirs_only = state(&volker.store, volker.pid);
+    theirs_only.retain(|_, v| !v.contains("my finding on their task"));
+    assert_eq!(state(&benny.store, benny.pid), theirs_only);
+
+    benny.store.disconnect_board(benny.pid, true).unwrap();
+    let fresh = benny.store.create_board("fresh").unwrap().id;
+    benny.store.connect_board(fresh, ROOM).unwrap();
+    // `converge` syncs each member's own board; this one is pulled by hand.
+    let page = relay.pull(ROOM, &benny.p, 0, 1000).unwrap();
+    benny.store.apply(fresh, &page.changes).unwrap();
+    let titles: Vec<String> = benny.store.board(fresh, &BoardQuery::board()).unwrap().tasks.into_iter().map(|t| t.title).collect();
+    assert_eq!(titles, ["theirs"], "a new board connected to the room gets it as well");
+}
+
 /// A store restored from a backup takes a new tag. Its work from before is still its own.
 #[test]
 fn work_published_under_an_earlier_tag_stays_this_stores_own() {

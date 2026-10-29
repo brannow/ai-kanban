@@ -33,8 +33,9 @@ USAGE:
     ai-kanban where                Print the path to the store
     ai-kanban remote <url> --key K Connect this machine to a sync relay (docs/sync.md)
     ai-kanban remote               Show it; --move <url>, --disconnect
-    ai-kanban room list            Rooms on the relay
-    ai-kanban room connect <room>  Share a board through a room (--board <b>, --yes)
+    ai-kanban room list            Rooms on the relay: where each came from, who is in it
+    ai-kanban room show <room>     What is in a room, as a board, without joining it
+    ai-kanban room connect <room>  Share a board through a room (--board <b> | --new-board, --yes)
     ai-kanban room disconnect <room>   Uncouple it again
     ai-kanban room status | sync   What each shared board last did; sync them now
     ai-kanban install-cli --link L Link this command into ~/.local/bin (what /ai-kanban:install-cli

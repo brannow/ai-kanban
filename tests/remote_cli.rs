@@ -113,12 +113,45 @@ fn connecting_needs_a_board_and_a_yes_without_a_terminal_then_publishes_and_back
     assert_eq!(backups.len(), 1, "a backup is written before anything leaves the machine");
 
     let list = m.ok(&["room", "list"]);
-    assert!(list.contains("sbahn") && list.contains("<- board sbb") && list.contains("b1 benny"), "{list}");
+    assert!(list.contains("sbahn") && list.contains("<- your board sbb") && list.contains("b1 benny"), "{list}");
     let status = m.ok(&["room", "status"]);
     assert!(status.contains("sbb @sbahn") && status.contains("unsent      0") && status.contains("team        b1 benny"), "{status}");
 
     let again = m.fails(&["room", "connect", "sbahn", "--board", "sbb", "--yes"]);
     assert!(again.contains("already connected"), "{again}");
+}
+
+/// Being certain it is the right room before connecting: what is in it can be read without
+/// joining, and a board can be made for it on the spot -- but never by mistyping a name.
+#[test]
+fn a_room_can_be_looked_into_without_joining_and_connected_to_a_new_board() {
+    let relay = HttpRelay::start();
+    let (benny, volker) = (Machine::new(), Machine::new());
+    let bp = benny.board("sbb");
+    benny.store().create_task(bp, TaskDraft::new("Timetable import fails on DST")).unwrap();
+    benny.ok(&["remote", &relay.url, "--key", &relay.key("benny", "b1")]);
+    benny.ok(&["room", "connect", "sbahn", "--board", "sbb", "--yes"]);
+    volker.ok(&["remote", &relay.url, "--key", &relay.key("volker", "v1")]);
+
+    let list = volker.ok(&["room", "list"]);
+    assert!(list.contains("from board \"sbb\" by benny") && list.contains("b1 benny"), "{list}");
+    let show = volker.ok(&["room", "show", "sbahn"]);
+    assert!(show.contains("created by benny from board \"sbb\"") && show.contains("Timetable import fails on DST"), "{show}");
+    assert!(show.contains("#1-b1"), "the handles the room's members use: {show}");
+    assert!(!volker.ok(&["room", "list"]).contains("v1 volker"), "looking is not joining");
+
+    let no_board = volker.fails(&["room", "connect", "sbahn"]);
+    assert!(no_board.contains("--new-board"), "without a terminal it says how to make one: {no_board}");
+    volker.fails(&["room", "connect", "sbahn", "--board", "sbhan", "--yes"]);
+    assert!(volker.store().all_projects().unwrap().is_empty(), "a mistyped --board creates nothing");
+    let both = volker.fails(&["room", "connect", "sbahn", "--board", "x", "--new-board", "--yes"]);
+    assert!(both.contains("contradict"), "{both}");
+
+    let out = volker.ok(&["room", "connect", "sbahn", "--new-board", "--yes"]);
+    assert!(out.contains("a new board \"sbahn\"") && out.contains("repo add"), "and how to give it a folder: {out}");
+    let vp = volker.store().project_by_name_or_key("sbahn").unwrap().id;
+    let got: Vec<String> = volker.store().board(vp, &BoardQuery::board()).unwrap().tasks.into_iter().map(|t| t.title).collect();
+    assert_eq!(got, ["Timetable import fails on DST"]);
 }
 
 #[test]

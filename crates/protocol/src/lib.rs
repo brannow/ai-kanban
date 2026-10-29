@@ -187,6 +187,13 @@ pub struct RoomInfo {
     pub members: Vec<Member>,
     pub changes: i64,
     pub head: i64,
+    /// The name of the board the room was created from, so people can tell rooms apart.
+    /// Optional both ways: an older relay does not send it, an older client ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<String>,
+    /// When the last change arrived (unix seconds); none for an empty room or an older relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_change_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +236,19 @@ pub struct Page {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clients and the relay update at different times. A 0.1.1 plugin reads what a newer relay
+    /// sends, and a newer client reads what a 0.1.1 relay sends.
+    #[test]
+    fn room_info_reads_across_versions_both_ways() {
+        let old = r#"{"name":"sbahn","created_at":1,"created_by":"benny","members":[],"changes":0,"head":0}"#;
+        let r: RoomInfo = serde_json::from_str(old).unwrap();
+        assert_eq!((r.board, r.last_change_at), (None, None));
+        let newer = r#"{"name":"sbahn","created_at":1,"created_by":"benny","members":[],"changes":0,"head":0,
+                        "board":"ai-kanban","last_change_at":5,"something_later":true}"#;
+        let r: RoomInfo = serde_json::from_str(newer).unwrap();
+        assert_eq!((r.board.as_deref(), r.last_change_at), (Some("ai-kanban"), Some(5)));
+    }
 
     #[test]
     fn tags_cannot_contain_what_handles_split_on() {

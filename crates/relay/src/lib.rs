@@ -136,9 +136,20 @@ async fn rooms(State(r): State<Relay>, headers: HeaderMap) -> ApiResult<Vec<prot
     Ok(Json(r.db().rooms()?))
 }
 
-async fn join(State(r): State<Relay>, headers: HeaderMap, Path(room): Path<String>) -> ApiResult<protocol::Joined> {
+#[derive(Deserialize)]
+struct JoinQuery {
+    /// The joining board's name, kept if this join creates the room.
+    board: Option<String>,
+}
+
+async fn join(
+    State(r): State<Relay>,
+    headers: HeaderMap,
+    Path(room): Path<String>,
+    Query(q): Query<JoinQuery>,
+) -> ApiResult<protocol::Joined> {
     let p = r.auth(&headers)?;
-    Ok(Json(r.db().join(&room, &p)?))
+    Ok(Json(r.db().join_from(&room, &p, q.board.as_deref())?))
 }
 
 async fn leave(State(r): State<Relay>, headers: HeaderMap, Path(room): Path<String>) -> Result<StatusCode, ServerError> {

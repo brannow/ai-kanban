@@ -96,9 +96,13 @@ impl Client {
         read(res)
     }
 
-    pub fn join(&self, room: &str) -> Result<Joined, RemoteError> {
-        let res = self.agent.post(self.room_url(room, "join")).header("authorization", self.bearer()).send_empty().map_err(offline)?;
-        read(res)
+    /// `board` names the joining board; the relay keeps it if this join creates the room.
+    pub fn join(&self, room: &str, board: Option<&str>) -> Result<Joined, RemoteError> {
+        let mut req = self.agent.post(self.room_url(room, "join")).header("authorization", self.bearer());
+        if let Some(b) = board {
+            req = req.query("board", b);
+        }
+        read(req.send_empty().map_err(offline)?)
     }
 
     pub fn leave(&self, room: &str) -> Result<(), RemoteError> {

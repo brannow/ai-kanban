@@ -8,7 +8,9 @@
 use super::client::{Client, RemoteError};
 use super::config::{self, RemoteConfig};
 use super::engine::{check_identity, sync_board};
+use crate::core::model::BoardQuery;
 use crate::core::Store;
+use crate::sync::protocol::{RoomInfo, MAX_PAGE};
 use std::io::{BufRead, IsTerminal, Write};
 use std::time::Duration;
 
@@ -30,6 +32,7 @@ struct Args {
     wipe_foreign: bool,
     sync_first: bool,
     discard: bool,
+    new_board: bool,
 }
 
 fn args() -> Result<Args, String> {
@@ -47,6 +50,7 @@ fn args() -> Result<Args, String> {
             "--wipe-foreign" => a.wipe_foreign = true,
             "--sync-first" => a.sync_first = true,
             "--discard" => a.discard = true,
+            "--new-board" => a.new_board = true,
             s if s.starts_with("--") => return Err(format!("unknown flag {s}")),
             _ => a.pos.push(arg),
         }
@@ -62,6 +66,11 @@ fn args() -> Result<Args, String> {
 
 /// Asks on the terminal, or fails naming the flag that answers it.
 fn ask(question: &str, flag: &str) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(ask_as_typed(question, flag)?.to_ascii_lowercase())
+}
+
+/// `ask`, keeping the case: for a name.
+fn ask_as_typed(question: &str, flag: &str) -> Result<String, Box<dyn std::error::Error>> {
     if !std::io::stdin().is_terminal() {
         return Err(format!("{question}\nno terminal to ask on: pass {flag}").into());
     }
@@ -69,7 +78,7 @@ fn ask(question: &str, flag: &str) -> Result<String, Box<dyn std::error::Error>>
     std::io::stdout().flush()?;
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line)?;
-    Ok(line.trim().to_ascii_lowercase())
+    Ok(line.trim().to_string())
 }
 
 fn confirm(question: &str, yes: bool) -> Result<bool, Box<dyn std::error::Error>> {
@@ -214,8 +223,12 @@ pub fn room_cmd() -> CliResult {
     let store = Store::open_default()?;
     match a.pos.first().map(String::as_str) {
         Some("list") | None => room_list(&store),
+        Some("show") => {
+            let room = a.pos.get(1).ok_or("usage: ai-kanban room show <room>")?;
+            room_show(&store, room)
+        }
         Some("connect") => {
-            let room = a.pos.get(1).ok_or("usage: ai-kanban room connect <room> [--board <b>] [--yes]")?;
+            let room = a.pos.get(1).ok_or("usage: ai-kanban room connect <room> [--board <b> | --new-board] [--yes]")?;
             room_connect(&store, room, &a)
         }
         Some("disconnect") => {
@@ -227,7 +240,7 @@ pub fn room_cmd() -> CliResult {
         }
         Some("status") => room_status(&store),
         Some("sync") => room_sync(&store),
-        Some(other) => Err(format!("unknown room command {other:?}: list, connect, disconnect, status, sync").into()),
+        Some(other) => Err(format!("unknown room command {other:?}: list, show, connect, disconnect, status, sync").into()),
     }
 }
 
@@ -239,26 +252,89 @@ fn room_list(store: &Store) -> CliResult {
         println!("No rooms on {} yet. Connecting a board creates one: ai-kanban room connect <room>", cfg.url);
         return Ok(());
     }
+    let now = crate::core::now();
     for r in rooms {
-        let members = if r.members.is_empty() {
-            "nobody connected".to_string()
-        } else {
-            r.members.iter().map(|m| format!("{} {}", m.tag, m.user)).collect::<Vec<_>>().join(", ")
-        };
-        let here = match store.board_of_room(&r.name)? {
-            Some(pid) => format!("   <- board {}", store.project(pid)?.name),
-            None => String::new(),
-        };
-        println!("{:<20} {:>6} changes   {members}{here}", r.name, r.changes);
+        let mine = store.board_of_room(&r.name)?.map(|pid| store.project(pid).map(|p| p.name)).transpose()?;
+        println!("{}", crate::render::room_line(&r, mine.as_deref(), now));
+    }
+    println!("\nWhat is in one: ai-kanban room show <room>");
+    Ok(())
+}
+
+fn room_show(store: &Store, room: &str) -> CliResult {
+    need_network()?;
+    let cfg = need_remote()?;
+    let room = parse_room(room)?;
+    let c = client(&cfg);
+    let info = find_room(&c, &room)?.ok_or_else(|| format!("no room {room} on {}. All of them: ai-kanban room list", cfg.url))?;
+    print!("{}", preview(&c, &cfg.url, &info)?);
+    match store.board_of_room(&room)? {
+        Some(pid) => println!("\nConnected here to your board {}.", store.project(pid)?.name),
+        None => println!("\nConnect one of your boards to it: ai-kanban room connect {room}"),
     }
     Ok(())
+}
+
+fn parse_room(room: &str) -> Result<String, Box<dyn std::error::Error>> {
+    crate::sync::protocol::room_name(room)
+        .ok_or_else(|| format!("{room:?} is not a room name: lowercase letters, digits, '-' and '_'").into())
+}
+
+fn find_room(c: &Client, room: &str) -> Result<Option<RoomInfo>, RemoteError> {
+    Ok(c.rooms()?.into_iter().find(|r| r.name == room))
+}
+
+/// The tag a preview store publishes under. The relay never issues it -- tags it hands out are
+/// an initial and a number -- so no change in a room can look like the preview's own.
+const PREVIEW_TAG: &str = "preview";
+
+/// What a room holds, shown as the board view shows any board, without connecting to it: the
+/// room's log pulled into a throwaway in-memory store and rendered from there. The relay
+/// interprets nothing; the counts and claims are the client's own board logic.
+///
+/// Pull and apply only. `sync_board` would also push, sending the temporary board's own
+/// creation into the room; `check_identity` would give the store this machine's tag, and this
+/// machine's published tasks would then read as the preview's own.
+fn preview(c: &Client, url: &str, info: &RoomInfo) -> Result<String, Box<dyn std::error::Error>> {
+    let mut out = crate::render::room_header(info, url, crate::core::now());
+    if info.changes == 0 {
+        return Ok(out);
+    }
+    let (tmp, pid) = Store::preview(&info.name, info.board.as_deref().unwrap_or(&info.name), PREVIEW_TAG)?;
+    let mut since = 0;
+    loop {
+        let page = c.pull(&info.name, since, MAX_PAGE).map_err(|e| match e {
+            // A relay from before reading was open to every key.
+            RemoteError::NotFound(m) if m.contains("not a member") => {
+                format!("the relay at {url} shows a room only to its members -- it is older than this ai-kanban. Update the relay")
+            }
+            e => e.to_string(),
+        })?;
+        let Some(last) = page.changes.iter().map(|p| p.seq).max() else { break };
+        since = last;
+        tmp.apply(pid, &page.changes)?;
+        if !page.more {
+            break;
+        }
+    }
+    let members: Vec<(String, String)> = info.members.iter().map(|m| (m.tag.clone(), m.user.clone())).collect();
+    tmp.sync_succeeded(pid, &members)?;
+    out.push('\n');
+    out.push_str(&crate::render::board(&tmp.board(pid, &BoardQuery::board())?));
+    Ok(out)
+}
+
+/// Which board a room connects to: one that exists, or one made for it -- made only once the
+/// person has confirmed, so cancelling leaves nothing behind.
+enum Pick {
+    Board(i64),
+    New(String),
 }
 
 fn room_connect(store: &Store, room: &str, a: &Args) -> CliResult {
     need_network()?;
     let cfg = need_remote()?;
-    let room = crate::sync::protocol::room_name(room)
-        .ok_or_else(|| format!("{room:?} is not a room name: lowercase letters, digits, '-' and '_'"))?;
+    let room = parse_room(room)?;
     let c = client(&cfg);
     if let Err(e) = check_identity(store, &c) {
         return Err(e.into());
@@ -267,26 +343,46 @@ fn room_connect(store: &Store, room: &str, a: &Args) -> CliResult {
         return Err(format!("room {room} is already connected to board {} on this machine", store.project(pid)?.name).into());
     }
 
-    let pid = match &a.board {
-        Some(b) => store.project_by_name_or_key(b)?.id,
-        None => pick_board(store, &room)?,
-    };
-    let board = store.project(pid)?;
-    if let Some(r) = store.room_of(pid)? {
-        return Err(format!("board {} is already connected to room {r}", board.name).into());
+    // What is in the room comes first: whoever answers the questions below should know which
+    // room they are answering them about.
+    let existing = find_room(&c, &room)?;
+    match &existing {
+        // A relay from before open reads cannot show it; connecting must still work there.
+        Some(info) => match preview(&c, &cfg.url, info) {
+            Ok(p) => println!("{p}"),
+            Err(e) => println!("(cannot show what is in room \"{room}\": {e})\n"),
+        },
+        None => println!("Room \"{room}\" does not exist yet on {} -- connecting creates it.\n", cfg.url),
     }
 
-    let existing = c.rooms()?.into_iter().find(|r| r.name == room);
-    let publish = store.publish_summary(pid)?;
-    let tag = store.origin_tag()?.unwrap_or_default();
-    println!("board \"{}\" -> room \"{room}\" on {}", board.name, cfg.url);
-    println!("  will publish:  {} tasks, {} events, {} notes   (as #N-{tag})", publish.tasks, publish.events, publish.notes);
-    match &existing {
-        Some(r) => {
-            let who = r.members.iter().map(|m| format!("{} ({})", m.user, m.tag)).collect::<Vec<_>>().join(", ");
-            println!("  will receive:  {} changes{}", r.changes, if who.is_empty() { String::new() } else { format!(" from {who}") });
+    let pick = match (&a.board, a.new_board) {
+        (Some(_), true) => return Err("--board and --new-board contradict each other".into()),
+        (Some(b), false) => Pick::Board(store.project_by_name_or_key(b)?.id),
+        (None, true) => Pick::New(free_name(store, &room)?),
+        (None, false) => pick_board(store, &room)?,
+    };
+    let (name, publish) = match &pick {
+        Pick::Board(pid) => {
+            let board = store.project(*pid)?;
+            if let Some(r) = store.room_of(*pid)? {
+                return Err(format!("board {} is already connected to room {r}", board.name).into());
+            }
+            (board.name, Some(store.publish_summary(*pid)?))
         }
-        None => println!("  room \"{room}\" does not exist yet -- it will be created"),
+        Pick::New(name) => (name.clone(), None),
+    };
+
+    let tag = store.origin_tag()?.unwrap_or_default();
+    match publish {
+        Some(p) => {
+            println!("board \"{name}\" -> room \"{room}\" on {}", cfg.url);
+            println!("  will publish:  {} tasks, {} events, {} notes   (as #N-{tag})", p.tasks, p.events, p.notes);
+        }
+        None => println!("a new board \"{name}\" -> room \"{room}\" on {}", cfg.url),
+    }
+    if let Some(r) = &existing {
+        let who = r.members.iter().map(|m| format!("{} ({})", m.user, m.tag)).collect::<Vec<_>>().join(", ");
+        println!("  will receive:  {} changes{}", r.changes, if who.is_empty() { String::new() } else { format!(" from {who}") });
     }
     if !confirm("Connect?", a.yes)? {
         println!("cancelled.");
@@ -301,40 +397,88 @@ fn room_connect(store: &Store, room: &str, a: &Args) -> CliResult {
     store.backup_to(&backup)?;
     println!("backup written: {}", backup.display());
 
-    c.join(&room)?;
+    let pid = match pick {
+        Pick::Board(pid) => pid,
+        Pick::New(name) => {
+            let p = store.create_board(&name)?;
+            println!("board {} created.", p.name);
+            give_it_a_folder(store, p.id, &p.name)?;
+            p.id
+        }
+    };
+    c.join(&room, Some(&name))?;
     store.connect_board(pid, &room)?;
     match sync_board(store, &c, pid) {
-        Ok(s) => println!("connected. Published {} changes, received {}. The board now shows as: Board: {} @{room}", s.pushed, s.applied, board.name),
+        Ok(s) => println!("connected. Published {} changes, received {}. The board now shows as: Board: {name} @{room}", s.pushed, s.applied),
         Err(e) => println!("connected, but the first sync failed: {e}\nIt is retried on the next sync; nothing is lost."),
     }
     Ok(())
 }
 
-/// The board to connect, asked for when `--board` was not given. Boards already in a room are
-/// not offered, and the one this folder resolves to comes first.
-fn pick_board(store: &Store, room: &str) -> Result<i64, Box<dyn std::error::Error>> {
+/// The room's name for a new board, if no board has it yet. Checked when it is chosen, so the
+/// person is not told after confirming.
+fn free_name(store: &Store, name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if store.all_projects()?.iter().any(|p| p.name.eq_ignore_ascii_case(name)) {
+        return Err(format!(
+            "there is already a board called {name}. Connect that one (--board {name}), or make one with another \
+             name: ai-kanban board add <name>, then --board <name>"
+        )
+        .into());
+    }
+    Ok(name.to_string())
+}
+
+/// A board with no folder is one no session opens: an agent in the project resolves to another
+/// board, and the room's tasks would land where nobody looks. So the folder this runs in is
+/// offered, when it belongs to no board yet -- defaulting to no, since that may be anywhere.
+fn give_it_a_folder(store: &Store, pid: i64, name: &str) -> CliResult {
+    let here = std::env::current_dir()?;
+    let hint = || println!("It has no folder yet. Give it one, so sessions there open it: ai-kanban repo add <path> --board {name}");
+    if store.find_project(&here)?.is_some() || !std::io::stdin().is_terminal() {
+        hint();
+        return Ok(());
+    }
+    let answer = ask(&format!("Open it from this folder ({})? [y/N]:", here.display()), "")?;
+    if matches!(answer.as_str(), "y" | "yes") {
+        let repo = store.add_repo(pid, &here, None, crate::core::model::Actor::User)?;
+        println!("{} added to board {name}.", repo.name);
+    } else {
+        hint();
+    }
+    Ok(())
+}
+
+/// The board to connect, asked for when neither `--board` nor `--new-board` was given. Boards
+/// already in a room are not offered, the one this folder resolves to comes first, and 0 makes
+/// a new one.
+fn pick_board(store: &Store, room: &str) -> Result<Pick, Box<dyn std::error::Error>> {
     let connected: Vec<i64> = store.connected_boards()?.into_iter().map(|(p, _)| p).collect();
     let here = std::env::current_dir().ok().and_then(|d| store.find_project(&d).ok().flatten()).map(|p| p.id);
-    let all = store.all_projects()?;
-    if all.is_empty() {
-        return Err("there is no board on this machine yet. One is created when an agent first uses ai-kanban in a project folder, or by `ai-kanban board add <name>`".into());
-    }
-    let mut boards: Vec<_> = all.into_iter().filter(|p| !connected.contains(&p.id)).collect();
-    if boards.is_empty() {
-        return Err("every board on this machine is already connected to a room".into());
-    }
+    let mut boards: Vec<_> = store.all_projects()?.into_iter().filter(|p| !connected.contains(&p.id)).collect();
     boards.sort_by_key(|p| (Some(p.id) != here, p.name.to_ascii_lowercase()));
     if !std::io::stdin().is_terminal() {
-        return Err(format!("which board? pass --board <name> (one of: {})", boards.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")).into());
+        let names = boards.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ");
+        return Err(if boards.is_empty() {
+            "no board on this machine is free to connect: pass --new-board to make one for this room".to_string()
+        } else {
+            format!("which board? pass --board <name> (one of: {names}), or --new-board to make one for this room")
+        }
+        .into());
     }
     println!("Connect which local board to room \"{room}\"?");
+    println!("  0) a new board");
     for (i, p) in boards.iter().enumerate() {
         let mark = if Some(p.id) == here { "   (this folder)" } else { "" };
         println!("  {}) {}{mark}", i + 1, p.name);
     }
-    let answer = ask("Board [1]:", "--board <name>")?;
-    let n: usize = if answer.is_empty() { 1 } else { answer.parse().map_err(|_| format!("{answer:?} is not one of the numbers"))? };
-    boards.get(n.wrapping_sub(1)).map(|p| p.id).ok_or_else(|| format!("{n} is not one of the numbers").into())
+    let default = if boards.is_empty() { 0 } else { 1 };
+    let answer = ask(&format!("Board [{default}]:"), "--board <name> or --new-board")?;
+    let n: usize = if answer.is_empty() { default } else { answer.parse().map_err(|_| format!("{answer:?} is not one of the numbers"))? };
+    if n == 0 {
+        let name = ask_as_typed(&format!("Name for the new board [{room}]:"), "--new-board")?;
+        return Ok(Pick::New(free_name(store, if name.is_empty() { room } else { &name })?));
+    }
+    boards.get(n - 1).map(|p| Pick::Board(p.id)).ok_or_else(|| format!("{n} is not one of the numbers").into())
 }
 
 fn disconnect(store: &Store, cfg: &RemoteConfig, pid: i64, room: &str, a: &Args) -> CliResult {

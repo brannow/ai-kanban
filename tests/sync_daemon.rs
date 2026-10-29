@@ -36,12 +36,12 @@ fn a_session_publishes_its_writes_and_receives_a_teammates_without_being_asked()
     let me = Store::open(&db).unwrap();
     me.set_origin_tag("b1").unwrap();
     let pid = me.create_board("sbb").unwrap().id;
-    Client::new(&relay.url, &key, Duration::from_secs(5)).join("sbahn").unwrap();
+    Client::new(&relay.url, &key, Duration::from_secs(5)).join("sbahn", None).unwrap();
     me.connect_board(pid, "sbahn").unwrap();
 
     let volker_key = relay.key("volker", "v1");
     let volker_client = Client::new(&relay.url, &volker_key, Duration::from_secs(5));
-    volker_client.join("sbahn").unwrap();
+    volker_client.join("sbahn", None).unwrap();
     let volker = Store::open_in_memory().unwrap();
     volker.set_origin_tag("v1").unwrap();
     let vp = volker.create_board("x").unwrap().id;

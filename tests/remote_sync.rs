@@ -26,7 +26,7 @@ fn machine(relay: &HttpRelay, user: &str, tag: &str, board: &str) -> Machine {
     let client = Client::new(&relay.url, &relay.key(user, tag), Duration::from_secs(5));
     store.set_origin_tag(&client.whoami().unwrap().tag).unwrap();
     let pid = store.create_board(board).unwrap().id;
-    client.join("sbahn").unwrap();
+    client.join("sbahn", None).unwrap();
     store.connect_board(pid, "sbahn").unwrap();
     Machine { store, pid, client, path, _dir: dir }
 }

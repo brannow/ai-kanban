@@ -144,14 +144,66 @@ async fn joining_creates_a_room_once_and_lists_its_members() {
     assert_eq!(rooms[0]["created_by"], "benny");
 }
 
+/// Writing needs membership. Reading needs only a key: anyone with one may join any room
+/// anyway, and looking before connecting (`room show`) must not add the looker to the members.
 #[tokio::test]
-async fn reading_and_writing_need_membership() {
+async fn writing_needs_membership_and_reading_only_a_key() {
     let f = fixture();
     join(&f, &f.benny, "sbahn").await;
+    push(&f, &f.benny, "sbahn", vec![change("b1", 1, task("b1", 1), None, "title", json!("x"))]).await;
     let (s, _) = push(&f, &f.volker, "sbahn", vec![change("v1", 1, task("v1", 1), None, "title", json!("x"))]).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "volker has not joined");
-    let (s, _) = call(&f.relay, "GET", "/v1/rooms/sbahn/changes", Some(&f.volker), None).await;
-    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    let members = |rooms: Value| rooms[0]["members"].as_array().unwrap().len();
+    let (_, before) = call(&f.relay, "GET", "/v1/rooms", Some(&f.volker), None).await;
+    assert_eq!(pull(&f, &f.volker, "sbahn", 0).await["changes"].as_array().unwrap().len(), 1, "a look inside");
+    let (_, after) = call(&f.relay, "GET", "/v1/rooms", Some(&f.volker), None).await;
+    assert_eq!((members(before), members(after)), (1, 1), "looking is not joining");
+
+    let (s, _) = call(&f.relay, "GET", "/v1/rooms/sbahn/changes", None, None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "but it takes a key");
+    let (s, _) = call(&f.relay, "GET", "/v1/rooms/nowhere/changes", Some(&f.volker), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "an unknown room is not an empty one");
+}
+
+/// The board a room came from is what tells two rooms apart. It is the creator's; a later
+/// member's board name says nothing about the room.
+#[tokio::test]
+async fn a_room_keeps_the_board_it_was_created_from() {
+    let f = fixture();
+    let (s, v) = call(&f.relay, "POST", "/v1/rooms/sbahn/join?board=ai-kanban", Some(&f.benny), None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["room"]["board"], "ai-kanban");
+    call(&f.relay, "POST", "/v1/rooms/sbahn/join?board=volkers-copy", Some(&f.volker), None).await;
+    let (_, rooms) = call(&f.relay, "GET", "/v1/rooms", Some(&f.benny), None).await;
+    assert_eq!(rooms[0]["board"], "ai-kanban", "a later joiner does not rename it");
+    assert!(rooms[0]["last_change_at"].is_null(), "nothing written yet");
+
+    // Shown in other people's terminals: no control characters, and not a page long.
+    let (_, v) = call(&f.relay, "POST", &format!("/v1/rooms/odd/join?board=a%1B%5B31mb{}", "x".repeat(100)), Some(&f.benny), None).await;
+    let name = v["room"]["board"].as_str().unwrap();
+    assert!(!name.contains('\u{1b}') && name.chars().count() <= 64 && name.starts_with("a[31mb"), "{name}");
+    let (_, v) = call(&f.relay, "POST", "/v1/rooms/plain/join", Some(&f.benny), None).await;
+    assert!(v["room"].get("board").is_none(), "an older client names no board: {v}");
+}
+
+/// The deployed relay holds a version-1 database. Opening it with this binary must add the
+/// column and keep every row.
+#[test]
+fn a_version_1_database_upgrades_and_keeps_its_rooms() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.db");
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(include_str!("../src/schema.sql")).unwrap();
+        c.execute_batch("PRAGMA user_version = 1; PRAGMA application_id = 1095459411;
+                         INSERT INTO rooms (name, created_at, created_by) VALUES ('sbahn', 1, 'benny');").unwrap();
+    }
+    let db = ServerDb::open(&path).unwrap();
+    let rooms = db.rooms().unwrap();
+    assert_eq!((rooms[0].name.as_str(), rooms[0].board.as_deref()), ("sbahn", None));
+    let v: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(v, 2);
 }
 
 #[tokio::test]

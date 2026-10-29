@@ -27,7 +27,7 @@ const APPLICATION_ID: i64 = 0x414B_6253;
 /// Each entry runs once, in order, inside a transaction, and stamps `user_version`. Frozen once
 /// shipped, for the reason note #178 gives about core's migrations: a store that already ran
 /// one never runs an edited version of it.
-const MIGRATIONS: &[&str] = &[include_str!("schema.sql")];
+const MIGRATIONS: &[&str] = &[include_str!("schema.sql"), include_str!("migrate_002_room_board.sql")];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -378,6 +378,13 @@ impl ServerDb {
 // Rooms
 // ---------------------------------------------------------------------------
 
+/// A board name as other people's terminals will show it: no control characters, at most 64
+/// characters. Cleaned rather than refused -- a name is a hint, and a client must not fail to
+/// join over one.
+fn board_label(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).take(64).collect::<String>().trim().to_string()
+}
+
 fn parse_room(raw: &str) -> Result<String> {
     protocol::room_name(raw).ok_or_else(|| {
         ServerError::BadRequest(format!(
@@ -395,8 +402,10 @@ impl ServerDb {
             .ok_or_else(|| ServerError::NotFound(format!("no room {name}")))
     }
 
-    /// The room, if the principal is a current member of it. Reading and writing both require
-    /// having joined, so membership is what `room list` and the empty-room rule can trust.
+    /// The room, if the principal is a current member of it. Writing requires having joined, so
+    /// membership is what `room list` and the empty-room rule can trust. Reading does not: any
+    /// key holder may join any room anyway, and a look before connecting (`room show`) should
+    /// not put the looker in the member list.
     fn member_room(&self, name: &str, p: &Principal) -> Result<i64> {
         let id = self.room_id(name)?;
         let member: bool = self.conn.query_row(
@@ -413,10 +422,10 @@ impl ServerDb {
     }
 
     pub fn room_info(&self, id: i64) -> Result<RoomInfo> {
-        let (name, created_at, created_by): (String, i64, String) = self.conn.query_row(
-            "SELECT name, created_at, created_by FROM rooms WHERE id = ?1",
+        let (name, created_at, created_by, board): (String, i64, String, Option<String>) = self.conn.query_row(
+            "SELECT name, created_at, created_by, board FROM rooms WHERE id = ?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         let mut st = self.conn.prepare(
             "SELECT m.tag, u.name FROM members m JOIN tags t ON t.tag = m.tag JOIN users u ON u.id = t.user_id
@@ -425,12 +434,12 @@ impl ServerDb {
         let members = st
             .query_map([id], |r| Ok(Member { tag: r.get(0)?, user: r.get(1)? }))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let (changes, head): (i64, i64) = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(MAX(seq), 0) FROM changes WHERE room_id = ?1",
+        let (changes, head, last_change_at): (i64, i64, Option<i64>) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(seq), 0), MAX(received_at) FROM changes WHERE room_id = ?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        Ok(RoomInfo { name, created_at, created_by, members, changes, head })
+        Ok(RoomInfo { name, created_at, created_by, members, changes, head, board, last_change_at })
     }
 
     pub fn rooms(&self) -> Result<Vec<RoomInfo>> {
@@ -444,11 +453,18 @@ impl ServerDb {
     /// Joins a room, creating it if it does not exist. Any user may create one: a server is a
     /// team. Joining again is harmless.
     pub fn join(&self, name: &str, p: &Principal) -> Result<Joined> {
+        self.join_from(name, p, None)
+    }
+
+    /// `join`, naming the board the room is created from. Only the join that creates the room
+    /// records it: a later member's board name says nothing about where the room came from.
+    pub fn join_from(&self, name: &str, p: &Principal, board: Option<&str>) -> Result<Joined> {
         let name = parse_room(name)?;
+        let board = board.map(board_label).filter(|b| !b.is_empty());
         let tx = self.conn.unchecked_transaction()?;
         let created = tx.execute(
-            "INSERT OR IGNORE INTO rooms (name, created_at, created_by) VALUES (?1, ?2, ?3)",
-            params![name, now(), p.user],
+            "INSERT OR IGNORE INTO rooms (name, created_at, created_by, board) VALUES (?1, ?2, ?3, ?4)",
+            params![name, now(), p.user, board],
         )? == 1;
         let id: i64 = tx.query_row("SELECT id FROM rooms WHERE name = ?1", [&name], |r| r.get(0))?;
         tx.execute(
@@ -627,8 +643,9 @@ impl ServerDb {
         Ok((id, self.head(id)?))
     }
 
-    pub fn pull(&self, room: &str, p: &Principal, since: i64, limit: usize) -> Result<Page> {
-        let room_id = self.member_room(room, p)?;
+    /// Open to every key, member or not (see `member_room`). `p` is the authenticated caller.
+    pub fn pull(&self, room: &str, _p: &Principal, since: i64, limit: usize) -> Result<Page> {
+        let room_id = self.room_id(room)?;
         let limit = limit.clamp(1, protocol::MAX_PAGE);
         let mut st = self.conn.prepare(
             "SELECT seq, author, received_at, body FROM changes WHERE room_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",

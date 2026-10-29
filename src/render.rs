@@ -773,3 +773,45 @@ fn truncate(s: &str, max: usize) -> String {
     let cut: String = chars[..end].iter().collect();
     format!("{}…", cut.trim_end())
 }
+
+/// One room in `room list`: what tells it apart from the others at a glance -- the board it
+/// came from, who made it and is in it, and whether anything still happens there. `mine` is
+/// the local board connected to it.
+pub fn room_line(r: &crate::sync::protocol::RoomInfo, mine: Option<&str>, now: i64) -> String {
+    let from = match &r.board {
+        Some(b) => format!("from board \"{b}\" by {}", r.created_by),
+        None => format!("made by {}", r.created_by),
+    };
+    let active = match r.last_change_at {
+        Some(t) => format!("active {}", since(now, t)),
+        None if r.changes == 0 => "empty".to_string(),
+        // An older relay does not say when.
+        None => format!("{} changes", r.changes),
+    };
+    let members = if r.members.is_empty() {
+        "nobody connected".to_string()
+    } else {
+        r.members.iter().map(|m| format!("{} {}", m.tag, m.user)).collect::<Vec<_>>().join(", ")
+    };
+    let mine = mine.map(|b| format!("   <- your board {b}")).unwrap_or_default();
+    format!("{:<16} {from}, {active}\n{:<16} {members}{mine}", r.name, "")
+}
+
+/// The first lines of `room show`, above the board the room holds.
+pub fn room_header(r: &crate::sync::protocol::RoomInfo, url: &str, now: i64) -> String {
+    let from = r.board.as_ref().map(|b| format!(" from board \"{b}\"")).unwrap_or_default();
+    let last = match r.last_change_at {
+        Some(t) => format!(", last change {}", since(now, t)),
+        None if r.changes == 0 => ", nothing in it yet".to_string(),
+        None => String::new(),
+    };
+    let members = if r.members.is_empty() {
+        "nobody".to_string()
+    } else {
+        r.members.iter().map(|m| format!("{} {}", m.tag, m.user)).collect::<Vec<_>>().join(", ")
+    };
+    format!(
+        "Room \"{}\" on {url}: created by {}{from} {}{last}\nConnected: {members}\n",
+        r.name, r.created_by, since(now, r.created_at)
+    )
+}

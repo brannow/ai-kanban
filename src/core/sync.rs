@@ -277,6 +277,22 @@ impl Store {
 
     /// Connects a board to a room: from here on everything on it is published, starting with
     /// everything already there. One room per board and one board per room.
+    /// A throwaway in-memory store holding one board, connected to `room` under `tag`, for
+    /// looking into a room without connecting to it (`room show`): the caller applies the
+    /// room's log and renders the board. `tag` must be one the relay never issues, so no change
+    /// in the room reads as the preview's own.
+    ///
+    /// The board's own `project_created` is dropped: it is this store's, written just now, and
+    /// the room's board would show as created "just now" however old it is.
+    pub fn preview(room: &str, board_name: &str, tag: &str) -> Result<(Store, i64)> {
+        let store = Store::open_in_memory()?;
+        store.set_origin_tag(tag)?;
+        let pid = store.create_board(board_name)?.id;
+        store.conn.execute("DELETE FROM events WHERE project_id = ?1 AND kind = 'project_created'", [pid])?;
+        store.connect_board(pid, room)?;
+        Ok((store, pid))
+    }
+
     pub fn connect_board(&self, project_id: i64, room: &str) -> Result<()> {
         let room = crate::sync::protocol::room_name(room)
             .ok_or_else(|| Error::InvalidValue { field: "room", value: room.into(), valid: "lowercase letters, digits, '-' and '_'".into() })?;
@@ -352,11 +368,49 @@ impl Store {
                     let ids = st.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
                     ids
                 };
-                for n in their_notes {
-                    self.forget_note_unchecked(project_id, n, false)?;
+                // Every event the forgets below delete: the task's own, and those of the notes
+                // that go with it.
+                let events: Vec<i64> = {
+                    let notes = their_notes.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+                    let mut st = self.conn.prepare(&format!(
+                        "SELECT id FROM events WHERE (task_id = ?1 AND note_id IS NULL) OR note_id IN ({})",
+                        if notes.is_empty() { "NULL".to_string() } else { notes }
+                    ))?;
+                    let ids = st.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+                    ids
+                };
+                for n in &their_notes {
+                    self.forget_note_unchecked(project_id, *n, false)?;
+                    self.unmap(&room, "note", *n)?;
                 }
                 self.forget_task_unchecked(project_id, id, false)?;
+                self.unmap(&room, "task", id)?;
+                for e in events {
+                    self.unmap(&room, "event", e)?;
+                }
             }
+        }
+        Ok(())
+    }
+
+    /// Forgets that a wiped row came from `room`: its id mapping, and the clocks its fields had
+    /// there. Left behind, they make the room's changes for it look already applied, so
+    /// connecting the room again -- to this board or another -- would bring nothing back. Only
+    /// for rows just wiped: a row deleted while connected keeps its mapping until its deletion
+    /// has been published.
+    fn unmap(&self, room: &str, kind: &str, local_id: i64) -> Result<()> {
+        let origin: Option<(String, i64)> = self
+            .conn
+            .query_row("SELECT origin, origin_id FROM sync_ids WHERE kind = ?1 AND local_id = ?2", params![kind, local_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        if let Some((origin, origin_id)) = origin {
+            self.conn.execute(
+                "DELETE FROM sync_fields WHERE room = ?1 AND kind = ?2 AND origin = ?3 AND origin_id = ?4",
+                params![room, kind, origin, origin_id],
+            )?;
+            self.conn.execute("DELETE FROM sync_ids WHERE kind = ?1 AND local_id = ?2", params![kind, local_id])?;
         }
         Ok(())
     }
