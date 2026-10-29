@@ -204,7 +204,7 @@ name twice:
 
 ```sh
 ai-kanban projects
-ai-kanban merge "git:github.com/me/repo" "path:/old/checkout"
+ai-kanban board merge "git:github.com/me/repo" "path:/old/checkout"
 ```
 
 The first board survives and the second is folded into it.

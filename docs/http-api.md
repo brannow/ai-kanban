@@ -88,6 +88,15 @@ whole router, so a route added later is covered without anyone remembering to:
 
 `tests/http_api.rs` covers the rebinding read, the cross-site write and the page's own requests.
 
+### `/api/sync` -- the room badge
+
+For each board shared through a room: its `room`, `live` (whether this process's stream for it is
+connected right now; `null` when the process does not sync), `last_ok_at`, `last_error`,
+`unsent_tasks`/`unsent_notes` and `members`, plus the store's `paused` reason. Its own small
+endpoint, asked every 10s: a stream connecting or dropping writes nothing the change feed sees,
+and rebuilding the board picker for it would close the dropdown under the person's hand. Task
+reads also carry `authors` beside `texts`: who wrote a history entry, when a teammate did.
+
 ### Teammates' text in the page
 
 Once a board is shared, its text is written by other people, so the page treats every string as
@@ -515,7 +524,7 @@ Everything that changes a repo lives in `ai-kanban repo`: `add`, `rm`, `rename`,
 <board>` (its folder, and every subdirectory the old home had learned, opens on that board from
 now on) and `forget`. A path that is already a repo on another board is **shared**: attached,
 home unchanged. A new checkout in a directory another board already claims is refused, naming
-that board, because the repair is `ai-kanban merge`.
+that board, because the repair is `ai-kanban board merge`.
 
 On tasks, naming repos is a field edit like tags, so the page may correct it: `POST`/`PATCH
 /tasks` take `repos` (ids of this board's repos; `[]` clears) and `external_ref` (`""` clears —

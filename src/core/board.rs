@@ -267,8 +267,9 @@ impl Store {
                 doing: self.tasks_in(project.id, &[Status::Doing], 5, None)?,
                 last_activity: self.last_activity(project.id)?,
                 open,
-                project,
                 handles: self.handles(&[])?,
+                room: self.room_of(project.id)?,
+                project,
             });
         }
         // Most recently touched first -- "what was I working on" is the question this

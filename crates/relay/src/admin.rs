@@ -43,6 +43,7 @@ fn args() -> Result<Args, String> {
             // A flag, not a word among the arguments: `key rotate volker --help` must show the
             // page, not rotate a user called "help".
             "-h" | "--help" => a.help = true,
+            "-V" | "--version" => a.pos.insert(0, "version".into()),
             s if s.starts_with("--") => return Err(format!("unknown flag {s}")),
             _ => a.pos.push(arg),
         }
@@ -145,6 +146,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             super::serve(opts).await
         }
         Some("help") => help(a.arg(1)),
+        Some("version") => {
+            println!(
+                "ai-kanban-relay {} (protocol {}-{})",
+                env!("CARGO_PKG_VERSION"), ai_kanban_protocol::MIN_PROTOCOL_VERSION, ai_kanban_protocol::PROTOCOL_VERSION
+            );
+            Ok(())
+        }
         Some("key") => key(&a),
         Some("room") => room(&a),
         Some("forget") => forget(&a),

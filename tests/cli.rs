@@ -142,3 +142,35 @@ fn a_command_whose_reader_goes_away_ends_quietly() {
         assert!(!err.contains("panicked") && !err.contains("Broken pipe"), "{args:?}: {err}");
     }
 }
+
+/// One way to say each thing: `repo rm --all` is what `repo forget` was, `board list` and
+/// `board merge` what `projects` and `merge` were. The older spellings keep working -- boards'
+/// notes and logs, the agents' memory, name them -- but the help lists only the new ones.
+#[test]
+fn the_tidied_commands_work_and_the_older_spellings_still_do() {
+    let c = Cli::new();
+    c.ok(&c.root, &["board", "add", "ONE"]);
+    c.ok(&c.root, &["board", "add", "TWO"]);
+    let lib = c.checkout("lib");
+    c.ok(&c.root, &["repo", "add", lib.to_str().unwrap(), "--board", "ONE"]);
+    c.ok(&c.root, &["repo", "add", lib.to_str().unwrap(), "--board", "TWO"]);
+
+    let dry = c.run(&c.root, &["repo", "rm", "lib", "--all"]);
+    assert!(!dry.status.success() && String::from_utf8_lossy(&dry.stdout).contains("off 2 boards"), "{}", String::from_utf8_lossy(&dry.stdout));
+    assert_eq!(c.store().all_repos().unwrap().len(), 1, "a dry run");
+    assert!(c.ok(&c.root, &["repo", "rm", "lib", "--all", "--yes"]).contains("from every board"));
+    assert!(c.store().all_repos().unwrap().is_empty());
+
+    assert_eq!(c.ok(&c.root, &["board", "list"]), c.ok(&c.root, &["projects"]));
+    assert!(c.ok(&c.root, &["board", "merge", "ONE", "TWO"]).contains("Moved"));
+    assert_eq!(c.store().all_projects().unwrap().len(), 1);
+    c.ok(&c.root, &["board", "add", "THREE"]);
+    c.ok(&c.root, &["merge", "ONE", "THREE"]);
+    assert_eq!(c.store().all_projects().unwrap().len(), 1, "`merge` still works");
+
+    let help = c.ok(&c.root, &["--help"]);
+    for gone in ["repo forget", "repo home", "ai-kanban projects", "ai-kanban merge", "room status"] {
+        assert!(!help.contains(gone), "{gone} is not advertised any more");
+    }
+    assert!(help.starts_with("ai-kanban ") && help.contains("(protocol "), "the version comes first");
+}

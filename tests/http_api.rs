@@ -22,7 +22,7 @@ fn api() -> (Api, i64) {
     let dir = tempfile::tempdir().unwrap();
     let pid = store.resolve_project(dir.path()).unwrap().project.id;
     let (tx, _) = tokio::sync::broadcast::channel(16);
-    (Api { store: Arc::new(Mutex::new(store)), changes: tx }, pid)
+    (Api { store: Arc::new(Mutex::new(store)), changes: tx, sync: None }, pid)
 }
 
 async fn call(api: &Api, req: Request<Body>) -> (StatusCode, Value, Option<String>) {

@@ -32,6 +32,9 @@ use std::sync::{Arc, Mutex};
 pub struct Api {
     pub store: Arc<Mutex<Store>>,
     pub changes: tokio::sync::broadcast::Sender<stream::Change>,
+    /// This process's sync, when it runs one (`serve` with a remote set): what tells the page
+    /// whether a room's stream is live right now.
+    pub sync: Option<Arc<crate::remote::daemon::Syncer>>,
 }
 
 impl Api {
@@ -70,6 +73,7 @@ pub fn router(api: Api) -> Router {
         .route("/app.js", get(|| async { page("text/javascript; charset=utf-8", APP) }))
         .route("/api/meta", get(routes::meta))
         .route("/api/projects", get(routes::projects))
+        .route("/api/sync", get(routes::sync_state))
         .route("/api/all/board", get(routes::all_board))
         .route("/api/all/tasks", get(routes::all_tasks))
         .route("/api/projects/{p}", get(routes::project))
@@ -98,8 +102,6 @@ pub fn router(api: Api) -> Router {
 /// value is noise, and the moment it accepts others somebody passes `0.0.0.0`.
 pub async fn serve(store: Store, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let (tx, _) = tokio::sync::broadcast::channel(64);
-    let api = Api { store: Arc::new(Mutex::new(store)), changes: tx.clone() };
-
     stream::spawn_poller(tx.clone());
 
     // The same background sync a session runs, so the page is not an island: what is changed
@@ -108,7 +110,8 @@ pub async fn serve(store: Store, port: u16) -> Result<(), Box<dyn std::error::Er
     // the page's own or one from elsewhere, is a reason to sync now rather than within the
     // minute. Several processes syncing one store is safe by design (`remote::engine`).
     let rooms = Store::open_default().ok().and_then(|s| s.connected_boards().ok()).unwrap_or_default();
-    match crate::remote::daemon::Syncer::start() {
+    let sync = crate::remote::daemon::Syncer::start().map(Arc::new);
+    match sync.clone() {
         Some(sync) => {
             let names = rooms.iter().map(|(_, r)| r.as_str()).collect::<Vec<_>>().join(", ");
             println!("sync: on{}", if names.is_empty() { " (no board in a room yet)".to_string() } else { format!(" -- rooms {names}") });
@@ -124,6 +127,7 @@ pub async fn serve(store: Store, port: u16) -> Result<(), Box<dyn std::error::Er
         }
         None => println!("sync: off (no remote set, or AI_KANBAN_SYNC=0)"),
     }
+    let api = Api { store: Arc::new(Mutex::new(store)), changes: tx.clone(), sync };
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;

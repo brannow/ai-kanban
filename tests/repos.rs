@@ -87,7 +87,7 @@ fn a_folder_another_board_already_claims_is_refused_and_the_owner_named() {
         }
         e => panic!("expected PathClaimed, got {e:?}"),
     }
-    assert!(text.contains("ai-kanban merge"), "the refusal must say what to do instead: {text}");
+    assert!(text.contains("ai-kanban board merge"), "the refusal must say what to do instead: {text}");
     assert!(f.s.repos(f.pid).unwrap().is_empty(), "a refused registration writes nothing");
 }
 

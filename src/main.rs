@@ -12,36 +12,42 @@ use rmcp::{transport::stdio, ServiceExt};
 const USAGE: &str = "\
 ai-kanban -- a kanban board an agent can actually use
 
-USAGE:
-    ai-kanban serve [--port N]     Web UI + HTTP API on http://127.0.0.1:7373
-    ai-kanban mcp                  Run the MCP server on stdio (what an agent connects to)
-    ai-kanban hook session-start   Emit the board as Claude Code SessionStart context
-    ai-kanban hook post-tool-use   Emit notes about the file a tool just touched
-    ai-kanban backup <file>        Copy the whole store to one consistent file
-    ai-kanban export [project...]  Write the store as JSON on stdout
-    ai-kanban import <file>        Restore projects from an export
-    ai-kanban projects             List every board in the store
-    ai-kanban board add <name>     Create a board for a project that is not one folder
-    ai-kanban board forget <board> Delete a board and all its history (dry run without --yes)
-    ai-kanban repo list [board]    Repos on a board, or \"all\" for every repo in the store
-    ai-kanban repo add <path>      Register a checkout on this directory's board (--board <b>)
-    ai-kanban repo rm <repo>       Take a repo off this directory's board (--board <b>)
-    ai-kanban repo rename <repo> <new>   Rename a repo (--board <b>)
-    ai-kanban repo home <repo> <board>   Make its folder open on that board from now on
-    ai-kanban repo forget <repo>   Remove a repo from every board (dry run without --yes)
-    ai-kanban merge <keep> <gone>  Repair a board that split into two
-    ai-kanban where                Print the path to the store
-    ai-kanban remote <url> --key K Connect this machine to a sync relay (--name N: how the team sees you)
-    ai-kanban remote --name N      Change the name the team sees; your task numbers stay
-    ai-kanban remote               Show it; --move <url>, --disconnect
-    ai-kanban room list            Rooms on the relay: where each came from, who is in it
-    ai-kanban room show <room>     What is in a room, as a board, without joining it
-    ai-kanban room connect <room>  Share a board through a room (--board <b> | --new-board, --yes)
+Boards:
+    ai-kanban board list               Every board, and the room it is shared through (@room)
+    ai-kanban board add <name>         A board for a project that is not one folder
+    ai-kanban board merge <keep> <gone>    Join a board that split into two
+    ai-kanban board forget <board>     Delete a board and all its history (dry run without --yes)
+    ai-kanban serve [--port N]         The web UI on http://127.0.0.1:7373; syncs shared boards too
+
+Repos -- the checkouts a board's tasks live in:
+    ai-kanban repo list [board|all]    Repos on this folder's board, another, or every one
+    ai-kanban repo add <path>          Register a checkout on this folder's board (--board <b>)
+    ai-kanban repo rm <repo>           Take it off this folder's board (--board <b>), or every
+                                       board (--all; dry run without --yes)
+    ai-kanban repo rename <repo> <new>
+
+Sharing with a team (docs/sync.md):
+    ai-kanban remote <url> --key K     Connect this machine to a relay (--name N: how the team sees you)
+    ai-kanban remote                   Show it. --name N renames you; --move <url>, --disconnect
+    ai-kanban room list                Rooms on the relay, and how your shared boards are doing
+    ai-kanban room show <room>         What is in a room, as a board, without joining it
+    ai-kanban room connect <room>      Share a board through a room (--board <b> | --new-board, --yes)
     ai-kanban room disconnect <room>   Uncouple it again
-    ai-kanban room status | sync   What each shared board last did; sync them now
-    ai-kanban install-cli --link L Link this command into ~/.local/bin (what /ai-kanban:install-cli
-                                   runs; --dir <d>, --replace)
-    ai-kanban --help
+
+Your data:
+    ai-kanban backup <file>            Copy the whole store to one consistent file
+    ai-kanban export [board...]        The store as JSON on stdout
+    ai-kanban import <file>            Restore boards from an export
+    ai-kanban where                    Print the path to the store
+
+Troubleshooting -- not needed normally:
+    ai-kanban room sync                Sync now. Sessions and the web UI do it by themselves
+    ai-kanban --version                This build and the sync protocol it speaks
+
+Run by the plugin, not by you:
+    ai-kanban mcp                      The MCP server an agent talks to, on stdio
+    ai-kanban hook session-start | post-tool-use
+    ai-kanban install-cli --link L     What /ai-kanban:install-cli runs (--dir <d>, --replace)
 
 Everything you have recorded lives in one SQLite file outside version control. Keep it
 with:
@@ -60,6 +66,10 @@ project that already exists.
 
 Override the store location with AI_KANBAN_DB.
 ";
+
+fn version() -> String {
+    format!("ai-kanban {} (protocol {})", env!("CARGO_PKG_VERSION"), ai_kanban::sync::protocol::PROTOCOL_VERSION)
+}
 
 #[tokio::main]
 async fn main() {
@@ -144,38 +154,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             print!("{}", ai_kanban::render::safe(&ai_kanban::render::import_report(&report)));
             Ok(())
         }
-        Some("projects") => {
-            let store = Store::open_default()?;
-            // No cap: the point of this listing is spotting a board that should not exist,
-            // and a truncated list is exactly where a split would hide.
-            let (sums, _) = store.project_summaries(usize::MAX)?;
-            print!("{}", ai_kanban::render::safe(&ai_kanban::render::project_list(&sums, ai_kanban::core::now())));
-            Ok(())
-        }
-        Some("merge") => {
-            // Both boards are named explicitly, and the first one survives. A merge is
-            // irreversible and it deletes a board, so it must never be inferred from where
-            // the caller happens to be standing.
-            let (keep, gone) = (std::env::args().nth(2), std::env::args().nth(3));
-            let (Some(keep), Some(gone)) = (keep, gone) else {
-                eprintln!("usage: ai-kanban merge <board-to-keep> <board-to-merge-in>");
-                eprintln!("\nBoth are a board name or key -- `ai-kanban projects` lists them.");
-                std::process::exit(2);
-            };
-            let store = Store::open_default()?;
-            let into = store.project_by_name_or_key(&keep)?;
-            let from = store.project_by_name_or_key(&gone)?;
-            let report = store.merge_projects(into.id, from.id)?;
-            print!("{}", ai_kanban::render::safe(&ai_kanban::render::merge_report(&report)));
-            Ok(())
-        }
+        // The spellings from before `board list` and `board merge`. Kept working: boards' notes
+        // and logs -- the agents' memory -- name them, and must keep meaning something.
+        Some("projects") => board_list(),
+        Some("merge") => board_merge(std::env::args().nth(2), std::env::args().nth(3)),
         Some("repo") => repo_cmd(),
         Some("board") => board_cmd(),
         Some("where") => {
             println!("{}", Store::default_path()?.display());
             Ok(())
         }
+        // Which build this is, with the protocol it speaks: what to say when asking for help,
+        // and what decides whether it can talk to a given relay (`ai-kanban remote` shows that).
+        Some("--version") | Some("-V") | Some("version") => {
+            println!("{}", version());
+            Ok(())
+        }
         Some("--help") | Some("-h") | Some("help") | None => {
+            println!("{}\n", version());
             print!("{USAGE}");
             Ok(())
         }
@@ -192,15 +188,17 @@ struct CliArgs {
     pos: Vec<String>,
     board: Option<String>,
     yes: bool,
+    all: bool,
 }
 
 fn cli_args() -> CliArgs {
-    let mut out = CliArgs { pos: vec![], board: None, yes: false };
+    let mut out = CliArgs { pos: vec![], board: None, yes: false, all: false };
     let mut it = std::env::args().skip(2);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--board" => out.board = it.next(),
             "--yes" => out.yes = true,
+            "--all" => out.all = true,
             _ => out.pos.push(a),
         }
     }
@@ -224,8 +222,40 @@ fn usage(line: &str) -> ! {
 /// Here rather than in the web UI or the agent's tools: the web UI is for looking at what the
 /// agent recorded, not for running the work, and creating or destroying a board is a rare,
 /// deliberate act that belongs to the person, like `merge`.
+/// `board list`: no cap -- the point of this listing is spotting a board that should not
+/// exist, and a truncated list is exactly where a split would hide.
+fn board_list() -> Result<(), Box<dyn std::error::Error>> {
+    let store = Store::open_default()?;
+    let (sums, _) = store.project_summaries(usize::MAX)?;
+    print!("{}", ai_kanban::render::safe(&ai_kanban::render::project_list(&sums, ai_kanban::core::now())));
+    Ok(())
+}
+
+/// `board merge`: both boards named explicitly, and the first one survives. A merge is
+/// irreversible and it deletes a board, so it must never be inferred from where the caller
+/// happens to be standing.
+fn board_merge(keep: Option<String>, gone: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let (Some(keep), Some(gone)) = (keep, gone) else {
+        eprintln!("usage: ai-kanban board merge <board-to-keep> <board-to-merge-in>");
+        eprintln!("\nBoth are a board name or key -- `ai-kanban board list` lists them.");
+        std::process::exit(2);
+    };
+    let store = Store::open_default()?;
+    let into = store.project_by_name_or_key(&keep)?;
+    let from = store.project_by_name_or_key(&gone)?;
+    let report = store.merge_projects(into.id, from.id)?;
+    print!("{}", ai_kanban::render::safe(&ai_kanban::render::merge_report(&report)));
+    Ok(())
+}
+
 fn board_cmd() -> Result<(), Box<dyn std::error::Error>> {
     let a = cli_args();
+    if matches!(a.arg(0), Some("list")) {
+        return board_list();
+    }
+    if matches!(a.arg(0), Some("merge")) {
+        return board_merge(a.arg(1).map(String::from), a.arg(2).map(String::from));
+    }
     let store = Store::open_default()?;
     match a.arg(0) {
         Some("add") => {
@@ -326,8 +356,11 @@ fn repo_cmd() -> Result<(), Box<dyn std::error::Error>> {
             println!("{} -> {} (board {})", repo.name, repo.path, project.name);
             Ok(())
         }
+        // Off every board is `forget` under its older name, kept working for what notes say.
+        Some("rm") if a.all => forget_repo(&store, a.arg(1), a.yes),
+        Some("forget") => forget_repo(&store, a.arg(1), a.yes),
         Some("rm") => {
-            let Some(name) = a.arg(1) else { usage("ai-kanban repo rm <repo> [--board <board>]") };
+            let Some(name) = a.arg(1) else { usage("ai-kanban repo rm <repo> [--board <board> | --all]") };
             let project = board(&store)?;
             let id = on_board(&store, project.id, name)?;
             let repo = store.repo(project.id, id)?;
@@ -346,6 +379,8 @@ fn repo_cmd() -> Result<(), Box<dyn std::error::Error>> {
             println!("renamed to {}", repo.name);
             Ok(())
         }
+        // Not in the help: which board a folder shared by several boards opens on is the first
+        // one it was added to, and that is nearly always right. Kept for the rare case.
         Some("home") => {
             // Both named: moving a home changes where an agent opening that folder lands, so it
             // is never inferred from the directory the command happens to run in.
@@ -358,23 +393,8 @@ fn repo_cmd() -> Result<(), Box<dyn std::error::Error>> {
             println!("{} now opens on board {}", repo.name, project.name);
             Ok(())
         }
-        Some("forget") => {
-            let Some(name) = a.arg(1) else { usage("ai-kanban repo forget <repo> [--yes]") };
-            let repo = store.find_repo(name)?;
-            if !a.yes {
-                let summary = store.repo_summaries(repo.home_project_id)?.into_iter().find(|r| r.repo.id == repo.id);
-                let boards = summary.as_ref().map(|s| 1 + s.other_boards.len()).unwrap_or(1);
-                println!("would forget repo {} ({}): off {boards} board{} and every ticket naming it.",
-                    repo.name, repo.path, if boards == 1 { "" } else { "s" });
-                println!("Its folder keeps opening where it does now.\n\nNot recoverable except from a backup. Rerun with --yes to do it.");
-                std::process::exit(1);
-            }
-            store.forget_repo(repo.id)?;
-            println!("forgot repo {}", repo.name);
-            Ok(())
-        }
         Some(other) => {
-            eprintln!("unknown repo command: {other}\n\nusage: ai-kanban repo list|add|rm|rename|home|forget");
+            eprintln!("unknown repo command: {other}\n\nusage: ai-kanban repo list|add|rm|rename");
             std::process::exit(2);
         }
     }
@@ -475,4 +495,22 @@ fn quiet_on_closed_pipe() {
             signal(SIGPIPE, SIG_DFL);
         }
     }
+}
+
+/// `repo rm --all`: a repo off every board and every ticket naming it. Its folder keeps
+/// opening where it does now.
+fn forget_repo(store: &Store, name: Option<&str>, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(name) = name else { usage("ai-kanban repo rm <repo> --all [--yes]") };
+    let repo = store.find_repo(name)?;
+    if !yes {
+        let summary = store.repo_summaries(repo.home_project_id)?.into_iter().find(|r| r.repo.id == repo.id);
+        let boards = summary.as_ref().map(|s| 1 + s.other_boards.len()).unwrap_or(1);
+        println!("would remove repo {} ({}): off {boards} board{} and every ticket naming it.",
+            repo.name, repo.path, if boards == 1 { "" } else { "s" });
+        println!("Its folder keeps opening where it does now.\n\nNot recoverable except from a backup. Rerun with --yes to do it.");
+        std::process::exit(1);
+    }
+    store.forget_repo(repo.id)?;
+    println!("removed repo {} from every board", repo.name);
+    Ok(())
 }

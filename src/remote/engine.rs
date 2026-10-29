@@ -67,6 +67,13 @@ pub fn check_identity(store: &Store, client: &Client) -> Result<(), RemoteError>
         pause(store, &why);
         return Err(RemoteError::Paused(why));
     }
+    // The other way round: the relay has less from this tag than it confirmed receiving. It was
+    // restored from a snapshot, and lost what arrived after it -- which every client has marked
+    // sent. Each machine sends its own again; together the room is whole.
+    let sent = store.confirmed_sent(&who.tag).map_err(|e| RemoteError::Http(0, e.to_string()))?;
+    if sent > hw.outbox {
+        store.republish_after_relay_loss(&who.tag, hw.outbox).map_err(|e| RemoteError::Http(0, e.to_string()))?;
+    }
     let _ = store.set_paused(None);
     Ok(())
 }
@@ -143,6 +150,13 @@ fn round(store: &Store, client: &Client, project_id: i64, deadline: Option<std::
         }
         let since = store.sync_status(project_id).map_err(core)?.map(|s| s.cursor).unwrap_or(0);
         let page = client.pull(&room, since, MAX_PAGE)?;
+        // The room's log is shorter than what this board has read: the relay went back to a
+        // snapshot, and its new changes reuse numbers this board counts as read. Read it again
+        // from the start; what is already here is ignored.
+        if page.head < since {
+            store.rewind_cursor(project_id, 0).map_err(core)?;
+            continue;
+        }
         if page.changes.is_empty() {
             break;
         }

@@ -257,3 +257,98 @@ fn the_round_before_a_claim_is_bounded_even_by_a_relay_that_never_answers() {
 fn titles_of(s: &Store, pid: i64) -> Vec<String> {
     s.board(pid, &BoardQuery::board()).unwrap().tasks.into_iter().map(|t| t.title).collect()
 }
+
+/// The relay restored from a snapshot has lost what arrived after it -- which every client
+/// had marked sent -- and numbers its new changes from the snapshot on, below where clients
+/// had read to. Nothing may go missing either way: each client sends its own work again, and
+/// reads the room again from the start.
+#[test]
+fn a_relay_restored_from_a_snapshot_loses_nothing_for_good() {
+    let mut relay = HttpRelay::start();
+    let benny = machine(&relay, "benny", "b1", "sbb");
+    let volker = machine(&relay, "volker", "v1", "x");
+    let round = |m: &Machine| {
+        check_identity(&m.store, &m.client).unwrap();
+        sync_board(&m.store, &m.client, m.pid).unwrap();
+    };
+    benny.store.create_task(benny.pid, TaskDraft::new("before the snapshot")).unwrap();
+    for m in [&benny, &volker] {
+        round(m);
+    }
+    let snapshot = relay.db_path.with_file_name("snapshot.db");
+    relay.admin().snapshot(&snapshot).unwrap();
+
+    // After the snapshot: benny's task reaches the relay, and volker has it.
+    let lost = benny.store.create_task(benny.pid, TaskDraft::new("lost in the restore")).unwrap();
+    benny.store.log_on(benny.pid, Some(lost.id), Actor::Agent, "a finding on it").unwrap();
+    for m in [&benny, &volker, &benny] {
+        round(m);
+    }
+    assert!(titles(&volker).contains(&"lost in the restore".to_string()));
+
+    // The relay goes back to the snapshot.
+    relay.stop();
+    for ext in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{ext}", relay.db_path.display()));
+    }
+    std::fs::copy(&snapshot, &relay.db_path).unwrap();
+    relay.resume();
+
+    // Volker writes first: his new change gets a number benny counts as already read.
+    volker.store.create_task(volker.pid, TaskDraft::new("after the restore")).unwrap();
+    round(&volker);
+    for m in [&benny, &volker, &benny] {
+        round(m);
+    }
+    assert!(titles(&benny).contains(&"after the restore".to_string()), "benny reads the room again: {:?}", titles(&benny));
+
+    // A newcomer gets everything, the lost task and its history included.
+    let carla = machine(&relay, "carla", "c1", "c");
+    round(&carla);
+    assert_eq!(titles(&carla), ["after the restore", "before the snapshot", "lost in the restore"]);
+    let t = carla.store.board(carla.pid, &BoardQuery::board()).unwrap().tasks.into_iter().find(|t| t.title == "lost in the restore").unwrap();
+    let detail = carla.store.task_detail(carla.pid, t.id).unwrap();
+    assert!(detail.events.iter().any(|e| e.body == "a finding on it"), "with its history: {:?}", detail.events);
+    assert_eq!(titles(&benny), titles(&volker), "and the two who were there agree");
+    let parked: i64 = benny.store.conn.query_row("SELECT COUNT(*) FROM sync_parked", [], |r| r.get(0)).unwrap();
+    assert_eq!(parked, 0);
+}
+
+/// The other half of a restore: a client that only read what arrived after the snapshot has
+/// nothing of its own to send again, but its cursor is past the restored relay's head -- and
+/// a teammate's next change gets a number it counts as read. It must read the room again.
+#[test]
+fn after_a_restore_a_client_that_only_read_still_gets_what_comes_next() {
+    let mut relay = HttpRelay::start();
+    let benny = machine(&relay, "benny", "b1", "sbb");
+    let volker = machine(&relay, "volker", "v1", "x");
+    let carla = machine(&relay, "carla", "c1", "c");
+    let round = |m: &Machine| {
+        check_identity(&m.store, &m.client).unwrap();
+        sync_board(&m.store, &m.client, m.pid).unwrap();
+    };
+    for m in [&benny, &volker, &carla] {
+        round(m);
+    }
+    let snapshot = relay.db_path.with_file_name("snapshot.db");
+    relay.admin().snapshot(&snapshot).unwrap();
+
+    // Volker writes a lot after the snapshot; benny reads it all. Then volker is away.
+    for i in 0..5 {
+        volker.store.create_task(volker.pid, TaskDraft::new(format!("volker's {i}"))).unwrap();
+    }
+    round(&volker);
+    round(&benny);
+
+    relay.stop();
+    for ext in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{ext}", relay.db_path.display()));
+    }
+    std::fs::copy(&snapshot, &relay.db_path).unwrap();
+    relay.resume();
+
+    carla.store.create_task(carla.pid, TaskDraft::new("carla's, after the restore")).unwrap();
+    round(&carla);
+    round(&benny);
+    assert!(titles(&benny).contains(&"carla's, after the restore".to_string()), "{:?}", titles(&benny));
+}

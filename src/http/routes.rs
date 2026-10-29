@@ -173,6 +173,28 @@ pub async fn projects(State(api): State<Api>) -> ApiResult<Json<serde_json::Valu
     })))
 }
 
+/// How each shared board's sync is doing, for the page's room badge: small, because the page
+/// asks every few seconds. `live` is whether this process's stream for the room is connected
+/// right now; `null` when this process does not sync (then only the last round can tell).
+pub async fn sync_state(State(api): State<Api>) -> ApiResult<Json<serde_json::Value>> {
+    let live = api.sync.as_ref().map(|s| s.live_rooms());
+    let store = api.store();
+    let mut boards = serde_json::Map::new();
+    for (pid, room) in store.connected_boards()? {
+        let s = store.sync_status(pid)?.unwrap_or_default();
+        boards.insert(pid.to_string(), json!({
+            "room": room,
+            "live": live.as_ref().map(|l| l.contains(&room)),
+            "last_ok_at": s.last_ok_at,
+            "last_error": s.last_error,
+            "unsent_tasks": s.unsent_items.0,
+            "unsent_notes": s.unsent_items.1,
+            "members": s.members.iter().map(|(t, u)| json!({ "tag": t, "user": u })).collect::<Vec<_>>(),
+        }));
+    }
+    Ok(Json(json!({ "now": crate::core::now(), "paused": store.paused()?, "boards": boards })))
+}
+
 pub async fn project(State(api): State<Api>, Path(p): Path<String>) -> ApiResult<Json<serde_json::Value>> {
     let store = api.store();
     let project = resolve(&store, &p)?;
@@ -214,14 +236,22 @@ fn add_handles(store: &Store, v: &mut serde_json::Value, texts: &[(&str, &str, i
         h.tasks.keys().map(|id| (id.to_string(), json!(h.task(*id)))).collect();
     v["handles"] = serde_json::Value::Object(handles);
     let mut out = serde_json::Map::new();
+    let mut authors = serde_json::Map::new();
     for (key, kind, id, raw) in texts {
         let shown = h.text(raw, h.origin_of(kind, *id));
         if shown != *raw {
             out.insert((*key).to_string(), json!(shown));
         }
+        // Who wrote it, when another member did, under the same key as its text.
+        if let Some(who) = h.author(kind, *id) {
+            authors.insert((*key).to_string(), json!(who));
+        }
     }
     if !out.is_empty() {
         v["texts"] = serde_json::Value::Object(out);
+    }
+    if !authors.is_empty() {
+        v["authors"] = serde_json::Value::Object(authors);
     }
     Ok(())
 }

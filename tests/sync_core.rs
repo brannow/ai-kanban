@@ -596,7 +596,7 @@ async fn the_web_api_refuses_to_forget_on_a_connected_board_with_409() {
     let t = s.create_task(pid, TaskDraft::new("t")).unwrap();
     s.connect_board(pid, ROOM).unwrap();
     let (tx, _) = tokio::sync::broadcast::channel(4);
-    let api = ai_kanban::http::Api { store: std::sync::Arc::new(std::sync::Mutex::new(s)), changes: tx };
+    let api = ai_kanban::http::Api { store: std::sync::Arc::new(std::sync::Mutex::new(s)), changes: tx, sync: None };
     let req = Request::builder().method("DELETE").uri(format!("/api/projects/{pid}/tasks/{}", t.id)).body(Body::empty()).unwrap();
     let res = ai_kanban::http::router(api.clone()).oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::CONFLICT);

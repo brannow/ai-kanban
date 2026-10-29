@@ -104,6 +104,13 @@ impl Syncer {
         let _ = sync_board_within(store, &self.claim, project_id, CLAIM_BUDGET);
     }
 
+    /// The rooms whose notification stream is connected right now, as `current` judges it: what
+    /// the web UI's live dot shows.
+    pub fn live_rooms(&self) -> HashSet<String> {
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        live.iter().filter(|(_, (_, seen))| seen.elapsed() < LIVE_FOR).map(|(room, _)| room.clone()).collect()
+    }
+
     fn current(&self, room: &str, cursor: i64) -> bool {
         let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
         live.get(room).is_some_and(|(head, seen)| seen.elapsed() < LIVE_FOR && cursor >= *head)

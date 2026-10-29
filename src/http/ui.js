@@ -34,6 +34,9 @@ function fail(msg) {
 // for showing only, never for an edit field.
 const HANDLES = {};
 const TEXTS = {};
+// Who wrote a history entry, when a teammate did: "volker", under the same key as its text.
+const AUTHORS = {};
+function by(key, actor) { return AUTHORS[key] ? `${AUTHORS[key]} \u00b7 ${actor}` : actor; }
 function tref(id) { return HANDLES[id] || ('#' + id); }
 function shown(key, raw) { return Object.prototype.hasOwnProperty.call(TEXTS, key) ? TEXTS[key] : raw; }
 
@@ -43,13 +46,14 @@ async function api(path, opts = {}) {
   const body = await res.json().catch(() => null);
   if (body && body.handles) Object.assign(HANDLES, body.handles);
   if (body && body.texts) Object.assign(TEXTS, body.texts);
+  if (body && body.authors) Object.assign(AUTHORS, body.authors);
   if (!res.ok) {
     const e = body && body.error || {};
     let msg = e.message || `${res.status} ${res.statusText}`;
     if (e.code === 'conflict') {
       msg = 'Someone else changed this while you had it open. Reloading.';
     } else if (e.code === 'claimed') {
-      msg += ` — if it is the same work, merge the boards first: ai-kanban merge <this board> ${e.key}`;
+      msg += ` — if it is the same work, merge the boards first: ai-kanban board merge <this board> ${e.key}`;
     } else if (e.valid) {
       msg += ` — valid: ${e.valid.join(', ')}`;
     }
@@ -441,7 +445,7 @@ async function openTask(id, pid) {
       <div class="ev">
         <span class="dim2">${ago(e.ts)}</span>
         <span class="k">${esc(e.kind)}</span>
-        <span class="dim2">${esc(e.actor)}</span>
+        <span class="dim2">${esc(by('event:' + e.id, e.actor))}</span>
         <div>${esc(shown('event:' + e.id, e.body))}</div>
       </div>`).reverse().join('') || '<div class="empty">nothing yet</div>'}
     </section>
@@ -760,15 +764,54 @@ function connect() {
 // board just created -- and defaults to what is on screen.
 async function refreshProjects(select) {
   const { body } = await api('/api/projects');
-  BOARDS = body.projects.map(p => ({ id: p.project.id, name: p.project.name, open: p.open }));
+  BOARDS = body.projects.map(p => ({ id: p.project.id, name: p.project.name, open: p.open, room: p.room }));
   PROJECTS.clear();
   BOARDS.forEach(b => PROJECTS.set(b.name, b.id));
   const total = BOARDS.reduce((n, b) => n + b.open, 0);
   const sel = $('#project');
   sel.innerHTML = `<option value="${ALL}">All projects (${total} open)</option>`
-    + BOARDS.map(b => `<option value="${b.id}">${esc(b.name)} (${b.open} open)</option>`).join('');
+    + BOARDS.map(b => `<option value="${b.id}">${esc(b.name)}${b.room ? ' \u21c4 ' + esc(b.room) : ''} (${b.open} open)</option>`).join('');
   sel.value = String(select ?? PROJECT ?? '');
+  refreshSync();
 }
+
+// The room badge next to the picker: which room this board is shared through, and whether
+// its sync is live -- asked for on its own, every few seconds, because a stream coming and
+// going writes nothing the page's change feed would see. Rebuilding the picker for it would
+// close the dropdown under the person's hand.
+let SYNC = null;
+async function refreshSync() {
+  try { SYNC = (await api('/api/sync')).body; } catch { SYNC = null; }
+  renderRoom();
+}
+function renderRoom() {
+  const el = $('#room');
+  const s = SYNC && !isAll() && SYNC.boards[String(PROJECT)];
+  el.hidden = !s;
+  if (!s) return;
+  // Live from this process's own stream when it syncs; else judged from the last round.
+  const fresh = s.live ?? (s.last_ok_at && SYNC.now - s.last_ok_at <= 120 && !s.last_error);
+  el.className = fresh ? 'live' : '';
+  el.textContent = '';
+  el.append(`\u21c4 ${s.room} `);
+  const dot = document.createElement('span');
+  dot.className = 'dot';
+  dot.textContent = '\u25cf';
+  el.append(dot);
+  const unsent = s.unsent_tasks + s.unsent_notes;
+  el.title = [
+    `shared through room ${s.room}`,
+    s.live === true ? 'live: teammates\' changes arrive as they happen' : s.live === false ? 'not live: reconnecting' : null,
+    s.last_ok_at ? `last sync ${since(s.last_ok_at)}` : 'never synced',
+    unsent ? `${s.unsent_tasks} task(s), ${s.unsent_notes} note(s) not sent yet` : 'nothing unsent',
+    s.last_error ? `last error: ${s.last_error}` : null,
+    SYNC.paused ? `sync paused: ${SYNC.paused}` : null,
+    s.members.length ? 'team: ' + s.members.map(m => `${m.user} (${m.tag})`).join(', ') : null,
+  ].filter(Boolean).join('\n');
+}
+// `ago` gives "just now" for the last minute; this keeps "ago" off it.
+function since(ts) { const a = ago(ts); return a === 'just now' ? a : `${a} ago`; }
+setInterval(refreshSync, 10000);
 
 async function onProjectChange() {
   const sel = $('#project');
@@ -781,6 +824,7 @@ async function onProjectChange() {
   EXPANDED = {};
   if (ES) ES.close();
   await loadBoard();
+  renderRoom();
   ES = connect();
 }
 

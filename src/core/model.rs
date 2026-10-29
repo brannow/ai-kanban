@@ -393,6 +393,8 @@ impl BoardSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectSummary {
     pub project: Project,
+    /// The room it is shared through, if it is.
+    pub room: Option<String>,
     pub open: usize,
     pub doing: Vec<Task>,
     pub last_activity: Option<i64>,
@@ -512,6 +514,9 @@ pub struct Handles {
     /// `"event:12"`, `"task:5"`, `"note:7"` -> the tag of the machine that wrote that text, for
     /// text from another member.
     pub origins: std::collections::HashMap<String, String>,
+    /// Tag -> the name its member goes by now, from the rooms' member lists. Current, not as
+    /// it was when they wrote: a rename shows everywhere at once.
+    pub names: std::collections::HashMap<String, String>,
 }
 
 impl Handles {
@@ -526,6 +531,22 @@ impl Handles {
     /// Where a piece of text came from, if another member wrote it.
     pub fn origin_of(&self, kind: &str, id: i64) -> Option<&str> {
         self.origins.get(&format!("{kind}:{id}")).map(String::as_str)
+    }
+
+    /// Who wrote it, if another member did: their name, or their tag once they left the room.
+    /// None for this machine's own -- "agent" and "user" already say who that is.
+    pub fn author(&self, kind: &str, id: i64) -> Option<String> {
+        self.origin_of(kind, id).map(|tag| self.names.get(tag).cloned().unwrap_or_else(|| tag.to_string()))
+    }
+
+    /// `author` as a history line begins: `volker: ` for what their agent recorded,
+    /// `volker (by hand): ` for what they did themselves. Empty for this machine's own.
+    pub fn by(&self, kind: &str, id: i64, actor: Actor) -> String {
+        match (self.author(kind, id), actor) {
+            (Some(who), Actor::User) => format!("{who} (by hand): "),
+            (Some(who), _) => format!("{who}: "),
+            (None, _) => String::new(),
+        }
     }
 
     /// `text` with every plain `#N` qualified for display. Stored text is never rewritten.

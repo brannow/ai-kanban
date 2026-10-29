@@ -581,7 +581,82 @@ impl Store {
     /// Drops changes the relay has accepted, up to and including `seq`.
     pub fn outbox_sent(&self, project_id: i64, seq: i64) -> Result<()> {
         self.conn.execute("DELETE FROM sync_outbox WHERE project_id = ?1 AND seq <= ?2", params![project_id, seq])?;
+        if let Some(tag) = self.origin_tag()? {
+            self.conn.execute(
+                "INSERT INTO sync_sent (tag, seq) VALUES (?1, ?2) ON CONFLICT (tag) DO UPDATE SET seq = MAX(seq, excluded.seq)",
+                params![tag, seq],
+            )?;
+        }
         Ok(())
+    }
+
+    /// The highest outbox seq the relay confirmed receiving from `tag` (migration 018).
+    pub fn confirmed_sent(&self, tag: &str) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COALESCE((SELECT seq FROM sync_sent WHERE tag = ?1), 0)", [tag], |r| r.get(0))?)
+    }
+
+    /// Reads a room's log from `to` on, below where this board's cursor is: for a relay whose
+    /// log went back (restored from a snapshot), whose new changes reuse numbers this board
+    /// counts as read. Applying again what is already here changes nothing.
+    pub fn rewind_cursor(&self, project_id: i64, to: i64) -> Result<()> {
+        self.conn.execute("UPDATE sync_rooms SET cursor = MIN(cursor, ?2) WHERE project_id = ?1", params![project_id, to])?;
+        Ok(())
+    }
+
+    /// After a relay lost changes this machine had sent -- it was restored from a snapshot --
+    /// queues again everything this machine last wrote in each of its rooms, and reads every
+    /// room from the start. `relay_has` is the outbox seq the relay says it has from `tag`.
+    ///
+    /// From `sync_fields`, which keeps each field's last published value with the clock it was
+    /// written at: the original clocks, so nothing republished can win over what a teammate
+    /// wrote since -- for them a republished change already here is simply ignored. Only what
+    /// is stored under `tag`: the relay accepts a change only under its writer's own tag.
+    /// Returns how many changes it queued.
+    pub fn republish_after_relay_loss(&self, tag: &str, relay_has: i64) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut queued = 0;
+        for (project_id, room) in self.connected_boards()? {
+            let rows: Vec<(String, String, i64, String, String, i64, i64)> = {
+                let mut st = self.conn.prepare(
+                    "SELECT kind, origin, origin_id, field, value, wall_ms, counter FROM sync_fields
+                      WHERE room = ?1 AND tag = ?2 ORDER BY wall_ms, counter",
+                )?;
+                let rows = st
+                    .query_map(params![room, tag], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                rows
+            };
+            for (kind, origin, origin_id, field, value, wall_ms, counter) in rows {
+                let entity = Ref { kind, origin, id: origin_id };
+                let value: Value = serde_json::from_str(&value).map_err(|e| Error::Other(e.to_string()))?;
+                // As flush names them: a row's own fields are about itself, an event about its
+                // note if it has one, else its task.
+                let (field, subject) = if field == ROW {
+                    let as_ref = |k: &str| -> Option<Ref> {
+                        let v = value.get(k)?;
+                        Some(Ref { kind: k.into(), origin: v.get("origin")?.as_str()?.into(), id: v.get("id")?.as_i64()? })
+                    };
+                    (None, as_ref("note").or_else(|| as_ref("task")))
+                } else {
+                    (Some(field), Some(entity.clone()))
+                };
+                let clock = Clock { wall_ms, counter: counter as u32, tag: tag.to_string() };
+                self.conn.execute("INSERT INTO sync_outbox (project_id, room, body) VALUES (?1, ?2, '')", params![project_id, room])?;
+                let seq = self.conn.last_insert_rowid();
+                let change = Change { cid: format!("{tag}:{seq}"), entity, subject, field, value, clock, extra: Default::default() };
+                let body = serde_json::to_string(&change).map_err(|e| Error::Other(e.to_string()))?;
+                self.conn.execute("UPDATE sync_outbox SET body = ?1 WHERE seq = ?2", params![body, seq])?;
+                queued += 1;
+            }
+            self.conn.execute("UPDATE sync_rooms SET cursor = 0 WHERE project_id = ?1", [project_id])?;
+        }
+        // From here on the relay's count is the baseline, so this runs once per loss.
+        self.conn.execute(
+            "INSERT INTO sync_sent (tag, seq) VALUES (?1, ?2) ON CONFLICT (tag) DO UPDATE SET seq = excluded.seq",
+            params![tag, relay_has],
+        )?;
+        tx.commit()?;
+        Ok(queued)
     }
 }
 
@@ -1179,6 +1254,16 @@ impl Store {
                 (Some(o), Some(i), _) => { h.tasks.insert(local, (o, i)); }
                 (_, _, Some(me)) => { h.tasks.insert(local, (me.clone(), local)); }
                 _ => {}
+            }
+        }
+        // Every room's members, for naming who wrote what. A tag in two rooms is one machine.
+        let mut st = self.conn.prepare("SELECT members FROM sync_room_status")?;
+        for members in st.query_map([], |r| r.get::<_, String>(0))? {
+            let members: Vec<Value> = serde_json::from_str(&members?).unwrap_or_default();
+            for m in members {
+                if let (Some(t), Some(u)) = (m["tag"].as_str(), m["user"].as_str()) {
+                    h.names.insert(t.to_string(), u.to_string());
+                }
             }
         }
         let me = tag.unwrap_or_default();

@@ -125,7 +125,7 @@ than something discovered after a disk failure.
   is task #3, and answering it halfway inside an importer would leave two half-answers.
 - **A board that already split is repairable.** `project_paths` prevents splits; it does
   nothing for one that already happened, and prevention alone is a one-way mitigation.
-  `ai-kanban merge <keep> <gone>` reparents tasks, notes, events and path aliases onto the
+  `ai-kanban board merge <keep> <gone>` reparents tasks, notes, events and path aliases onto the
   surviving board and deletes the other. Order is load-bearing — every child table cascades
   on project delete and `tasks.blocked_by` is `ON DELETE SET NULL`, so deleting before
   reparenting would silently drop exactly the cross-board references a split produces.

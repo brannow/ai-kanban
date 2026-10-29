@@ -270,24 +270,48 @@ pub fn room_cmd() -> CliResult {
             let pid = store.board_of_room(&room)?.ok_or_else(|| format!("no board on this machine is connected to room {room}"))?;
             disconnect(&store, &cfg, pid, &room, &a)
         }
-        Some("status") => room_status(&store),
+        // `status` was the shared boards' half of what `list` now shows; kept for what notes say.
+        Some("status") => room_list(&store),
         Some("sync") => room_sync(&store),
         Some(other) => Err(format!("unknown room command {other:?}: list, show, connect, disconnect, status, sync").into()),
     }
 }
 
+/// Every room on the relay, and for the ones a board here shares, how its sync is doing. One
+/// command for both: what is out there and how mine are doing are the same question. Without
+/// the relay, what this machine knows of its own shared boards.
 fn room_list(store: &Store) -> CliResult {
-    need_network()?;
     let cfg = need_remote()?;
-    let rooms = client(&cfg).rooms()?;
+    if let Some(why) = store.paused()? {
+        println!("sync paused: {why}\n");
+    }
+    if !config::sync_enabled() {
+        println!("sync off for this run (AI_KANBAN_SYNC)\n");
+    }
+    let now = crate::core::now();
+    let rooms = if config::sync_enabled() { client(&cfg).rooms() } else { Err(RemoteError::Offline("sync is off for this run".into())) };
+    let rooms = match rooms {
+        Ok(r) => r,
+        Err(e) => {
+            println!("{} is not answering ({e}). What this machine knows of its shared boards:\n", cfg.url);
+            for (pid, room) in store.connected_boards()? {
+                let s = store.sync_status(pid)?.unwrap_or_default();
+                println!("{room:<16} <- your board {}\n{:<16} {}", store.project(pid)?.name, "", crate::render::sync_state(&s, now));
+            }
+            return Ok(());
+        }
+    };
     if rooms.is_empty() {
         println!("No rooms on {} yet. Connecting a board creates one: ai-kanban room connect <room>", cfg.url);
         return Ok(());
     }
-    let now = crate::core::now();
     for r in rooms {
-        let mine = store.board_of_room(&r.name)?.map(|pid| store.project(pid).map(|p| p.name)).transpose()?;
-        println!("{}", crate::render::safe(&crate::render::room_line(&r, mine.as_deref(), now)));
+        let mine = match store.board_of_room(&r.name)? {
+            Some(pid) => Some((store.project(pid)?.name, store.sync_status(pid)?.unwrap_or_default())),
+            None => None,
+        };
+        let line = crate::render::room_line(&r, mine.as_ref().map(|(b, s)| (b.as_str(), s)), now);
+        println!("{}", crate::render::safe(&line));
     }
     println!("\nWhat is in one: ai-kanban room show <room>");
     Ok(())
@@ -420,8 +444,8 @@ fn room_connect(store: &Store, room: &str, a: &Args) -> CliResult {
     if let Some((elsewhere, tasks)) = store.room_held_elsewhere(&room, target)? {
         let held = store.project(elsewhere)?.name;
         let fix = match &pick {
-            Pick::Board(pid) => format!("or merge it into this one first: ai-kanban merge \"{}\" \"{held}\"", store.project(*pid)?.name),
-            Pick::New(_) => "or merge it into the board you want first (ai-kanban merge <board> <that board>)".to_string(),
+            Pick::Board(pid) => format!("or merge it into this one first: ai-kanban board merge \"{}\" \"{held}\"", store.project(*pid)?.name),
+            Pick::New(_) => "or merge it into the board you want first (ai-kanban board merge <board> <that board>)".to_string(),
         };
         return Err(format!(
             "{tasks} task(s) of room {room} are on board \"{held}\" on this machine. A room's tasks live on one board per \
@@ -614,37 +638,6 @@ fn disconnect(store: &Store, cfg: &RemoteConfig, pid: i64, room: &str, a: &Args)
     }
     store.disconnect_board(pid, wipe)?;
     println!("disconnected. Board \"{}\" is local again{}.", board.name, if wipe { ", without other members' tasks" } else { "" });
-    Ok(())
-}
-
-fn room_status(store: &Store) -> CliResult {
-    let boards = store.connected_boards()?;
-    if boards.is_empty() {
-        println!("No board on this machine is connected to a room.");
-        return Ok(());
-    }
-    if let Some(why) = store.paused()? {
-        println!("sync paused: {why}\n");
-    }
-    if !config::sync_enabled() {
-        println!("sync off for this run (AI_KANBAN_SYNC)\n");
-    }
-    for (pid, _) in boards {
-        let s = store.sync_status(pid)?.unwrap_or_default();
-        let when = s.last_ok_at.map(|t| format!("{}s ago", (crate::core::now() - t).max(0))).unwrap_or_else(|| "never".into());
-        println!("{} @{}", store.project(pid)?.name, s.room);
-        println!("  last sync   {when}");
-        println!("  unsent      {}", s.unsent);
-        if s.parked > 0 {
-            println!("  parked      {} (need a newer ai-kanban)", s.parked);
-        }
-        if let Some(e) = &s.last_error {
-            println!("  last error  {e}");
-        }
-        if !s.members.is_empty() {
-            println!("  team        {}", s.members.iter().map(|(t, u)| format!("{t} {u}")).collect::<Vec<_>>().join(", "));
-        }
-    }
     Ok(())
 }
 

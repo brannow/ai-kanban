@@ -41,6 +41,9 @@
   .dim2 { color: var(--dim2); }
   #live { font-size: 11px; color: var(--dim2); }
   #live.on { color: var(--ok); }
+  #room { font-size: 11px; color: var(--dim2); border: 1px solid var(--line); border-radius: 10px; padding: 1px 7px; }
+  #room .dot { color: var(--dim2); }
+  #room.live .dot { color: var(--ok); }
 
   #columns { display: flex; gap: 12px; padding: 14px; align-items: flex-start; overflow-x: auto; }
   .col { flex: 1 1 0; min-width: 220px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
@@ -137,6 +140,7 @@
 <header>
   <h1>ai-kanban</h1>
   <select id="project"></select>
+  <span id="room" hidden></span>
   <button id="repobtn" title="the local checkouts this board's tickets live in">repos</button>
   <label class="ws">working in <select id="workstream"></select></label>
   <span id="live">connecting</span>

@@ -102,7 +102,7 @@ remote is set.
 ```
 ai-kanban remote https://sync.board.rannow.de --key akb_…   set the remote, check the key
 ai-kanban remote                                            show it: URL, user, origin tag, protocol
-ai-kanban room list                                         rooms on the remote: origin board, creator, last activity, members, your board
+ai-kanban room list                                         rooms on the remote: origin board, creator, last activity, members, and for your boards how sync is doing (● synced 3s ago · nothing unsent)
 ai-kanban room show sbahn                                   what is in a room, rendered as a board, without joining it
 ai-kanban room connect sbahn [--board sbb | --new-board] [--yes]   connect a local board to a room
 ai-kanban room disconnect sbahn [--keep-foreign|--wipe-foreign] [--yes]
@@ -150,7 +150,7 @@ connected. Board header now shows: Board: sbb @sbahn
   connecting a room to a second board while another still holds its tasks would leave the second
   empty -- changes for them read as applied, this machine's own as echoes -- and silently. So
   `room connect` refuses, before it writes anything, naming the board and the way out: connect
-  that board again, or `ai-kanban merge <this> <that>` first, which keeps the mapping. Likewise
+  that board again, or `ai-kanban board merge <this> <that>` first, which keeps the mapping. Likewise
   when the room holds tasks this machine published from a board it no longer has (forgotten): a
   new board would miss them as echoes; the way out is a key of its own, after which they arrive
   as anyone else's.
@@ -431,6 +431,22 @@ is set and the run allows sync.
 - **Several sessions on one store sync independently.** There is no lock held across the network:
   retries are stored once per change id, an older clock never wins, and the cursor only moves
   forward, so concurrent rounds agree (`tests/remote_sync.rs`).
+- **`room sync`** exists for when nothing else runs; it is listed under troubleshooting, because
+  sessions and the web UI sync by themselves. `room status` is the same view as `room list`,
+  kept for what older notes say.
+- **A relay restored from a snapshot loses nothing for good.** It has lost what arrived after
+  the snapshot -- which every client marked sent -- and numbers new changes from the snapshot
+  on, below where clients had read to. Two checks, both in every round:
+  - *Outgoing:* the client records the highest outbox seq the relay confirmed (`sync_sent`,
+    migration 018). When `whoami` says the relay has less from this tag, it queues again what
+    it last wrote in each room -- from `sync_fields`, with the original clocks, so nothing
+    republished beats a teammate's newer edit -- and reads every room from the start.
+  - *Incoming:* when a room's head is below the board's cursor, the log went back; the board
+    reads it again from the start. Applying what is already here changes nothing.
+  Each machine covers its own work, so the room is whole once each has synced
+  (`tests/remote_sync.rs`, `a_relay_restored_...`, `after_a_restore_...`). Not covered: a
+  member who wrote after the snapshot and never connects again -- their lost work is only on
+  their machine.
 - **`AI_KANBAN_SYNC=off`** keeps one run local-only (set in the shell that starts Claude Code; not
   yet verified to reach plugin MCP servers from `.claude/settings.json`). Connected boards keep
   recording, and the next run that allows sync publishes the backlog.
@@ -629,6 +645,15 @@ docker exec kanban ai-kanban-relay key add benny laptop   # prints the key once,
   `kanban-test cli <name> remote <url> --key K --name N`, with a key of its own (`./kanban key
   add <label>`). On a freshly wiped relay the high-water check would not catch a shared key, since
   both stores start at zero.
+- **History says who.** A teammate's history entries carry the tag of the machine that wrote
+  them (`sync_ids`), named by the room's member list as the person is called now: `volker:`
+  for their agent, `volker (by hand):` for what they did themselves, their tag once they left.
+  This machine's own entries stay as they were, so an unshared board reads exactly as before.
+  The web page gets the same as `authors` beside `texts`.
+- **Shared boards are marked** where boards are listed: `bmu @bmu` in `board list` and the
+  agent's every-board summary, the same mark the header carries; on the web page a `⇄ bmu`
+  badge with a dot -- live when the page's own stream for the room is connected -- and the
+  details in its tooltip (`/api/sync`).
 - **Teammates' text is outside input.** Board text is stored as written (it holds code), and
   made safe where it is shown: `render::safe` turns control characters (other than line breaks
   and tabs) and bidi controls into U+FFFD on every MCP answer (`call_tool` in

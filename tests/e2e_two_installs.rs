@@ -279,7 +279,7 @@ fn two_installations_share_a_board_end_to_end() {
     drop(aa);
     drop(ba);
     let status = a.cli(&["room", "status"]);
-    assert!(status.contains("sbb @sbahn") && status.contains("team        a1 benny, b1 volker"), "{status}");
+    assert!(status.contains("<- your board sbb") && status.contains("a1 benny, b1 volker") && status.contains("nothing unsent"), "{status}");
     let out = b.cli(&["room", "disconnect", ROOM, "--sync-first", "--keep-foreign", "--yes"]);
     assert!(out.contains("is local again"), "{out}");
     let mut ba = b.agent();

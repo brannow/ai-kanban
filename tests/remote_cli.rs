@@ -118,8 +118,9 @@ fn connecting_needs_a_board_and_a_yes_without_a_terminal_then_publishes_and_back
 
     let list = m.ok(&["room", "list"]);
     assert!(list.contains("sbahn") && list.contains("<- your board sbb") && list.contains("b1 benny"), "{list}");
-    let status = m.ok(&["room", "status"]);
-    assert!(status.contains("sbb @sbahn") && status.contains("unsent      0") && status.contains("team        b1 benny"), "{status}");
+    assert!(list.contains("\u{25cf} synced") && list.contains("nothing unsent"), "how the shared board is doing, inline: {list}");
+    assert_eq!(m.ok(&["room", "status"]), list, "`status`, the older spelling, is the same view");
+    assert!(m.ok(&["board", "list"]).contains("sbb @sbahn"), "the shared board is marked where boards are listed");
 
     let again = m.fails(&["room", "connect", "sbahn", "--board", "sbb", "--yes"]);
     assert!(again.contains("already connected"), "{again}");
@@ -325,9 +326,10 @@ fn sync_off_for_a_run_keeps_it_local_and_says_so() {
     m.board("a");
     m.ok(&["remote", &relay.url, "--key", &relay.key("benny", "b1")]);
     let off = [("AI_KANBAN_SYNC", "off")];
+    // Sync off is no reason to refuse: the list shows what this machine knows, and says why.
     let out = m.run_env(&["room", "list"], &off);
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("AI_KANBAN_SYNC is off"));
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("sync off for this run"), "{}", String::from_utf8_lossy(&out.stdout));
     let shown = m.run_env(&["remote"], &off);
     assert!(String::from_utf8_lossy(&shown.stdout).contains("off for this run"));
 }
@@ -347,7 +349,7 @@ fn connecting_refuses_a_board_that_would_miss_the_rooms_tasks() {
 
     m.board("second");
     let out = m.fails(&["room", "connect", "sbahn", "--board", "second", "--yes"]);
-    assert!(out.contains("on board \"sbb\"") && out.contains("ai-kanban merge \"second\" \"sbb\""), "{out}");
+    assert!(out.contains("on board \"sbb\"") && out.contains("ai-kanban board merge \"second\" \"sbb\""), "{out}");
     assert!(m.store().room_of(m.store().project_by_name_or_key("second").unwrap().id).unwrap().is_none(), "nothing connected");
     assert!(!relay.admin().rooms().unwrap()[0].members.iter().any(|x| x.tag == "b1"), "not even joined on the relay");
 

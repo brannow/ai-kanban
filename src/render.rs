@@ -334,7 +334,7 @@ fn event_line(e: &Event, now: i64, h: &Handles) -> String {
             },
         },
     };
-    format!("  {:<4} {what}\n", when)
+    format!("  {:<4} {}{what}\n", when, h.by("event", e.id, e.actor))
 }
 
 /// A history line in `task_show`. Logs and every reason a `task_update` or move carries
@@ -369,7 +369,7 @@ fn history_line(e: &Event, now: i64, h: &Handles) -> String {
         }
         text.push_str(line);
     }
-    format!("  {:<4} {text}\n", ago(now, e.ts))
+    format!("  {:<4} {}{text}\n", ago(now, e.ts), h.by("event", e.id, e.actor))
 }
 
 fn reason(body: &str) -> String {
@@ -535,7 +535,7 @@ pub fn project_summaries(sums: &[ProjectSummary], total: usize, now: i64) -> Str
     let mut out = format!("{} board{}\n", total, plural(total));
     for s in sums {
         let when = s.last_activity.map(|t| since(now, t)).unwrap_or_else(|| "never".into());
-        out.push_str(&format!("\n{}  ({} open, last active {})\n", s.project.name, s.open, when));
+        out.push_str(&format!("\n{}{}  ({} open, last active {})\n", s.project.name, at_room(s), s.open, when));
         for t in &s.doing {
             out.push_str(&format!("  doing  {} {}\n", s.handles.task(t.id), truncate(&t.title, 45)));
         }
@@ -556,6 +556,11 @@ pub fn project_summaries(sums: &[ProjectSummary], total: usize, now: i64) -> Str
 /// cannot do its job -- a split board is two rows with the *same name*, so a listing that
 /// shows only names makes the very thing it exists to reveal invisible, and leaves the
 /// reader with no string they can pass to `merge`.
+/// ` @room` after a shared board's name: the same mark its header carries (`Board: bmu @bmu`).
+fn at_room(s: &ProjectSummary) -> String {
+    s.room.as_ref().map(|r| format!(" @{r}")).unwrap_or_default()
+}
+
 pub fn project_list(sums: &[ProjectSummary], now: i64) -> String {
     if sums.is_empty() {
         return "No boards yet.\n".to_string();
@@ -570,15 +575,15 @@ pub fn project_list(sums: &[ProjectSummary], now: i64) -> String {
     for s in sums {
         let when = s.last_activity.map(|t| since(now, t)).unwrap_or_else(|| "never".into());
         out.push_str(&format!(
-            "\n{}  ({} open, last active {})\n  {}\n",
-            s.project.name, s.open, when, s.project.key
+            "\n{}{}  ({} open, last active {})\n  {}\n",
+            s.project.name, at_room(s), s.open, when, s.project.key
         ));
     }
     let split: Vec<&String> = seen.iter().filter(|(_, n)| **n > 1).map(|(k, _)| k).collect();
     if !split.is_empty() {
         out.push_str(&format!(
             "\nMore than one board is called {}. That is what a split board looks like: \n\
-             one project remembered as two half-memories. `ai-kanban merge <keep> <gone>` \n\
+             one project remembered as two half-memories. `ai-kanban board merge <keep> <gone>` \n\
              joins them -- name them by key, since the names collide.\n",
             split.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ")
         ));
@@ -693,7 +698,7 @@ pub fn error(e: &crate::core::Error) -> String {
         E::PathClaimed { path, board, key } => format!(
             "{path} already belongs to board \"{board}\".\n\nA directory resolves to exactly one \
              board, so it cannot join a second one. If both boards are the same work, merge \
-             them first:\n\n  ai-kanban merge <this board> {key}\n"
+             them first:\n\n  ai-kanban board merge <this board> {key}\n"
         ),
         E::NoProjectContext => {
             "Could not tell which project this is.\n\nPass project explicitly, or run the server \
@@ -802,7 +807,7 @@ fn one_line(s: &str) -> String {
 /// One room in `room list`: what tells it apart from the others at a glance -- the board it
 /// came from, who made it and is in it, and whether anything still happens there. `mine` is
 /// the local board connected to it.
-pub fn room_line(r: &crate::sync::protocol::RoomInfo, mine: Option<&str>, now: i64) -> String {
+pub fn room_line(r: &crate::sync::protocol::RoomInfo, mine: Option<(&str, &crate::core::sync::SyncStatus)>, now: i64) -> String {
     let from = match &r.board {
         Some(b) => format!("from board \"{b}\" by {}", r.created_by),
         None => format!("made by {}", r.created_by),
@@ -818,8 +823,35 @@ pub fn room_line(r: &crate::sync::protocol::RoomInfo, mine: Option<&str>, now: i
     } else {
         r.members.iter().map(|m| format!("{} {}", m.tag, m.user)).collect::<Vec<_>>().join(", ")
     };
-    let mine = mine.map(|b| format!("   <- your board {b}")).unwrap_or_default();
-    format!("{:<16} {from}, {active}\n{:<16} {members}{mine}", r.name, "")
+    let status = mine.map(|(_, s)| format!("\n{:<16} {}", "", sync_state(s, now))).unwrap_or_default();
+    let mine = mine.map(|(b, _)| format!("   <- your board {b}")).unwrap_or_default();
+    format!("{:<16} {from}, {active}\n{:<16} {members}{mine}{status}", r.name, "")
+}
+
+/// How a shared board's sync is doing, in one line: `●` when it synced in the last two
+/// minutes without an error since, `○` otherwise. Judged from the last round, which is all a
+/// process other than the one syncing can know -- the session and the web UI keep it fresh.
+pub fn sync_state(s: &crate::core::sync::SyncStatus, now: i64) -> String {
+    let unsent = match s.unsent_items {
+        (0, 0, 0) if s.unsent == 0 => "nothing unsent".to_string(),
+        (t, n, _) if t + n > 0 => format!("{t} task{}, {n} note{} unsent", plural(t as usize), plural(n as usize)),
+        _ => format!("{} change{} unsent", s.unsent, plural(s.unsent as usize)),
+    };
+    let mut parts = Vec::new();
+    let fresh = s.last_ok_at.is_some_and(|t| now - t <= 120) && s.last_error.is_none();
+    parts.push(match (s.last_ok_at, fresh) {
+        (Some(t), true) => format!("\u{25cf} synced {}", since(now, t)),
+        (Some(t), false) => format!("\u{25cb} last sync {}", since(now, t)),
+        (None, _) => "\u{25cb} never synced".to_string(),
+    });
+    parts.push(unsent);
+    if let Some(e) = &s.last_error {
+        parts.push(format!("last error: {e}"));
+    }
+    if s.parked > 0 {
+        parts.push(format!("{} parked (need a newer ai-kanban)", s.parked));
+    }
+    parts.join(" \u{b7} ")
 }
 
 /// The first lines of `room show`, above the board the room holds.

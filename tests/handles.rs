@@ -308,7 +308,7 @@ async fn get_json(store: Store, uri: &str) -> serde_json::Value {
     use axum::http::Request;
     use tower::ServiceExt;
     let (tx, _) = tokio::sync::broadcast::channel(4);
-    let api = ai_kanban::http::Api { store: std::sync::Arc::new(std::sync::Mutex::new(store)), changes: tx };
+    let api = ai_kanban::http::Api { store: std::sync::Arc::new(std::sync::Mutex::new(store)), changes: tx, sync: None };
     let res = ai_kanban::http::router(api).oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
     assert!(res.status().is_success(), "{uri}: {}", res.status());
     serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 22).await.unwrap()).unwrap()
@@ -329,7 +329,7 @@ async fn the_web_page_gets_handles_and_qualified_text_for_a_shared_board() {
     // One router over Benny's store for all three reads: the store moves into it.
     let task = {
         let (tx, _) = tokio::sync::broadcast::channel(4);
-        let api = ai_kanban::http::Api { store: std::sync::Arc::new(std::sync::Mutex::new(benny.store)), changes: tx };
+        let api = ai_kanban::http::Api { store: std::sync::Arc::new(std::sync::Mutex::new(benny.store)), changes: tx, sync: None };
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
@@ -358,4 +358,66 @@ async fn a_store_that_shares_nothing_answers_the_web_page_exactly_as_before() {
     s.log_on(pid, Some(t.id), Actor::Agent, &format!("see #{}", t.id)).unwrap();
     let board = get_json(s, &format!("/api/projects/{pid}/board")).await;
     assert!(board.get("handles").is_none() && board.get("texts").is_none(), "{board}");
+}
+
+// ---------------------------------------------------------------------------
+// Who wrote it: on a shared board, "agent" alone does not say whose
+// ---------------------------------------------------------------------------
+
+/// A teammate's history entries say who wrote them, by the name they go by now -- their
+/// agent's as `volker:`, their own as `volker (by hand):` -- and this machine's own stay as
+/// they were, so an unshared board's output is unchanged. Someone no longer in the room is
+/// named by their tag.
+#[tokio::test]
+async fn a_teammates_history_says_who_wrote_it_in_the_agents_view_and_on_the_page() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    let t = benny.store.create_task(benny.pid, TaskDraft::new("login times out")).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    let theirs = task_by_title(&volker, "login times out");
+    volker.store.log_on(volker.pid, Some(theirs.id), Actor::Agent, "root cause: keep-alive").unwrap();
+    volker.store.update_task(volker.pid, theirs.id, TaskPatch { status: Some(Status::Doing), log: Some("on it".into()), actor: Actor::User, ..patch() }).unwrap();
+    benny.store.log_on(benny.pid, Some(t.id), Actor::Agent, "benny's own note").unwrap();
+    converge(&relay, &[&benny, &volker]);
+
+    // Before any round recorded the members, the tag is all there is to name him by.
+    let detail = |m: &Member, id: i64| render::task_detail(&m.store.task_detail(m.pid, id).unwrap());
+    let shown = detail(&benny, t.id);
+    assert!(shown.contains("v1: root cause: keep-alive"), "{shown}");
+    benny.store.sync_succeeded(benny.pid, &[("b1".into(), "benny".into()), ("v1".into(), "Volker".into())]).unwrap();
+    let shown = detail(&benny, t.id);
+    assert!(shown.contains("Volker: root cause: keep-alive"), "his agent's finding: {shown}");
+    assert!(shown.contains("Volker (by hand): ") && shown.contains("-> doing: on it"), "what he did himself: {shown}");
+    let own = shown.lines().find(|l| l.contains("benny's own note")).unwrap();
+    assert!(!own.contains("benny:") && !own.contains("b1:"), "this machine's own entries stay as they were: {own}");
+    let recent = render::board(&benny.store.board(benny.pid, &BoardQuery::board()).unwrap());
+    assert!(recent.contains("Volker: "), "in the board's recent too: {recent}");
+
+    // The page: the same, as `authors` beside `texts`.
+    let pid = benny.pid;
+    let v = get_json(benny.store, &format!("/api/projects/{pid}/tasks/{}", t.id)).await;
+    let authors = v["authors"].as_object().expect("authors for a teammate's entries");
+    assert!(authors.values().any(|a| a == "Volker") && authors.len() >= 2, "{authors:?}");
+}
+
+/// The page's room badge asks `/api/sync` for each shared board: its room, its last round,
+/// what is unsent, its team -- and whether this process's stream is live, `null` when the
+/// process does not sync.
+#[tokio::test]
+async fn the_page_learns_how_each_shared_board_is_syncing() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    benny.store.create_task(benny.pid, TaskDraft::new("unsent yet")).unwrap();
+    benny.store.flush().unwrap();
+    benny.store.sync_succeeded(benny.pid, &[("b1".into(), "benny".into())]).unwrap();
+    let private = benny.store.create_board("private").unwrap().id;
+    let pid = benny.pid;
+    let v = get_json(benny.store, "/api/sync").await;
+    let b = &v["boards"][pid.to_string()];
+    assert_eq!(b["room"], ROOM);
+    assert!(b["live"].is_null(), "this process does not sync: {b}");
+    assert!(b["last_ok_at"].is_i64() && b["unsent_tasks"] == 1, "{b}");
+    assert_eq!(b["members"][0]["user"], "benny");
+    assert!(v["boards"].get(private.to_string()).is_none(), "an unshared board has no badge");
 }

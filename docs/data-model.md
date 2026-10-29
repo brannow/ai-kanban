@@ -527,7 +527,7 @@ them is the point:
 What is still open is the harder half: a note can be about code that still exists and still
 be wrong. Nothing detects that, and file-watching does not, either.
 
-**Project merge — solved.** `ai-kanban merge <keep> <gone>` reparents one board onto
+**Project merge — solved.** `ai-kanban board merge <keep> <gone>` reparents one board onto
 another and deletes the empty one; see `docs/architecture.md`. Merging boards from two
 *different stores* remains open (#20) and is a different problem: ids collide meaninglessly.
 
