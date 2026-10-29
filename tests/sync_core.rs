@@ -745,3 +745,112 @@ fn a_teammates_event_about_a_task_i_took_private_does_not_link_the_boards() {
     assert_eq!(waits.blocked_by, None, "a blocker that left the room here is not linked across boards");
     assert!(benny.store.task_detail(private, here.id).unwrap().events.iter().all(|e| e.body != "still on it"));
 }
+
+/// Workstreams travel by name, normalized (`Crawl Replay`, `crawl_replay` and `crawl-replay`
+/// are one), so the same one made twice by accident -- offline on two machines, or on a board
+/// before it was connected -- is one workstream, never a second row or a parked change. Closing
+/// is this machine's view and is not published.
+#[test]
+fn a_workstream_made_twice_by_accident_is_one_workstream() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    let in_ws = |m: &Member, title: &str, ws: i64| {
+        let t = m.store.create_task(m.pid, TaskDraft::new(title)).unwrap();
+        m.store.update_task(m.pid, t.id, TaskPatch { workstream: Some(Some(ws)), ..patch() }).unwrap();
+    };
+    // Not a field of `Task`: the column stays out of TASK_COLS (migration 005).
+    let ws_of = |m: &Member, title: &str| -> Option<i64> {
+        let id = task_by_title(m, title).id;
+        m.store.conn.query_row("SELECT workstream_id FROM tasks WHERE id = ?1", [id], |r| r.get(0)).unwrap()
+    };
+    let names = |m: &Member| -> Vec<String> {
+        m.store.conn.prepare("SELECT name FROM workstreams WHERE project_id = ?1 ORDER BY name").unwrap()
+            .query_map([m.pid], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+
+    // Offline on both machines, spelled differently.
+    let wb = benny.store.ensure_workstream(benny.pid, "Crawl Replay").unwrap();
+    let wv = volker.store.ensure_workstream(volker.pid, "crawl_replay").unwrap();
+    in_ws(&benny, "benny's replay", wb.id);
+    in_ws(&volker, "volker's replay", wv.id);
+    converge(&relay, &[&benny, &volker]);
+    for m in [&benny, &volker] {
+        assert_eq!(names(m), ["crawl-replay"], "one workstream");
+        let ws = m.store.workstream_by_name(m.pid, "crawl-replay").unwrap().unwrap().id;
+        for t in ["benny's replay", "volker's replay"] {
+            assert_eq!(ws_of(m, t), Some(ws), "{t} is in it");
+        }
+        assert_eq!(count(&m.store, "sync_parked"), 0);
+    }
+
+    // Closed here, still worked on there.
+    benny.store.close_workstream(benny.pid, wb.id).unwrap();
+    in_ws(&volker, "after benny closed it", wv.id);
+    converge(&relay, &[&benny, &volker]);
+    assert_eq!(names(&benny), ["crawl-replay"], "the closed one is found, not made again");
+    assert_eq!(ws_of(&benny, "after benny closed it"), Some(wb.id));
+    assert_eq!(count(&benny.store, "sync_parked"), 0);
+    let dir: Vec<String> = benny.store.board(benny.pid, &BoardQuery::board()).unwrap()
+        .other_workstreams.into_iter().map(|w| w.workstream.name).collect();
+    assert_eq!(dir, ["crawl-replay"], "a teammate put work into it after it was closed here: back in the directory");
+    assert!(benny.store.recent_events(benny.pid, 10).unwrap().iter().any(|e| e.kind == "workstream_reopened"), "and the history says why");
+
+    // History from before the closing does not wake it: closed "later" than volker's next change.
+    benny.store.close_workstream(benny.pid, wb.id).unwrap();
+    benny.store.conn.execute("UPDATE workstreams SET closed_at = closed_at + 3600 WHERE id = ?1", [wb.id]).unwrap();
+    in_ws(&volker, "from before the closing", wv.id);
+    converge(&relay, &[&benny, &volker]);
+    assert_eq!(ws_of(&benny, "from before the closing"), Some(wb.id));
+    let closed: Option<i64> = benny.store.conn.query_row("SELECT closed_at FROM workstreams WHERE id = ?1", [wb.id], |r| r.get(0)).unwrap();
+    assert!(closed.is_some(), "an older change does not reopen it");
+    benny.store.conn.execute("UPDATE workstreams SET closed_at = NULL WHERE id = ?1", [wb.id]).unwrap();
+
+    // On a board that had it before the room's work arrived.
+    let carla = member(&relay, "carla", "c1", "carla's");
+    let early = carla.store.ensure_workstream(carla.pid, "CRAWL REPLAY").unwrap();
+    in_ws(&carla, "made before the room arrived", early.id);
+    converge(&relay, &[&carla, &benny, &volker]);
+    assert_eq!(names(&carla), ["crawl-replay"], "the room's and the board's own are one");
+    for t in ["made before the room arrived", "benny's replay", "volker's replay", "after benny closed it", "from before the closing"] {
+        assert_eq!(ws_of(&carla, t), Some(early.id), "{t}");
+        assert_eq!(ws_of(&benny, t), Some(wb.id), "{t} reached benny in it too");
+    }
+}
+
+/// A room's tasks live on one board per machine: their ids map to one local row each. So
+/// connecting the room to a second board while the first still holds them would leave the
+/// second empty -- changes for them read as applied, this machine's own as echoes -- and
+/// nothing would say so. That is refused (`room_held_elsewhere`, checked by `room connect`),
+/// and the way out it names, merging the boards, keeps every task once and syncing.
+#[test]
+fn a_room_held_by_one_board_is_refused_to_another_and_merging_moves_it() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    let t = benny.store.create_task(benny.pid, TaskDraft::new("benny's")).unwrap();
+    volker.store.create_task(volker.pid, TaskDraft::new("volker's")).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    let kept = task_by_title(&volker, "benny's");
+
+    volker.store.disconnect_board(volker.pid, false).unwrap();
+    let second = volker.store.create_board("second").unwrap().id;
+    let held = volker.store.room_held_elsewhere(ROOM, Some(second)).unwrap();
+    assert_eq!(held, Some((volker.pid, 2)), "the first board holds both, its own and benny's");
+    assert_eq!(volker.store.room_held_elsewhere(ROOM, Some(volker.pid)).unwrap(), None, "connecting the same board again is fine");
+
+    // Meanwhile the room moves on; the disconnected board is not the room's to change.
+    benny.store.update_task(benny.pid, t.id, TaskPatch { title: Some("benny's, renamed".into()), ..patch() }).unwrap();
+    converge(&relay, &[&benny]);
+    assert_eq!(volker.store.task(volker.pid, kept.id).unwrap().title, "benny's");
+
+    // The way out: merge the first board into the second, then connect the second.
+    volker.store.merge_projects(second, volker.pid).unwrap();
+    assert_eq!(volker.store.room_held_elsewhere(ROOM, Some(second)).unwrap(), None);
+    volker.store.connect_board(second, ROOM).unwrap();
+    let page = relay.pull(ROOM, &volker.p, 0, 1000).unwrap();
+    volker.store.apply(second, &page.changes).unwrap();
+    let mut titles: Vec<String> = volker.store.board(second, &BoardQuery::board()).unwrap().tasks.into_iter().map(|t| t.title).collect();
+    titles.sort();
+    assert_eq!(titles, ["benny's, renamed", "volker's"], "each task once, and current");
+}

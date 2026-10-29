@@ -1,7 +1,8 @@
-//! Keeping shared boards in sync while an agent session runs, inside the MCP process.
+//! Keeping shared boards in sync while an agent session or the web UI runs: inside the MCP
+//! process, and inside `serve`.
 //!
-//! Not a daemon of its own -- the vision rules one out -- but a thread in the process every
-//! session already has. It syncs every connected board at startup, when a teammate's push is
+//! Not a daemon of its own -- the vision rules one out -- but a thread in a process that runs
+//! anyway. It syncs every connected board at startup, when a teammate's push is
 //! announced on a room's notification stream, shortly after this session writes, and once a
 //! minute regardless. The stream only says *that* something changed; the round pulls from its
 //! own cursor, so a missed notification costs a delay, never a change.

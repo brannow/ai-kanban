@@ -19,13 +19,14 @@ struct Args {
     keep: Option<String>,
     yes: bool,
     debug: bool,
+    all: bool,
     help: bool,
 }
 
 fn args() -> Result<Args, String> {
     let mut a = Args {
         pos: vec![], db: None, listen: None,
-        snapshot_every: None, snapshot_dir: None, keep: None, yes: false, debug: false, help: false,
+        snapshot_every: None, snapshot_dir: None, keep: None, yes: false, debug: false, help: false, all: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -38,6 +39,7 @@ fn args() -> Result<Args, String> {
             "--keep" => a.keep = Some(value("--keep")?),
             "--yes" => a.yes = true,
             "--debug" => a.debug = true,
+            "--all" => a.all = true,
             // A flag, not a word among the arguments: `key rotate volker --help` must show the
             // page, not rotate a user called "help".
             "-h" | "--help" => a.help = true,
@@ -175,8 +177,11 @@ fn key(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
             print!("{}", pages::welcome(id, &label, &key));
         }
         Some("list") => {
-            let keys = db.keys()?;
-            if keys.is_empty() {
+            // Revoked keys are history, not something to act on: listed with --all.
+            let every = db.keys()?;
+            let hidden = if a.all { 0 } else { every.iter().filter(|k| k.revoked_at.is_some()).count() };
+            let keys: Vec<_> = every.into_iter().filter(|k| a.all || k.revoked_at.is_none()).collect();
+            if keys.is_empty() && hidden == 0 {
                 println!("no keys yet. {} key add <label>", prog());
             } else {
                 println!("{:>4}  {:<8} {:<20} {:<24} {:<10} {}", "id", "tag", "name (theirs)", "label (yours)", "runs", "");
@@ -195,6 +200,9 @@ fn key(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 println!("{:>4}  {:<8} {:<20} {:<24} {:<10} {}", k.id, tag, name, k.label, runs, state);
             }
+            if hidden > 0 {
+                println!("({hidden} revoked: {} key list --all)", prog());
+            }
         }
         Some("revoke") => {
             let id = db.key_id(a.arg(2).ok_or_else(|| usage("key revoke <tag|id>"))?)?;
@@ -202,10 +210,15 @@ fn key(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
             println!("key {id} revoked. Its tag is not given out again.");
         }
         Some("rotate") => {
-            let id = db.key_id(a.arg(2).ok_or_else(|| usage("key rotate <tag|id>"))?)?;
+            let id = db.key_to_rotate(a.arg(2).ok_or_else(|| usage("key rotate <tag|id>"))?)?;
             let label = db.keys()?.into_iter().find(|k| k.id == id).map(|k| k.label).unwrap_or_default();
             let (tag, key) = db.rotate_key(id)?;
             print!("{}", pages::rotated(&label, tag.as_deref(), &key));
+        }
+        Some("delete") => {
+            let selector = a.arg(2).ok_or_else(|| usage("key delete <tag|id>"))?;
+            let n = db.delete_keys(selector)?;
+            println!("{n} revoked key(s) of {selector} deleted. The tag stays reserved: it is never given to another machine.");
         }
         Some("label") => {
             let id = db.key_id(a.arg(2).ok_or_else(|| usage("key label <tag|id> <label>"))?)?;

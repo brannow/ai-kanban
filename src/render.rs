@@ -322,6 +322,7 @@ fn event_line(e: &Event, now: i64, h: &Handles) -> String {
             // to it.
             "workstream_created" => format!("started workstream \"{}\"", truncate(body, 50)),
             "workstream_closed"  => format!("closed workstream \"{}\"", truncate(body, 50)),
+            "workstream_reopened" => format!("reopened workstream \"{}\": a teammate put work into it", truncate(body, 50)),
             // Same reasoning as the workstream kinds: history worth the line, but the body
             // alone ("eee-web (/Users/…)") would not say what happened to it.
             "repo_added"   => format!("added repo {}", truncate(body, 60)),

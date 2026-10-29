@@ -46,8 +46,9 @@ ai-kanban relay -- administration
 {run}Keys -- one per machine; people name themselves:
     {p} key add <label>              a key for someone, with a message to send them
     {p} key list
-    {p} key rotate <tag|id>          replace a lost or leaked key
+    {p} key rotate <tag|id>          replace a lost, leaked or revoked key
     {p} key revoke <tag|id>
+    {p} key delete <tag|id>          remove revoked keys for good
     {p} key label <tag|id> <label>
 
 Rooms:
@@ -88,16 +89,23 @@ machines on one key would hand out the same ones.
     {p} key add <label>
         A new key, labelled with who it is for. Prints a message to send them.
 
-    {p} key list
-        Every key: id, tag, the name its user chose, your label, which ai-kanban its machine
-        runs (\"older\": from before 0.2, which did not say), and when it was last used.
+    {p} key list [--all]
+        Every live key: id, tag, the name its user chose, your label, which ai-kanban its
+        machine runs (\"older\": from before 0.2, which did not say), and when it was last
+        used. --all adds the revoked ones.
 
     {p} key rotate <tag|id>
-        For a lost or leaked key: a new key with the same tag, name and label, and the old
-        one stops working at once. Prints a message to send them.
+        A new key with the same tag, name and label. For a lost or leaked key -- the old one
+        stops working at once -- and to bring back a machine whose key was revoked: it gets a
+        new key, never the old one again. Prints a message to send them.
 
     {p} key revoke <tag|id>
-        Stop a key for good. Its tag is not given out again.
+        Stop a key. Its machine is locked out until it gets a new one (key rotate).
+
+    {p} key delete <tag|id>
+        Remove revoked keys from the list for good (revoke first: a live key is refused).
+        The tag stays reserved and is never given to another machine -- its handles may be
+        in a room already.
 
     {p} key label <tag|id> <label>
         Change your label for a key.
@@ -108,6 +116,8 @@ Examples:
     {p} key add volker laptop
     {p} key rotate v1
     {p} key revoke 3
+    {p} key rotate 3                   key 3 was revoked; the machine gets a new one
+    {p} key delete 3
 "
         ),
         "room" => format!(

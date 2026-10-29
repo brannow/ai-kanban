@@ -921,3 +921,38 @@ async fn the_relay_records_what_each_machine_runs_and_refuses_a_protocol_too_old
     assert!(body.contains("protocol 1 or newer") && body.contains("ai-kanban 0.0.1"), "says what to do: {body}");
     assert_eq!(client("b1").as_deref(), Some("ai-kanban/0.2.0 (protocol 1)"), "a refused request records nothing");
 }
+
+/// A revoked machine comes back with a new key under its old tag -- never with the old secret
+/// -- and revoked keys can be removed for good, while their tag stays reserved.
+#[tokio::test]
+async fn a_revoked_key_is_replaced_by_rotating_and_deleted_only_once_revoked() {
+    let f = fixture();
+    let old = f.relay.db.lock().unwrap().key_id("b1").unwrap();
+    f.relay.db.lock().unwrap().revoke_key(old).unwrap();
+    let revoked_at = |id: i64| f.relay.db.lock().unwrap().keys().unwrap().into_iter().find(|k| k.id == id).unwrap().revoked_at;
+    let when = revoked_at(old);
+
+    let (tag, back) = { let db = f.relay.db.lock().unwrap(); let id = db.key_to_rotate("b1").unwrap(); db.rotate_key(id).unwrap() };
+    assert_eq!(tag.as_deref(), Some("b1"));
+    let (s, v) = call(&f.relay, "GET", "/v1/whoami", Some(&back), None).await;
+    assert_eq!((s, v["tag"].clone(), v["user"].clone()), (StatusCode::OK, json!("b1"), json!("benny")), "same tag and name");
+    let (s, _) = call(&f.relay, "GET", "/v1/whoami", Some(&f.benny), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "the old secret stays dead");
+    assert_eq!(revoked_at(old), when, "when it was revoked stays on record");
+
+    let err = f.relay.db.lock().unwrap().key_to_rotate(&old.to_string()).unwrap_err().to_string();
+    assert!(err.contains("already has a live key"), "one live key per tag: {err}");
+
+    let live = f.relay.db.lock().unwrap().key_id("b1").unwrap();
+    let err = f.relay.db.lock().unwrap().delete_keys(&live.to_string()).unwrap_err().to_string();
+    assert!(err.contains("revoke it first"), "{err}");
+    assert_eq!(f.relay.db.lock().unwrap().delete_keys(&old.to_string()).unwrap(), 1);
+    assert!(f.relay.db.lock().unwrap().keys().unwrap().iter().all(|k| k.id != old), "gone from the list");
+    let err = f.relay.db.lock().unwrap().delete_keys("b1").unwrap_err().to_string();
+    assert!(err.contains("revoke it first"), "by tag, a live key is refused too: {err}");
+
+    // Every key of v1 revoked and deleted: the tag is still not handed out again.
+    { let db = f.relay.db.lock().unwrap(); let id = db.key_id("v1").unwrap(); db.revoke_key(id).unwrap(); db.delete_keys("v1").unwrap(); }
+    let (id, _) = f.relay.db.lock().unwrap().issue_key("another volker").unwrap();
+    assert_eq!(f.relay.db.lock().unwrap().name_key(id, "Volker").unwrap().tag, "v2", "v1 stays reserved");
+}

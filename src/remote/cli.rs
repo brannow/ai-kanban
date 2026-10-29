@@ -328,10 +328,17 @@ const PREVIEW_TAG: &str = "preview";
 /// creation into the room; `check_identity` would give the store this machine's tag, and this
 /// machine's published tasks would then read as the preview's own.
 fn preview(c: &Client, url: &str, info: &RoomInfo) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(look(c, url, info, None)?.0)
+}
+
+/// `preview`, also counting the tasks in the room created under one of `own`'s tags: what a
+/// board of `own` published there.
+fn look(c: &Client, url: &str, info: &RoomInfo, own: Option<&Store>) -> Result<(String, i64), Box<dyn std::error::Error>> {
     let mut out = crate::render::room_header(info, url, crate::core::now());
     if info.changes == 0 {
-        return Ok(crate::render::safe(&out).into_owned());
+        return Ok((crate::render::safe(&out).into_owned(), 0));
     }
+    let mut mine = std::collections::HashSet::new();
     let (tmp, pid) = Store::preview(&info.name, info.board.as_deref().unwrap_or(&info.name), PREVIEW_TAG)?;
     let mut since = 0;
     loop {
@@ -344,6 +351,13 @@ fn preview(c: &Client, url: &str, info: &RoomInfo) -> Result<String, Box<dyn std
         })?;
         let Some(last) = page.changes.iter().map(|p| p.seq).max() else { break };
         since = last;
+        if let Some(store) = own {
+            for p in &page.changes {
+                if p.change.entity.kind == "task" && store.is_own_tag(&p.change.entity.origin)? {
+                    mine.insert((p.change.entity.origin.clone(), p.change.entity.id));
+                }
+            }
+        }
         tmp.apply(pid, &page.changes)?;
         if !page.more {
             break;
@@ -354,7 +368,7 @@ fn preview(c: &Client, url: &str, info: &RoomInfo) -> Result<String, Box<dyn std
     out.push('\n');
     out.push_str(&crate::render::board(&tmp.board(pid, &BoardQuery::board())?));
     // Everything in it came from the room: through the same filter as every answer.
-    Ok(crate::render::safe(&out).into_owned())
+    Ok((crate::render::safe(&out).into_owned(), mine.len() as i64))
 }
 
 /// Which board a room connects to: one that exists, or one made for it -- made only once the
@@ -379,10 +393,14 @@ fn room_connect(store: &Store, room: &str, a: &Args) -> CliResult {
     // What is in the room comes first: whoever answers the questions below should know which
     // room they are answering them about.
     let existing = find_room(&c, &room)?;
+    let mut published_before = 0;
     match &existing {
         // A relay from before open reads cannot show it; connecting must still work there.
-        Some(info) => match preview(&c, &cfg.url, info) {
-            Ok(p) => println!("{p}"),
+        Some(info) => match look(&c, &cfg.url, info, Some(store)) {
+            Ok((p, mine)) => {
+                println!("{p}");
+                published_before = mine;
+            }
             Err(e) => println!("(cannot show what is in room \"{room}\": {e})\n"),
         },
         None => println!("Room \"{room}\" does not exist yet on {} -- connecting creates it.\n", cfg.url),
@@ -394,6 +412,32 @@ fn room_connect(store: &Store, room: &str, a: &Args) -> CliResult {
         (None, true) => Pick::New(free_name(store, &room)?),
         (None, false) => pick_board(store, &room)?,
     };
+    // Before anything is written -- the backup, the join, a new board.
+    let target = match &pick {
+        Pick::Board(pid) => Some(*pid),
+        Pick::New(_) => None,
+    };
+    if let Some((elsewhere, tasks)) = store.room_held_elsewhere(&room, target)? {
+        let held = store.project(elsewhere)?.name;
+        let fix = match &pick {
+            Pick::Board(pid) => format!("or merge it into this one first: ai-kanban merge \"{}\" \"{held}\"", store.project(*pid)?.name),
+            Pick::New(_) => "or merge it into the board you want first (ai-kanban merge <board> <that board>)".to_string(),
+        };
+        return Err(format!(
+            "{tasks} task(s) of room {room} are on board \"{held}\" on this machine. A room's tasks live on one board per \
+             machine, so another board would not get them. Connect \"{held}\" again (ai-kanban room connect {room} --board \"{held}\"), {fix}"
+        )
+        .into());
+    }
+    if published_before > store.own_tasks_held(&room)? {
+        return Err(format!(
+            "room {room} holds {published_before} task(s) this machine published from a board it no longer has. A board \
+             connected now would not get them back: they read as this machine's own echoes. To start over in the room, \
+             give this machine a key of its own (relay admin: key add <label>), set it (ai-kanban remote <url> --key <key>), \
+             then connect -- the old tasks then arrive as anyone else's"
+        )
+        .into());
+    }
     let (name, publish) = match &pick {
         Pick::Board(pid) => {
             let board = store.project(*pid)?;

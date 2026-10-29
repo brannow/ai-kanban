@@ -32,7 +32,7 @@ kanban-test -- extra ai-kanban clients on this machine (see the top of this scri
 
 A test client next to your own session on the team relay, in this order:
     1. on the server: ./kanban key add benjamin test client      (a key of its own)
-    2. kanban-test cli b2 remote https://kanban.work.rannow.de --key <that key> --name "benjamin (test)"
+    2. kanban-test cli b2 remote https://kanban.work.rannow.de --key <that key> --name benjamin-test
     3. kanban-test claude b2                                     (/login once, then as usual)
 The plugin's relay settings are ignored by test clients; leave them empty there.
 

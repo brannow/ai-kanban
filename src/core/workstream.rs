@@ -232,6 +232,15 @@ impl Store {
         }
     }
 
+    /// Back in the directory. Reached from sync only: when a teammate puts work into a
+    /// workstream closed here (`sync::write_field`).
+    pub(crate) fn reopen_workstream(&self, project_id: i64, id: i64) -> Result<Workstream> {
+        let w = self.workstream(project_id, id)?;
+        self.conn.execute("UPDATE workstreams SET closed_at = NULL WHERE id = ?1 AND project_id = ?2", params![id, project_id])?;
+        self.write_event(project_id, None, Actor::System, "workstream_reopened", &w.name)?;
+        self.workstream(project_id, id)
+    }
+
     /// Close a workstream. Its tasks are untouched; only the directory changes.
     pub fn close_workstream(&self, project_id: i64, id: i64) -> Result<Workstream> {
         let w = self.workstream(project_id, id)?;

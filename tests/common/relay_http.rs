@@ -20,9 +20,8 @@ impl HttpRelay {
     pub fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("server.db");
-        {
-            let db = ServerDb::open(&db_path).unwrap();
-        }
+        // Created and migrated before the server opens it; keys are added per test.
+        ServerDb::open(&db_path).unwrap();
         let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         let mut r = HttpRelay { url: format!("http://{addr}"), db_path, addr, stop: None, thread: None, _dir: dir };
         r.resume();

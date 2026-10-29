@@ -100,7 +100,30 @@ pub async fn serve(store: Store, port: u16) -> Result<(), Box<dyn std::error::Er
     let (tx, _) = tokio::sync::broadcast::channel(64);
     let api = Api { store: Arc::new(Mutex::new(store)), changes: tx.clone() };
 
-    stream::spawn_poller(tx);
+    stream::spawn_poller(tx.clone());
+
+    // The same background sync a session runs, so the page is not an island: what is changed
+    // here goes out within seconds, and what teammates do arrives -- announced on the room's
+    // stream -- and shows, since the page follows the store. Every change the poller sees,
+    // the page's own or one from elsewhere, is a reason to sync now rather than within the
+    // minute. Several processes syncing one store is safe by design (`remote::engine`).
+    let rooms = Store::open_default().ok().and_then(|s| s.connected_boards().ok()).unwrap_or_default();
+    match crate::remote::daemon::Syncer::start() {
+        Some(sync) => {
+            let names = rooms.iter().map(|(_, r)| r.as_str()).collect::<Vec<_>>().join(", ");
+            println!("sync: on{}", if names.is_empty() { " (no board in a room yet)".to_string() } else { format!(" -- rooms {names}") });
+            let mut changes = tx.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match changes.recv().await {
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => sync.kick(),
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+        None => println!("sync: off (no remote set, or AI_KANBAN_SYNC=0)"),
+    }
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;

@@ -331,3 +331,85 @@ fn sync_off_for_a_run_keeps_it_local_and_says_so() {
     let shown = m.run_env(&["remote"], &off);
     assert!(String::from_utf8_lossy(&shown.stdout).contains("off for this run"));
 }
+
+/// Connecting a room to a board refuses what would leave that board silently incomplete,
+/// and says the way out: the room's tasks still on another board here, or this machine's own
+/// tasks in the room from a board it no longer has.
+#[test]
+fn connecting_refuses_a_board_that_would_miss_the_rooms_tasks() {
+    let relay = HttpRelay::start();
+    let m = Machine::new();
+    let first = m.board("sbb");
+    m.store().create_task(first, TaskDraft::new("filed on sbb")).unwrap();
+    m.ok(&["remote", &relay.url, "--key", &relay.key("benny", "b1")]);
+    m.ok(&["room", "connect", "sbahn", "--board", "sbb", "--yes"]);
+    m.ok(&["room", "disconnect", "sbahn", "--keep-foreign", "--yes"]);
+
+    m.board("second");
+    let out = m.fails(&["room", "connect", "sbahn", "--board", "second", "--yes"]);
+    assert!(out.contains("on board \"sbb\"") && out.contains("ai-kanban merge \"second\" \"sbb\""), "{out}");
+    assert!(m.store().room_of(m.store().project_by_name_or_key("second").unwrap().id).unwrap().is_none(), "nothing connected");
+    assert!(!relay.admin().rooms().unwrap()[0].members.iter().any(|x| x.tag == "b1"), "not even joined on the relay");
+
+    m.ok(&["board", "forget", "sbb", "--yes"]);
+    let out = m.fails(&["room", "connect", "sbahn", "--new-board", "--yes"]);
+    assert!(out.contains("from a board it no longer has") && out.contains("key of its own"), "{out}");
+    assert!(m.store().project_by_name_or_key("sbahn").is_err(), "no stray board made");
+}
+
+/// The web UI syncs by itself, both ways: what is done on the page goes out within seconds,
+/// and what a teammate does shows up on it -- with no agent session running.
+#[test]
+fn the_web_ui_syncs_both_ways_without_a_session() {
+    let relay = HttpRelay::start();
+    let (benny, volker) = (Machine::new(), Machine::new());
+    let bp = benny.board("sbb");
+    volker.board("x");
+    benny.ok(&["remote", &relay.url, "--key", &relay.key("benny", "b1")]);
+    volker.ok(&["remote", &relay.url, "--key", &relay.key("volker", "v1")]);
+    benny.ok(&["room", "connect", "sbahn", "--board", "sbb", "--yes"]);
+    volker.ok(&["room", "connect", "sbahn", "--board", "x", "--yes"]);
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_ai-kanban"))
+        .args(["serve", "--port", &port.to_string()])
+        .current_dir(benny.dir.path())
+        .env("AI_KANBAN_DB", &benny.db)
+        .env_remove("AI_KANBAN_SYNC")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let until = |what: &str, ok: &dyn Fn() -> bool| {
+        let done = (0..100).any(|_| { std::thread::sleep(std::time::Duration::from_millis(100)); ok() });
+        assert!(done, "{what} within 10s");
+    };
+    until("the page answers", &|| ureq::get(&base).call().is_ok());
+
+    // Out: filed on the page, in the room.
+    ureq::post(format!("{base}/api/projects/{bp}/tasks"))
+        .header("content-type", "application/json")
+        .send(r#"{"title": "filed on the page", "origin": "user", "actor": "user"}"#)
+        .unwrap();
+    // The relay keeps each change as sent; the title is in one of them.
+    let in_room = || {
+        let n: i64 = relay.admin().conn
+            .query_row("SELECT COUNT(*) FROM changes WHERE body LIKE '%filed on the page%'", [], |r| r.get(0))
+            .unwrap();
+        n > 0
+    };
+    until("the page's task reaches the room", &in_room);
+
+    // In: a teammate's task, on the page.
+    let vp = volker.store().project_by_name_or_key("x").unwrap().id;
+    volker.store().create_task(vp, TaskDraft::new("from volker")).unwrap();
+    volker.ok(&["room", "sync"]);
+    until("volker's task shows on the page", &|| {
+        let mut res = ureq::get(format!("{base}/api/projects/{bp}/board")).call().unwrap();
+        res.body_mut().read_to_string().unwrap().contains("from volker")
+    });
+    let _ = serve.kill();
+    let _ = serve.wait();
+}

@@ -67,7 +67,7 @@ rewrite and a single writer), cr-sqlite (last push 2024-10, native extension). T
 | **Everything on a connected board publishes.** No per-task privacy. | Per-task privacy means the agent decides what is private. Private work goes on a board that isn't connected. |
 | A room carries **tasks, their events, notes (including board-level notes) and board-level events**. | Notes and decisions are the knowledge half. A teammate's `recall` finding your root cause is the double work avoided most often. |
 | Sync is **both ways for every task, your own included.** | Teammates log evidence and findings on your tasks, and you need that back. Publishing without receiving would leave your copy behind the room's. |
-| Synced per room: workstream **membership**, by name. Local only: `current_workstream`, `project_paths`, `repos.path`. | Which workstream a task belongs to is shared. Which one *you* are in is your context. This also prevents one person's workstream switch from changing everyone's view. |
+| Synced per room: workstream **membership**, by name (normalized: `Crawl Replay` and `crawl_replay` are one, so the same workstream made twice by accident merges). Closing is local -- but a teammate putting work into a workstream after it was closed here reopens it here (`workstream_reopened`), or their work would sit where the directory does not show it. Local only: `current_workstream`, `project_paths`, `repos.path`. | Which workstream a task belongs to is shared. Which one *you* are in is your context. This also prevents one person's workstream switch from changing everyone's view. |
 | **Connecting is a CLI step,** never the agent's: `ai-kanban room join <server>/<room>`. | Joining publishes the board's whole history to others, and that is a human decision. |
 | A first connect publishes the board's existing tasks, history and notes. When two existing boards join one room, the result is the **union**. | That is what R4 asks for. Duplicates get reconciled by people, by forgetting or merging one, since only people know two tasks are the same. |
 | `task_update(move_to)` **onto** a connected board publishes the task. **Off** one, the task leaves the room: others keep a frozen, archived copy with "moved off the team board by benny". | The agent can move tasks, so both directions need a defined result. Deleting the task on others' machines would destroy their history of it. |
@@ -146,6 +146,14 @@ connected. Board header now shows: Board: sbb @sbahn
   would push the temporary board's creation into the room. That is why **reading a room needs
   only a key, not membership** -- any key holder may join any room anyway, and looking must not
   put the looker in the member list. Writing and the event stream still need membership.
+- **A room's tasks live on one board per machine.** Their ids map to one local row each, so
+  connecting a room to a second board while another still holds its tasks would leave the second
+  empty -- changes for them read as applied, this machine's own as echoes -- and silently. So
+  `room connect` refuses, before it writes anything, naming the board and the way out: connect
+  that board again, or `ai-kanban merge <this> <that>` first, which keeps the mapping. Likewise
+  when the room holds tasks this machine published from a board it no longer has (forgotten): a
+  new board would miss them as echoes; the way out is a key of its own, after which they arrive
+  as anyone else's.
 - **Rooms remember the board they were created from** (relay migration 2, `?board=` on the join
   that creates it; a later joiner's name does not replace it). Cleaned of control characters and
   cut to 64 characters, since it is printed in other people's terminals.
@@ -392,9 +400,15 @@ Each mutation on a connected board writes, **in the same transaction**, one chan
 
 ### When it happens
 
-All of it runs in a background thread of the MCP process (`src/remote/daemon.rs`), which exists
-per session already, so there is no daemon of its own. Nothing starts unless a remote is set
-and the run allows sync.
+All of it runs in a background thread (`src/remote/daemon.rs`) of a process that runs anyway:
+the MCP process of every agent session, and `ai-kanban serve`, the web UI. So there is no daemon
+of its own, and the web UI is not an island: what is done on the page goes out within seconds,
+what teammates do shows up on it, with no agent session running. Nothing starts unless a remote
+is set and the run allows sync.
+
+- **In `serve`** every change the page's live stream sees -- the page's own, the CLI's, an applied
+  one -- kicks a round, so the page is as quick both ways as a session (`tests/remote_cli.rs`,
+  `the_web_ui_syncs_both_ways_without_a_session`). It prints `sync: on` or `sync: off` at start.
 
 - **At startup**, in the background: never in the way of the session starting.
 - **Shortly after every write** the agent makes: writes in quick succession go out as one round.
@@ -506,6 +520,7 @@ stay for `serve`.
 ai-kanban-relay key add volker laptop                 # a key, labelled; printed once with a message to send
 ai-kanban-relay key list                              # id, tag, the name its user chose, your label, last use
 ai-kanban-relay key rotate v1 | revoke v1 | label v1 <label>   # by tag, or by id for a key not used yet
+ai-kanban-relay key delete 3                          # a revoked key, for good; its tag stays reserved
 ai-kanban-relay room list | delete <room>               # rooms are created by connecting
 ai-kanban-relay forget <room> <handle>                 # the only forget in a room
 ai-kanban-relay snapshot                              # also scheduled: --snapshot-every 6h --keep 28
@@ -533,6 +548,15 @@ ai-kanban-relay snapshot                              # also scheduled: --snapsh
     markup (`< > & "`) are refused -- with the reason, not silently cleaned. The tag's letter is
     the name's first letter as typed on an ASCII keyboard (`ßaskia` s, `örkan` o, `Дмитрий` d);
     scripts without one use a Latin letter elsewhere in the name, else `x` (`王伟` x1).
+  - **A revoked machine comes back by `key rotate`**: a new secret under its old tag, never the
+    old secret again -- keys are revoked because they leaked or were lost, and waking one would
+    reopen exactly that. A tag holds one live key, so rotating a revoked key whose tag has a newer
+    live one is refused, naming it.
+  - **`key delete`** removes revoked keys for good (a live one is refused: revoke first). The tag
+    stays reserved even with no key left: whether it ever published is not something the relay
+    can know -- a machine may have named itself and filed `#12-x1` offline -- and handed to
+    someone else, its handles would collide in a room. `key list` shows live keys; `--all` the
+    revoked ones too.
   - Gone with users: disabling a person. One key per machine and no person on the server means
     locking someone out is revoking each of their keys, found by label in `key list`. The
     migration revoked the keys of users who were disabled.

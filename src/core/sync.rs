@@ -107,7 +107,7 @@ pub const EVENT_LOCAL: &[&str] = &["id", "project_id"];
 /// What it leaves out, and why that is the safe side: `repo_added` carries a local checkout
 /// path; `project_created`, `moved` and `moved_out` name local boards ("moved here from board
 /// customer-x"); `repo_home`, `repo_renamed`, `repo_removed` and `workstream_closed` describe
-/// one machine's setup; `workstream_created` is written by each machine when a workstream
+/// one machine's setup, and so does `workstream_reopened`; `workstream_created` is written by each machine when a workstream
 /// first appears there; `forgotten` and `left_room` are written locally when a tombstone or a
 /// departure arrives; the housekeeping kinds say nothing about the work.
 pub const PUBLISHED_KINDS: &[&str] = &["created", "updated", "note_added", "note_updated", "log"];
@@ -277,6 +277,40 @@ impl Store {
 
     /// Connects a board to a room: from here on everything on it is published, starting with
     /// everything already there. One room per board and one board per room.
+    /// The board on this machine, other than `except`, that holds tasks it had from `room` (or
+    /// published into it), and how many. A room's tasks can live on one board per machine: their
+    /// ids map to one local row each, so connecting the room to another board would leave that
+    /// board without them -- the room's changes for them read as already applied, and this
+    /// machine's own as echoes -- with nothing saying so. `room connect` refuses instead.
+    pub fn room_held_elsewhere(&self, room: &str, except: Option<i64>) -> Result<Option<(i64, i64)>> {
+        Ok(self.conn
+            .query_row(
+                "SELECT t.project_id, COUNT(*) FROM tasks t
+                   JOIN sync_ids s ON s.kind = 'task' AND s.local_id = t.id
+                  WHERE (?2 IS NULL OR t.project_id != ?2)
+                    AND EXISTS (SELECT 1 FROM sync_fields f
+                                 WHERE f.room = ?1 AND f.kind = 'task' AND f.origin = s.origin AND f.origin_id = s.origin_id)
+                  GROUP BY t.project_id ORDER BY COUNT(*) DESC, t.project_id LIMIT 1",
+                params![room, except],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// How many of this store's own tasks, published into `room`, it still has a row for on
+    /// any board. Set against what the room holds under this store's tags, it tells whether a
+    /// board that published there is gone.
+    pub fn own_tasks_held(&self, room: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks t JOIN sync_ids s ON s.kind = 'task' AND s.local_id = t.id
+              WHERE s.origin IN (SELECT tag FROM sync_own_tags)
+                AND EXISTS (SELECT 1 FROM sync_fields f
+                             WHERE f.room = ?1 AND f.kind = 'task' AND f.origin = s.origin AND f.origin_id = s.origin_id)",
+            [room],
+            |r| r.get(0),
+        )?)
+    }
+
     /// A throwaway in-memory store holding one board, connected to `room` under `tag`, for
     /// looking into a room without connecting to it (`room show`): the caller applies the
     /// room's log and renders the board. `tag` must be one the relay never issues, so no change
@@ -671,7 +705,7 @@ impl Store {
     }
 
     /// Writes one received field into its row.
-    fn write_field(&self, room: &str, project_id: i64, kind: &str, local_id: i64, s: &Spec, v: &Value) -> Result<()> {
+    fn write_field(&self, room: &str, project_id: i64, kind: &str, local_id: i64, s: &Spec, v: &Value, clock: &Clock) -> Result<()> {
         let t = table(kind);
         let bad = || Error::Other(format!("{kind}.{}: unexpected value {v}", s.field));
         let sql_value: Sql = match s.enc {
@@ -702,7 +736,19 @@ impl Store {
             // Merged by name: a workstream two members created offline is one workstream.
             Enc::Workstream => match v {
                 Value::Null => Sql::Null,
-                Value::String(name) => Sql::Integer(self.ensure_workstream(project_id, name)?.id),
+                Value::String(name) => {
+                    let w = self.ensure_workstream(project_id, name)?;
+                    // Closing is this machine's view and is not published. A teammate putting
+                    // work into it after it was closed here says it is not finished: reopened,
+                    // or their work would sit in a workstream the directory does not show.
+                    // Only for a change from the closing's second on -- history from before it,
+                    // pulled again, does not wake it. The closing is kept in whole seconds, so
+                    // the same second counts as after: better shown once too often than hidden.
+                    if w.closed_at.is_some_and(|closed| clock.wall_ms / 1000 >= closed) {
+                        self.reopen_workstream(project_id, w.id)?;
+                    }
+                    Sql::Integer(w.id)
+                }
                 _ => return Err(bad()),
             },
         };
@@ -1004,7 +1050,7 @@ impl Store {
         if !on_board {
             return Ok(Outcome::Ignored);
         }
-        self.write_field(room, project_id, &e.kind, local, s, &c.value)?;
+        self.write_field(room, project_id, &e.kind, local, s, &c.value, &c.clock)?;
         self.conn.execute(
             &format!("UPDATE {} SET updated_at = ?2, version = version + 1 WHERE id = ?1", table(&e.kind)),
             params![local, now()],

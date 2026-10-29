@@ -384,12 +384,37 @@ impl ServerDb {
         found.ok_or_else(|| ServerError::NotFound(format!("no live key {selector} (a key id or a tag, from key list)")))
     }
 
-    /// A new key in place of a lost or leaked one: same tag, name and label, so everything the
-    /// machine published keeps its handles. The old key stops working at once.
+    /// The key `key rotate` means: a key id (live or revoked), or a tag -- its live key, else its
+    /// newest. Rotating a revoked key is how a machine comes back: a new secret under its old
+    /// tag, never the old secret again (a key is revoked because it leaked or was lost, and
+    /// waking it would reopen exactly that). A tag holds one live key, so a revoked key whose
+    /// tag has a newer live one is refused, naming that one.
+    pub fn key_to_rotate(&self, selector: &str) -> Result<i64> {
+        let row: Option<(i64, Option<String>, Option<i64>)> = match selector.parse::<i64>() {
+            Ok(id) => self.conn.query_row("SELECT id, tag, revoked_at FROM keys WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?,
+            Err(_) => self.conn.query_row(
+                "SELECT id, tag, revoked_at FROM keys WHERE tag = ?1 ORDER BY revoked_at IS NOT NULL, id DESC LIMIT 1",
+                [selector],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).optional()?,
+        };
+        let (id, tag, revoked) = row.ok_or_else(|| ServerError::NotFound(format!("no key {selector} (a key id or a tag, from key list --all)")))?;
+        if let (Some(_), Some(tag)) = (revoked, &tag) {
+            let live: Option<i64> = self.conn.query_row("SELECT id FROM keys WHERE tag = ?1 AND revoked_at IS NULL", [tag], |r| r.get(0)).optional()?;
+            if let Some(live) = live {
+                return Err(ServerError::Conflict(format!("tag {tag} already has a live key ({live}); rotate that one: key rotate {live}")));
+            }
+        }
+        Ok(id)
+    }
+
+    /// A new key in place of a lost, leaked or revoked one: same tag, name and label, so
+    /// everything the machine published keeps its handles. A live old key stops working at once.
     pub fn rotate_key(&self, key_id: i64) -> Result<(Option<String>, String)> {
         let tx = self.conn.unchecked_transaction()?;
         let (tag, label): (Option<String>, String) = tx.query_row("SELECT tag, label FROM keys WHERE id = ?1", [key_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        tx.execute("UPDATE keys SET revoked_at = ?2 WHERE id = ?1", params![key_id, now()])?;
+        // Not over an earlier revocation: when it happened stays on record.
+        tx.execute("UPDATE keys SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL", params![key_id, now()])?;
         let key = new_key()?;
         tx.execute("INSERT INTO keys (tag, label, hash, created_at) VALUES (?1, ?2, ?3, ?4)", params![tag, label, hash_key(&key), now()])?;
         tx.commit()?;
@@ -405,6 +430,33 @@ impl ServerDb {
             return Err(ServerError::NotFound(format!("no live key {id}")));
         }
         Ok(())
+    }
+
+    /// Removes revoked keys for good: the key `selector` names (an id), or every revoked key of
+    /// a tag. A live key is refused -- revoke it first -- so deleting is always two steps.
+    ///
+    /// The tag stays reserved even when no key is left for it. Whether it ever published is
+    /// not something the relay can know: a machine may have named itself and filed tasks as
+    /// `#12-x1` while offline. Handed to someone else, the tag's handles would collide in a
+    /// room without anything noticing. Tags cost nothing; reusing one could cost a board.
+    /// Returns how many keys went.
+    pub fn delete_keys(&self, selector: &str) -> Result<usize> {
+        let ids: Vec<(i64, Option<i64>)> = match selector.parse::<i64>() {
+            Ok(id) => self.conn.prepare("SELECT id, revoked_at FROM keys WHERE id = ?1")?.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?,
+            Err(_) => self.conn.prepare("SELECT id, revoked_at FROM keys WHERE tag = ?1")?.query_map([selector], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?,
+        };
+        if ids.is_empty() {
+            return Err(ServerError::NotFound(format!("no key {selector} (a key id or a tag, from key list --all)")));
+        }
+        if let Some((live, _)) = ids.iter().find(|(_, revoked)| revoked.is_none()) {
+            return Err(ServerError::Conflict(format!("key {live} is live; revoke it first (key revoke {live}), then delete it")));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for (id, _) in &ids {
+            tx.execute("DELETE FROM keys WHERE id = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(ids.len())
     }
 
     pub fn label_key(&self, id: i64, label: &str) -> Result<()> {
