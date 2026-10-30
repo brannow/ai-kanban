@@ -82,6 +82,15 @@ fn a_session_publishes_its_writes_and_receives_a_teammates_without_being_asked()
     }
     assert_eq!(me.sync_status(pid).unwrap().unwrap().members.len(), 2, "a round that did not ask keeps the team");
 
+    // A kick with nothing to send runs no round: the page's poller kicks on every change it
+    // sees, including the write the last round already sent and the pull it just applied.
+    relay.log.lock().unwrap().clear();
+    syncer.kick();
+    syncer.kick_now();
+    std::thread::sleep(Duration::from_millis(1500));
+    let asked: Vec<String> = relay.log.lock().unwrap().iter().filter(|l| l.contains(" > ") && l.contains("benny/b1")).cloned().collect();
+    assert!(asked.is_empty(), "a kick with nothing to send went to the relay: {asked:#?}");
+
     // The round before a claim is bounded when the relay is gone, and does not fail.
     relay.stop();
     let start = Instant::now();

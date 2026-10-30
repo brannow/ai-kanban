@@ -589,6 +589,17 @@ impl Store {
         Ok(out)
     }
 
+    /// Whether any connected board has changes waiting for its room.
+    pub fn has_unsent(&self) -> Result<bool> {
+        // Joined, not the bare table: a row left for a board no longer in a room would otherwise
+        // count forever, and every kick would run a round again.
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_outbox o JOIN sync_rooms r ON r.project_id = o.project_id)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Drops changes the relay has accepted, up to and including `seq`.
     pub fn outbox_sent(&self, project_id: i64, seq: i64) -> Result<()> {
         self.conn.execute("DELETE FROM sync_outbox WHERE project_id = ?1 AND seq <= ?2", params![project_id, seq])?;

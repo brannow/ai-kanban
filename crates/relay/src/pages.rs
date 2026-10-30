@@ -28,10 +28,13 @@ pub fn overview() -> String {
         "\
 Run it:
     ai-kanban-relay [--listen ADDR] [--snapshot-every DUR] [--keep N] [--snapshot-dir DIR] [--debug]
+                    [--max-streams N]
         ADDR defaults to 127.0.0.1:7373; the container passes 0.0.0.0:7373.
         DUR is like 30m, 6h or 1d. Snapshots go to <db dir>/snapshots by default.
         --debug (or AI_KANBAN_RELAY_DEBUG=1) logs every request, response and stream event,
         bodies included. For watching what clients do, not for a relay left running.
+        --max-streams caps open notification streams; past it new ones get 503 and their
+        clients sync once a minute instead. Default: 85% of the open-file limit.
     Every command takes --db <file> (default: $AI_KANBAN_SERVER_DB, else /data/server.db).
     It never falls back to the personal store.
 
@@ -176,7 +179,8 @@ The relay also takes them by itself, every --snapshot-every, keeping the newest 
 
     {p} health [--listen ADDR]
         Prints ok and exits 0 if the relay answers on ADDR (default 127.0.0.1:7373). The
-        container's health check runs this.
+        container's health check runs this. Inside the container it also prints how many
+        files the relay has open, of how many it may.
 "
         ),
         _ => return None,

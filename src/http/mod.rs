@@ -41,6 +41,13 @@ impl Api {
     pub fn store(&self) -> std::sync::MutexGuard<'_, Store> {
         self.store.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// After a write from the page: publish it now rather than when the poller notices.
+    pub fn wrote(&self) {
+        if let Some(s) = &self.sync {
+            s.kick_now();
+        }
+    }
 }
 
 /// The web UI. Embedded in the binary rather than served from disk: "one file to install"
@@ -102,7 +109,7 @@ pub fn router(api: Api) -> Router {
 /// value is noise, and the moment it accepts others somebody passes `0.0.0.0`.
 pub async fn serve(store: Store, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let (tx, _) = tokio::sync::broadcast::channel(64);
-    stream::spawn_poller(tx.clone());
+    let poke = stream::spawn_poller(tx.clone());
 
     // The same background sync a session runs, so the page is not an island: what is changed
     // here goes out within seconds, and what teammates do arrives -- announced on the room's
@@ -110,7 +117,9 @@ pub async fn serve(store: Store, port: u16) -> Result<(), Box<dyn std::error::Er
     // the page's own or one from elsewhere, is a reason to sync now rather than within the
     // minute. Several processes syncing one store is safe by design (`remote::engine`).
     let rooms = Store::open_default().ok().and_then(|s| s.connected_boards().ok()).unwrap_or_default();
-    let sync = crate::remote::daemon::Syncer::start().map(Arc::new);
+    // A pull that applied a teammate's change wakes the poller, so the page shows it now rather
+    // than on the next tick.
+    let sync = crate::remote::daemon::Syncer::start_with(move || poke.notify_one()).map(Arc::new);
     match sync.clone() {
         Some(sync) => {
             let names = rooms.iter().map(|(_, r)| r.as_str()).collect::<Vec<_>>().join(", ");

@@ -17,6 +17,7 @@ struct Args {
     snapshot_every: Option<String>,
     snapshot_dir: Option<PathBuf>,
     keep: Option<String>,
+    max_streams: Option<String>,
     yes: bool,
     debug: bool,
     all: bool,
@@ -26,7 +27,7 @@ struct Args {
 fn args() -> Result<Args, String> {
     let mut a = Args {
         pos: vec![], db: None, listen: None,
-        snapshot_every: None, snapshot_dir: None, keep: None, yes: false, debug: false, help: false, all: false,
+        snapshot_every: None, snapshot_dir: None, keep: None, max_streams: None, yes: false, debug: false, help: false, all: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -37,6 +38,7 @@ fn args() -> Result<Args, String> {
             "--snapshot-every" => a.snapshot_every = Some(value("--snapshot-every")?),
             "--snapshot-dir" => a.snapshot_dir = Some(PathBuf::from(value("--snapshot-dir")?)),
             "--keep" => a.keep = Some(value("--keep")?),
+            "--max-streams" => a.max_streams = Some(value("--max-streams")?),
             "--yes" => a.yes = true,
             "--debug" => a.debug = true,
             "--all" => a.all = true,
@@ -142,6 +144,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // The variable too, so compose can switch it in `environment:` without
                 // repeating the image's command.
                 debug: a.debug || std::env::var("AI_KANBAN_RELAY_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0"),
+                max_streams: match &a.max_streams {
+                    Some(n) => Some(n.parse().map_err(|_| format!("--max-streams {n:?}: expected a number"))?),
+                    None => None,
+                },
             };
             super::serve(opts).await
         }
@@ -307,6 +313,21 @@ fn forget(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// How close the running relay is to its open-file limit, read from the outside: run inside its
+/// container, where it is process 1. Nothing elsewhere, where process 1 is something else.
+fn relay_load() -> Option<String> {
+    let me = std::env::current_exe().ok()?;
+    if std::fs::read_link("/proc/1/exe").ok()? != me {
+        return None;
+    }
+    let open = std::fs::read_dir("/proc/1/fd").ok()?.count();
+    let limit = super::open_file_limit("1")?;
+    Some(format!(
+        "open files: {open} of {limit}; new notification streams are refused at about {}",
+        limit * super::STREAM_SHARE / 100
+    ))
+}
+
 /// A `HEALTHCHECK` for an image with no shell and no curl: one request with the standard
 /// library, so it needs no HTTP client in the binary.
 fn health(listen: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -320,6 +341,9 @@ fn health(listen: &str) -> Result<(), Box<dyn std::error::Error>> {
     s.read_to_string(&mut buf)?;
     if buf.starts_with("HTTP/1.0 200") || buf.starts_with("HTTP/1.1 200") {
         println!("ok");
+        if let Some(load) = relay_load() {
+            println!("{load}");
+        }
         Ok(())
     } else {
         Err(format!("relay at {addr} answered: {}", buf.lines().next().unwrap_or("nothing")).into())

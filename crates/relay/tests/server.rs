@@ -579,6 +579,38 @@ async fn the_event_stream_ends_when_its_key_is_revoked() {
 // Edge cases
 // ---------------------------------------------------------------------------
 
+/// Past its cap the relay refuses new notification streams with 503 rather than run out of open
+/// files, at which point it answered nobody, pushes and pulls included (scripts/relay-load).
+/// A closed stream frees its place, and pushes go on regardless.
+#[tokio::test]
+async fn past_its_stream_cap_the_relay_refuses_new_streams_but_keeps_taking_pushes() {
+    let f = fixture();
+    let relay = f.relay.clone().with_max_streams(1);
+    join(&f, &f.benny, "sbahn").await;
+    let open = || {
+        let req = Request::builder().uri("/v1/rooms/sbahn/events").header("authorization", format!("Bearer {}", f.benny));
+        router(relay.clone()).oneshot(req.body(Body::empty()).unwrap())
+    };
+
+    let first = open().await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(relay.open_streams(), 1);
+
+    let refused = open().await.unwrap();
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(refused.headers().contains_key("retry-after"), "the client is told when to come back");
+    assert_eq!(refused.headers().get("connection").map(|v| v.to_str().unwrap()), Some("close"), "and its connection does not linger");
+    assert_eq!(relay.open_streams(), 1, "a refused stream is not counted");
+
+    let body = json!({ "changes": [change("b1", 1, task("b1", 1), None, "title", json!("x"))] });
+    let (s, v) = call(&relay, "POST", "/v1/rooms/sbahn/changes", Some(&f.benny), Some(body)).await;
+    assert_eq!(s, StatusCode::OK, "pushes are not streams: {v}");
+
+    drop(first);
+    assert_eq!(relay.open_streams(), 0, "a closed stream frees its place");
+    assert_eq!(open().await.unwrap().status(), StatusCode::OK);
+}
+
 fn db_with_benny() -> (ServerDb, String) {
     let db = ServerDb::open_in_memory().unwrap();
     let key = db.add_key("benny", "b1").unwrap();

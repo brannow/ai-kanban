@@ -53,6 +53,10 @@ pub enum ServerError {
     /// someone else owns.
     #[error("{0}")]
     Conflict(String),
+    /// Too many open notification streams to take another (503): the relay keeps its
+    /// remaining open files for pushes and pulls rather than stop answering everyone.
+    #[error("{0}")]
+    Busy(String),
     #[error("{0}")]
     Other(String),
 }

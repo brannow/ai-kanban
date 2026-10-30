@@ -79,7 +79,14 @@ status() {
 	docker compose ps
 	running
 	echo
-	if relay health >/dev/null 2>&1; then echo "health: ok"; else echo "health: NOT ANSWERING"; fi
+	local health
+	if health=$(relay health 2>/dev/null); then
+		echo "health: ok"
+		# The relay's open files against its limit, when the image is new enough to say.
+		echo "$health" | sed -n 's/^open files: /load:   open files /p'
+	else
+		echo "health: NOT ANSWERING"
+	fi
 	echo "url:    $(url)"
 	if debugging; then echo "debug:  ON -- every request is logged, bodies included ($prog debug off)"; fi
 	echo

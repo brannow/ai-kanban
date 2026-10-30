@@ -7,6 +7,11 @@
 //! minute regardless. The stream only says *that* something changed; the round pulls from its
 //! own cursor, so a missed notification costs a delay, never a change.
 //!
+//! A local kick with nothing waiting to go out runs no round. The page's poller kicks on every
+//! change it sees, its own write's and the ones a pull just applied alike; the write's round has
+//! already sent it, and an announced change already set off its pull. Without the check each
+//! of those was a second round, a pull of nothing that queued the next real change behind it.
+//!
 //! A round set off by a change only moves changes. The checks that guard the room (protocol,
 //! key, high-water marks, a relay restored from a snapshot) and the member list run in a full
 //! round: at startup, after any round that failed, and once a minute. From across the world
@@ -28,7 +33,8 @@ use std::time::{Duration, Instant};
 
 /// The backstop interval: what a session without working notifications still gets.
 const EVERY: Duration = Duration::from_secs(60);
-/// Writes in quick succession (a task_update and its log) go out as one round.
+/// Writes in quick succession (a task_update and its log) go out as one round. Only for kicks
+/// that may be followed by more: an announced change and a finished web request go at once.
 const SETTLE: Duration = Duration::from_millis(300);
 /// The round before a claim runs inside a tool call. No request starts after this budget is
 /// spent, and each is bounded by `CLAIM_REQUEST`, so an unreachable or stalled relay costs the
@@ -43,8 +49,20 @@ const LIVE_FOR: Duration = Duration::from_secs(40);
 /// sent anything at all. An entry exists only while its stream is connected.
 type Live = Arc<Mutex<HashMap<String, (i64, Instant)>>>;
 
+/// Why a round is wanted, which decides how soon it runs and whether it runs at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kick {
+    /// Something local changed, and more may follow: settle first, then publish if there is
+    /// anything to publish.
+    Soon,
+    /// A write that is complete (one web request): publish now, if there is anything to.
+    Now,
+    /// The relay announced a new head: pull now.
+    Announced,
+}
+
 pub struct Syncer {
-    kick: Sender<()>,
+    kick: Sender<Kick>,
     claim: Client,
     live: Live,
 }
@@ -53,11 +71,17 @@ impl Syncer {
     /// Starts syncing in the background if this run may use the network and a remote is set.
     /// `None` otherwise, and then nothing in the session touches the network.
     pub fn start() -> Option<Syncer> {
+        Self::start_with(|| {})
+    }
+
+    /// `start`, calling `applied` after a round applied a teammate's changes to the store: what
+    /// lets the web UI show them at once instead of on its poller's next tick.
+    pub fn start_with(applied: impl Fn() + Send + 'static) -> Option<Syncer> {
         if !config::sync_enabled() {
             return None;
         }
         let cfg = RemoteConfig::load().ok().flatten()?;
-        let (tx, rx) = channel::<()>();
+        let (tx, rx) = channel::<Kick>();
         let background = Client::new(&cfg.url, &cfg.key, Duration::from_secs(30));
         let notify = tx.clone();
         let live: Live = Arc::default();
@@ -75,7 +99,7 @@ impl Syncer {
                 let mut last_full: Option<Instant> = None;
                 loop {
                     let full = !healthy || last_full.is_none_or(|t| t.elapsed() >= EVERY);
-                    healthy = round(&store, &background, &mut watched, &mut named, &notify, &watching, full);
+                    healthy = round(&store, &background, &mut watched, &mut named, &notify, &watching, full, &applied);
                     if full && healthy {
                         last_full = Some(Instant::now());
                     }
@@ -86,14 +110,25 @@ impl Syncer {
                     // round, a session writing every 30s never reached the timer, and the overdue
                     // full round landed on a write's round instead, adding its requests to that
                     // change's trip (smoke run, note #333).
-                    let due = last_full.map_or(Duration::ZERO, |t| EVERY.saturating_sub(t.elapsed()));
-                    match rx.recv_timeout(if healthy { due } else { backoff }) {
-                        Ok(()) => {
-                            std::thread::sleep(SETTLE);
-                            while rx.try_recv().is_ok() {}
+                    loop {
+                        let due = last_full.map_or(Duration::ZERO, |t| EVERY.saturating_sub(t.elapsed()));
+                        match rx.recv_timeout(if healthy { due } else { backoff }) {
+                            Ok(first) => {
+                                if first == Kick::Soon {
+                                    std::thread::sleep(SETTLE);
+                                }
+                                let mut announced = first == Kick::Announced;
+                                while let Ok(k) = rx.try_recv() {
+                                    announced |= k == Kick::Announced;
+                                }
+                                // A failed store retries on any kick, as it always did.
+                                if announced || !healthy || unsent(&store) {
+                                    break;
+                                }
+                            }
+                            Err(RecvTimeoutError::Timeout) => break,
+                            Err(RecvTimeoutError::Disconnected) => return,
                         }
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => return,
                     }
                 }
             })
@@ -103,7 +138,14 @@ impl Syncer {
 
     /// Something was written: publish it soon.
     pub fn kick(&self) {
-        let _ = self.kick.send(());
+        let _ = self.kick.send(Kick::Soon);
+    }
+
+    /// A write is complete and nothing follows it: publish it now. For the web UI, where each
+    /// action is one request; waiting for its poller to notice cost up to 0.4s, and the settle
+    /// another 0.3s, on every change's trip (note #333).
+    pub fn kick_now(&self) {
+        let _ = self.kick.send(Kick::Now);
     }
 
     /// A quick round for one board, on the caller's connection, before an agent claims work or
@@ -138,7 +180,11 @@ impl Syncer {
 
 /// One background round over every connected board. Returns whether the relay was reachable and
 /// sync is allowed. Only a `full` round checks identity and refreshes the member list.
-fn round(store: &Store, client: &Client, watched: &mut HashSet<String>, named: &mut bool, notify: &Sender<()>, live: &Live, full: bool) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn round(
+    store: &Store, client: &Client, watched: &mut HashSet<String>, named: &mut bool, notify: &Sender<Kick>, live: &Live, full: bool,
+    applied: &dyn Fn(),
+) -> bool {
     let boards = store.connected_boards().unwrap_or_default();
     if boards.is_empty() {
         // Nothing to sync yet, but a name from the plugin's settings has to reach the relay
@@ -166,21 +212,32 @@ fn round(store: &Store, client: &Client, watched: &mut HashSet<String>, named: &
         }
     }
     let mut ok = true;
+    let mut arrived = false;
     for (pid, room) in boards {
-        let synced = if full { sync_board(store, client, pid) } else { sync_board_changes(store, client, pid) };
-        if synced.is_err() {
-            ok = false;
+        match if full { sync_board(store, client, pid) } else { sync_board_changes(store, client, pid) } {
+            Ok(s) => arrived |= s.applied > 0,
+            Err(_) => ok = false,
         }
         if watched.insert(room.clone()) {
             watch(client.clone(), room, notify.clone(), live.clone());
         }
     }
+    if arrived {
+        applied();
+    }
     ok
+}
+
+/// Whether anything local is waiting to go out. Flushes first, so a write not yet turned into
+/// changes counts. An error counts as yes: a round is the safe answer.
+fn unsent(store: &Store) -> bool {
+    let _ = store.flush();
+    store.has_unsent().unwrap_or(true)
 }
 
 /// Follows one room's notification stream for the life of the process, reconnecting with
 /// backoff, and turns every announced head into a round.
-fn watch(client: Client, room: String, notify: Sender<()>, live: Live) {
+fn watch(client: Client, room: String, notify: Sender<Kick>, live: Live) {
     let _ = std::thread::Builder::new().name(format!("ai-kanban-watch-{room}")).spawn(move || {
         let mut backoff = Duration::from_secs(5);
         loop {
@@ -191,7 +248,7 @@ fn watch(client: Client, room: String, notify: Sender<()>, live: Live) {
                 match head {
                     Some(h) => {
                         l.insert(room.clone(), (h, Instant::now()));
-                        alive = notify.send(()).is_ok();
+                        alive = notify.send(Kick::Announced).is_ok();
                     }
                     // A heartbeat: still connected. Before the first head there is nothing to
                     // vouch for yet.

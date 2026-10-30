@@ -409,12 +409,22 @@ is set and the run allows sync.
 - **In `serve`** every change the page's live stream sees -- the page's own, the CLI's, an applied
   one -- kicks a round, so the page is as quick both ways as a session (`tests/remote_cli.rs`,
   `the_web_ui_syncs_both_ways_without_a_session`). It prints `sync: on` or `sync: off` at start.
+  A write from the page does not wait for that: its request kicks the round itself, with no
+  settle, since one action is one request (the poller's 0-0.4s and the settle's 0.3s were both on
+  every change's trip). And a round that applied a teammate's change wakes the page's poller, so
+  the page shows it at once instead of on the next tick.
 
 - **At startup**, in the background: never in the way of the session starting.
-- **Shortly after every write** the agent makes: writes in quick succession go out as one round.
+- **Shortly after every write** the agent makes: writes in quick succession go out as one round
+  (a 0.3s settle).
+- **Not when there is nothing to send.** A local kick (a write, the page's poller) with an empty
+  outbox runs no round. The poller kicks on every change it sees, including the write the last
+  round already sent and the pull it just applied; each of those used to be a second round that
+  pulled nothing and queued the next real change behind it. A failed store still retries on any
+  kick.
 - **When a teammate pushes.** One SSE stream per connected room (`rooms/{r}/events`) carries only
-  "room changed, head N", plus a heartbeat every 30s. Each notification triggers a round that pulls
-  from the board's own cursor. SSE rather than WebSocket, because only server -> client is needed,
+  "room changed, head N", plus a heartbeat every 30s. Each notification triggers a round at once,
+  with no settle, that pulls from the board's own cursor. SSE rather than WebSocket, because only server -> client is needed,
   it is plain HTTP, and the codebase already serves SSE. Behind nginx it needs `proxy_buffering
   off` and a `proxy_read_timeout` above 30s. Streams reconnect with backoff.
 - **Every 60s regardless.** Streams drop, laptops sleep, proxies cut idle connections, and a missed
@@ -650,6 +660,14 @@ docker exec kanban ai-kanban-relay key add benny laptop   # prints the key once,
   stream in its room in under 10ms. Docker's default soft limit of 1024 open files is the ceiling,
   and a relay that reaches it stops answering everyone, not only the newest stream -- hence
   `ulimits: nofile` in the compose file (`--ulimit` above).
+- **Past 85% of that limit, new streams are refused** (503, `Retry-After`, connection closed),
+  so the rest stays for pushes and pulls: degraded, not down. A refused client backs off and keeps
+  syncing on its writes and once a minute; it learns of teammates' changes within a minute instead
+  of at once. The relay logs once when it starts refusing and once when it accepts again, and
+  prints the cap at start; `--max-streams N` sets it where the limit cannot be read (it is read
+  from `/proc`, so Linux only). On the server `./kanban` shows `open files X of Y`. Measured with a
+  limit of 1024 and the cap at 870: 1000 streams asked, 870 open, 130 refused, pushes still reached
+  every stream in under 10ms. `crates/relay/src/lib.rs` (`Streams`).
 - **`--debug`** (or `AI_KANBAN_RELAY_DEBUG=1`; on the server `./kanban debug on|off`) logs every
   request, response and event-stream message, one line each: `HH:MM:SS.mmm #<n> > GET /v1/... user/tag
   <bytes> <body>`, then `#<n> < 200 3ms ...`, and for a stream `sse open`, each `sse head N`, `sse

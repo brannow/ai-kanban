@@ -30,6 +30,7 @@ use axum::{middleware, Json, Router};
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 pub use store::{Principal, ServerDb, ServerError};
@@ -41,6 +42,14 @@ pub(crate) const BODY_LIMIT: usize = 8 * 1024 * 1024;
 /// Empty rooms are removed after this long.
 pub const EMPTY_ROOM_AGE: i64 = 7 * 24 * 3600;
 
+/// The share of the open-file limit notification streams may hold, in percent. Each stream is
+/// one open connection for as long as a session or page runs; at the limit the relay could not
+/// accept anything, pushes and pulls included, and stayed that way (scripts/relay-load). The
+/// rest is for those requests, the database and the proxy's pooled connections.
+pub const STREAM_SHARE: usize = 85;
+/// What a refused stream is told to wait. Clients back off on their own anyway.
+const BUSY_RETRY_AFTER: &str = "60";
+
 #[derive(Clone)]
 pub struct Relay {
     pub db: Arc<Mutex<ServerDb>>,
@@ -49,11 +58,66 @@ pub struct Relay {
     /// Every room's head and who may see it, polled once for all notification streams
     /// (`heads.rs`).
     heads: heads::Heads,
+    streams: Arc<Streams>,
+}
+
+/// How many notification streams are open, and how many may be.
+#[derive(Default)]
+struct Streams {
+    open: AtomicUsize,
+    max: Option<usize>,
+    /// Whether the last stream that asked was refused: the log says so once per stretch, not
+    /// once per client retrying.
+    refusing: AtomicBool,
+}
+
+/// One open stream, counted for as long as it lives.
+struct OpenStream(Arc<Streams>);
+
+impl Drop for OpenStream {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Streams {
+    fn open(self: &Arc<Self>) -> Result<OpenStream, ServerError> {
+        let n = self.open.fetch_add(1, Ordering::Relaxed) + 1;
+        let guard = OpenStream(self.clone());
+        match self.max {
+            Some(max) if n > max => {
+                drop(guard);
+                if !self.refusing.swap(true, Ordering::Relaxed) {
+                    eprintln!("busy: {max} notification streams open, the most allowed; refusing new ones (503) until some close");
+                }
+                // Degraded, not down: a refused client still syncs, on its own writes and once a
+                // minute, and asks for a stream again after a backoff.
+                Err(ServerError::Busy(format!("the relay has {max} notification streams open, its most; try again later")))
+            }
+            _ => {
+                if self.refusing.swap(false, Ordering::Relaxed) {
+                    println!("busy no more: accepting notification streams again");
+                }
+                Ok(guard)
+            }
+        }
+    }
 }
 
 impl Relay {
     pub fn new(db: ServerDb) -> Self {
-        Self { db: Arc::new(Mutex::new(db)), trace: None, heads: heads::Heads::default() }
+        Self { db: Arc::new(Mutex::new(db)), trace: None, heads: heads::Heads::default(), streams: Arc::default() }
+    }
+
+    /// At most `max` notification streams open at once; new ones above it are refused (503).
+    pub fn with_max_streams(mut self, max: usize) -> Self {
+        self.streams = Arc::new(Streams { max: Some(max), ..Streams::default() });
+        self
+    }
+
+    /// Notification streams open right now.
+    pub fn open_streams(&self) -> usize {
+        self.streams.open.load(Ordering::Relaxed)
     }
 
     pub fn with_trace(mut self, sink: debug::Sink) -> Self {
@@ -131,10 +195,18 @@ impl IntoResponse for ServerError {
             ServerError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             ServerError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             ServerError::UpgradeRequired(_) => (StatusCode::UPGRADE_REQUIRED, "upgrade_required"),
+            ServerError::Busy(_) => (StatusCode::SERVICE_UNAVAILABLE, "busy"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "error"),
         };
         let body = serde_json::json!({ "error": { "code": code, "message": self.to_string() } });
-        (status, Json(body)).into_response()
+        let mut res = (status, Json(body)).into_response();
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            res.headers_mut().insert(header::RETRY_AFTER, header::HeaderValue::from_static(BUSY_RETRY_AFTER));
+            // Kept alive, the refused connection would go on holding the open file the refusal
+            // is there to save.
+            res.headers_mut().insert(header::CONNECTION, header::HeaderValue::from_static("close"));
+        }
+        res
     }
 }
 
@@ -242,13 +314,16 @@ async fn events(
 ) -> Result<impl IntoResponse, ServerError> {
     let p = r.auth(&headers)?;
     let (room_id, head) = r.db().member_head(&room, &p)?;
+    let open = r.streams.open()?;
     let log = r.trace.clone().zip(traced).map(|(sink, Extension(t))| debug::StreamLog::new(sink, t.0, &format!("{}/{}", p.user, p.tag), &room));
     let key_id = p.key_id;
     let mut snapshots = r.heads.subscribe(&r.db);
     let connected = std::time::Instant::now();
     let stream = async_stream::stream! {
-        // Moved in, so it is dropped -- and logs the close -- with the stream.
+        // Moved in, so they are dropped with the stream: the log records the close, and the
+        // count goes down.
         let mut log = log;
+        let _open = open;
         let mut last = head;
         if let Some(l) = &log { l.head(last) }
         yield Ok::<_, Infallible>(SseEvent::default().event("head").data(last.to_string()));
@@ -290,11 +365,27 @@ pub struct Options {
     pub keep: usize,
     /// Log every request and stream event (`debug.rs`).
     pub debug: bool,
+    /// Notification streams allowed at once. None: `STREAM_SHARE` of the open-file limit,
+    /// where the system says what it is.
+    pub max_streams: Option<usize>,
+}
+
+/// The soft limit on open files, where it can be read without a dependency: Linux, which is
+/// where the relay runs (its container).
+pub fn open_file_limit(pid: &str) -> Option<usize> {
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).ok()?;
+    let line = limits.lines().find(|l| l.starts_with("Max open files"))?;
+    line.split_whitespace().nth(3)?.parse().ok()
 }
 
 pub async fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let db = ServerDb::open(&opts.db)?;
     let mut relay = Relay::new(db);
+    let limit = open_file_limit("self");
+    let max_streams = opts.max_streams.or(limit.map(|l| l * STREAM_SHARE / 100));
+    if let Some(max) = max_streams {
+        relay = relay.with_max_streams(max);
+    }
     if opts.debug {
         relay = relay.with_trace(debug::stdout());
     }
@@ -307,6 +398,11 @@ pub async fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     match opts.snapshot_every {
         Some(s) => println!("snapshots: every {}s into {}, keeping {}", s, opts.snapshot_dir.display(), opts.keep),
         None => println!("snapshots: off (pass --snapshot-every)"),
+    }
+    match (max_streams, limit) {
+        (Some(m), _) if opts.max_streams.is_some() => println!("streams: at most {m} (--max-streams)"),
+        (Some(m), Some(l)) => println!("streams: at most {m} ({STREAM_SHARE}% of the open-file limit, {l})"),
+        _ => println!("streams: no limit known (pass --max-streams)"),
     }
     if opts.debug {
         println!("debug: logging every request, response and stream event, bodies included -- turn it off when done");

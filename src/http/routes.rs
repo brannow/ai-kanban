@@ -549,6 +549,7 @@ pub async fn create_task(
         }
     };
     let version = task.version;
+    api.wrote();
     Ok((StatusCode::CREATED, etag(version), Json(json!({ "task": task }))))
 }
 
@@ -586,6 +587,7 @@ pub async fn update_task(
     };
     let task = store.update_task(project.id, t, patch)?;
     let version = task.version;
+    api.wrote();
     Ok((etag(version), Json(json!({ "task": task }))))
 }
 
@@ -597,6 +599,7 @@ pub async fn forget_task(
     let store = api.store();
     let project = resolve(&store, &p)?;
     store.forget_task(project.id, t)?;
+    api.wrote();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -788,6 +791,7 @@ pub async fn create_note(
         Actor::User,
     )?;
     let version = note.version;
+    api.wrote();
     Ok((StatusCode::CREATED, etag(version), Json(json!({ "note": note }))))
 }
 
@@ -810,6 +814,7 @@ pub async fn update_note(
         },
     )?;
     let version = note.version;
+    api.wrote();
     Ok((etag(version), Json(json!({ "note": note }))))
 }
 
@@ -819,6 +824,7 @@ pub async fn forget_note(
     let store = api.store();
     let project = resolve(&store, &p)?;
     store.forget_note(project.id, n)?;
+    api.wrote();
     Ok(StatusCode::NO_CONTENT)
 }
 

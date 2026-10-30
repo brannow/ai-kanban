@@ -35,6 +35,7 @@ for r in range(R):
 sel = selectors.DefaultSelector()
 streams = {}  # sock -> [room, buffer, last head]
 failed = 0
+busy = 0  # answered 503: the relay's stream cap, not a failure
 for i in range(N):
     room = f"r{i % R}"
     try:
@@ -42,12 +43,13 @@ for i in range(N):
         s.sendall(f"GET /v1/rooms/{room}/events HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {key}\r\n\r\n".encode())
         s.setblocking(False)
         sel.register(s, selectors.EVENT_READ)
-        streams[s] = [room, b"", None]
+        streams[s] = [room, b"", None, False]
     except OSError:
         failed += 1
 
 def pump(until, want=None):
     """Read streams until `until`; with `want` (room, head), return the time all of that room's streams saw it."""
+    global busy
     while time.monotonic() < until:
         for k, _ in sel.select(timeout=0.05):
             s = k.fileobj
@@ -55,10 +57,13 @@ def pump(until, want=None):
                 data = s.recv(65536)
             except OSError:
                 data = b""
+            st = streams[s]
+            if data.startswith(b"HTTP/1.1 503"):
+                st[3] = True
             if not data:
+                busy += st[3]
                 sel.unregister(s); s.close(); del streams[s]
                 continue
-            st = streams[s]
             st[1] += data
             for m in re.finditer(rb"data: (\d+)", st[1]):
                 st[2] = int(m.group(1))
@@ -86,5 +91,5 @@ for k in range(5):
     done = pump(time.monotonic() + 5, ("r0", target))
     lat.append(None if done is None else (done - t0) * 1000)
 
-print(f"N={N} rooms={R}: connected {alive}/{N} (refused {failed}, dropped {N - failed - alive}), "
+print(f"N={N} rooms={R}: connected {alive}/{N} (busy 503 {busy}, failed {failed}, dropped {N - failed - alive - busy}), "
       f"idle cpu {idle_cpu:.0f}%, fds {fd_count}, push->all r0 streams ms {[None if x is None else round(x) for x in lat]}", flush=True)

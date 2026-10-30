@@ -5,8 +5,10 @@
 #   scripts/relay-load [N ...]        default 100 300 600 900, over 10 rooms
 #
 # Each N gets a fresh local relay on this checkout's build, limited to 1024 open files: Docker's
-# default soft limit, which the deployed relay has unless its compose file raises it. Above it the
-# relay stops answering everyone, which the probe shows as a failed run.
+# default soft limit, which the deployed relay has unless its compose file raises it. At that
+# limit a relay stops answering everyone. On Linux it caps its streams below it by itself (85%);
+# here it cannot read the limit, so RELAY_LOAD_MAX_STREAMS=870 shows the cap: streams past it are
+# counted as "busy 503", and pushes keep working. Unset, the probe shows the uncapped relay.
 #
 # Every Claude session and every open web UI holds one stream per shared room, so 100 people are
 # roughly 300-600 streams. Measured numbers and what they changed: note #333, docs/sync.md
@@ -22,7 +24,7 @@ cargo build --release -q --manifest-path "$repo/Cargo.toml" -p ai-kanban-relay |
 for n in "$@"; do
 	dir=$(mktemp -d)
 	key=$("$bin" --db "$dir/r.db" key add load | awk '/Team relay key/ {print $NF}')
-	(ulimit -n 1024; exec "$bin" --db "$dir/r.db" --listen 127.0.0.1:$port >"$dir/relay.log" 2>&1) &
+	(ulimit -n 1024; exec "$bin" --db "$dir/r.db" --listen 127.0.0.1:$port ${RELAY_LOAD_MAX_STREAMS:+--max-streams $RELAY_LOAD_MAX_STREAMS} >"$dir/relay.log" 2>&1) &
 	relay=$!
 	sleep 1
 	python3 -I "$repo/scripts/relay-load.py" $port "$key" $relay "$n" 10 2>&1 | tail -1

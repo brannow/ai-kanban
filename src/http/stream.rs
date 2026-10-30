@@ -37,8 +37,9 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 
 /// How often the store is checked. Fast enough that a board feels live, slow enough that an
 /// idle server is doing nothing measurable.
@@ -61,11 +62,19 @@ pub struct Change {
 /// that mutex four times a second would contend with every request handler, and worse: a read
 /// transaction held here is a transaction an agent's `task_add` in another process waits on
 /// through `busy_timeout`. A viewer must never slow down the thing being viewed.
-pub fn spawn_poller(tx: broadcast::Sender<Change>) {
+///
+/// Returns a handle that makes it look now instead of at the next tick: for a write this
+/// process knows about, such as a pull its sync just applied.
+pub fn spawn_poller(tx: broadcast::Sender<Change>) -> Arc<Notify> {
+    let poke = Arc::new(Notify::new());
+    let woken = poke.clone();
     tokio::spawn(async move {
         let mut last: Option<i64> = None;
         loop {
-            tokio::time::sleep(POLL).await;
+            tokio::select! {
+                _ = tokio::time::sleep(POLL) => {}
+                _ = woken.notified() => {}
+            }
             // Reopened per tick, deliberately: the store may not exist yet, may be replaced,
             // and every failure here must be survivable rather than ending the task. Opening
             // a SQLite connection is cheap; a dead poller is not recoverable without a restart.
@@ -92,6 +101,7 @@ pub fn spawn_poller(tx: broadcast::Sender<Change>) {
             let _ = tx.send(Change { cursor, projects });
         }
     });
+    poke
 }
 
 #[derive(Debug, Deserialize)]
