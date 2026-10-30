@@ -79,6 +79,8 @@ make install-dev                # plugin running this checkout's build, so a glo
 make where                      # every path an install would touch
 cargo run -p ai-kanban-relay -- --db /tmp/r.db --debug   # the sync relay, logging all traffic
 scripts/kanban-test claude b2   # a second client next to yours: own store, config, this build
+scripts/sync-smoke run          # web UI to web UI through the real relay, timed (setup: see header)
+scripts/relay-load              # what N notification streams cost a local relay: CPU, files, latency
 ```
 
 **Set `AI_KANBAN_DB` when running anything by hand.** Without it you are writing to your real

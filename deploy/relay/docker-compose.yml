@@ -10,6 +10,12 @@ services:
     # this the relay stops at once with "unable to open database file".
     user: "1000:1000"
     restart: unless-stopped
+    # Every notification stream holds a connection, and every Claude session and web UI holds
+    # one per shared room: 100 people are ~300-600. Docker's default soft limit of 1024 open
+    # files leaves little room, and a relay that hits it stops answering everyone, not just the
+    # newest stream (load test, note #333).
+    ulimits:
+      nofile: 65536
     command: ["--listen", "0.0.0.0:7373", "--snapshot-every", "6h", "--keep", "28"]
     environment:
       # `./kanban debug on|off` sets KANBAN_DEBUG: every request, response and stream event

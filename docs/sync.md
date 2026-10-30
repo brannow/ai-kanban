@@ -614,11 +614,15 @@ ai-kanban-relay snapshot                              # also scheduled: --snapsh
   for a key of its own (a new tag). As a second net, a `cid` that arrives again with different content is refused.
 - **Bind:** `--listen` defaults to `127.0.0.1:7373`. The container passes `0.0.0.0:7373`. `hello`
   is the only route without a key.
-- **SSE notifications come from polling** `MAX(seq)` per room once a second, for the same reason
-  `src/http/stream.rs` polls: admin commands run in another process (`docker exec`), and an admin
-  forget must notify too. **A push wakes every stream at once** on top of that, so a teammate's
-  change is not held for up to a second at the relay (`a_push_wakes_the_event_stream_...`); the
-  tick remains for what no handler sees.
+- **SSE notifications come from polling**, for the same reason `src/http/stream.rs` polls: admin
+  commands run in another process (`docker exec`), and an admin forget must notify too. **One
+  poller for the whole relay** (`crates/relay/src/heads.rs`), once a second: every room's head and
+  which keys may still see each, published only when something changed; each stream compares in
+  memory. A stream polling for itself made an idle relay's work grow with its listeners (900
+  streams: 1.5 cores of a laptop doing nothing; now 0). **A push pokes the poller**, so a
+  teammate's change is not held for up to a second (`a_push_wakes_the_event_stream_...`). Access
+  is re-checked on every change, as every other route checks it per request, so a revoked key or
+  a left room ends its stream within a second.
 
 ### Running the relay
 
@@ -627,7 +631,7 @@ The image is built by `Dockerfile` and published by `.github/workflows/relay-ima
 `:latest` from a `v1.2.3` tag.
 
 ```
-docker run -d --name kanban --restart unless-stopped \
+docker run -d --name kanban --restart unless-stopped --ulimit nofile=65536 \
   -v kanban-data:/data -p 127.0.0.1:7373:7373 ghcr.io/<owner>/ai-kanban-relay:latest
 docker exec kanban ai-kanban-relay key add benny laptop   # prints the key once, with a message to send
 ```
@@ -640,6 +644,12 @@ docker exec kanban ai-kanban-relay key add benny laptop   # prints the key once,
   binary (`crates/relay/src/pages.rs`), so they match the running image; the helper passes the
   name it was called by and the public URL (`AI_KANBAN_RELAY_AS`, `AI_KANBAN_RELAY_URL`). It wraps `docker compose exec`, because the image has
   no shell or sqlite3 to administer it with otherwise.
+- **Capacity: open files, not CPU.** Every notification stream holds a connection, and every
+  Claude session and web UI holds one per shared room, so 100 people are roughly 300-600 streams.
+  Measured on a laptop (`scripts/relay-load`): 900 streams idle at 0% CPU, a push reaches every
+  stream in its room in under 10ms. Docker's default soft limit of 1024 open files is the ceiling,
+  and a relay that reaches it stops answering everyone, not only the newest stream -- hence
+  `ulimits: nofile` in the compose file (`--ulimit` above).
 - **`--debug`** (or `AI_KANBAN_RELAY_DEBUG=1`; on the server `./kanban debug on|off`) logs every
   request, response and event-stream message, one line each: `HH:MM:SS.mmm #<n> > GET /v1/... user/tag
   <bytes> <body>`, then `#<n> < 200 3ms ...`, and for a stream `sse open`, each `sse head N`, `sse
@@ -658,6 +668,11 @@ docker exec kanban ai-kanban-relay key add benny laptop   # prints the key once,
   `kanban-test cli <name> remote <url> --key K --name N`, with a key of its own (`./kanban key
   add <label>`). On a freshly wiped relay the high-water check would not catch a shared key, since
   both stores start at zero.
+- **Measuring:** `scripts/sync-smoke` times the trip a person sees -- a task created in one web UI
+  until another returns it -- with two clients on this machine and the team's relay, so the round
+  trips are real. `scripts/relay-load` opens N streams against a local relay limited to 1024 open
+  files and reports CPU, files and push latency. Both are run by hand, not in CI: one needs the real
+  relay, the other a quiet machine. Their numbers, and what they changed: note #333.
 - **History says who.** A teammate's history entries carry the tag of the machine that wrote
   them (`sync_ids`), named by the room's member list as the person is called now: `volker:`
   for their agent, `volker (by hand):` for what they did themselves, their tag once they left.

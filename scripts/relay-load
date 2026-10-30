@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# relay-load -- what N open notification streams cost a relay: CPU while idle, open files, and how
+# fast a push reaches every stream in its room.
+#
+#   scripts/relay-load [N ...]        default 100 300 600 900, over 10 rooms
+#
+# Each N gets a fresh local relay on this checkout's build, limited to 1024 open files: Docker's
+# default soft limit, which the deployed relay has unless its compose file raises it. Above it the
+# relay stops answering everyone, which the probe shows as a failed run.
+#
+# Every Claude session and every open web UI holds one stream per shared room, so 100 people are
+# roughly 300-600 streams. Measured numbers and what they changed: note #333, docs/sync.md
+# ("Capacity").
+set -uo pipefail
+
+repo=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+bin=$repo/target/release/ai-kanban-relay
+port=7390
+cargo build --release -q --manifest-path "$repo/Cargo.toml" -p ai-kanban-relay || exit 1
+[ $# -gt 0 ] || set -- 100 300 600 900
+
+for n in "$@"; do
+	dir=$(mktemp -d)
+	key=$("$bin" --db "$dir/r.db" key add load | awk '/Team relay key/ {print $NF}')
+	(ulimit -n 1024; exec "$bin" --db "$dir/r.db" --listen 127.0.0.1:$port >"$dir/relay.log" 2>&1) &
+	relay=$!
+	sleep 1
+	python3 -I "$repo/scripts/relay-load.py" $port "$key" $relay "$n" 10 2>&1 | tail -1
+	kill $relay 2>/dev/null; wait $relay 2>/dev/null
+	rm -rf "$dir"
+done

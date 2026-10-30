@@ -71,6 +71,12 @@ impl Client {
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
             .timeout_connect(Some(timeout.min(Duration::from_secs(5))))
+            // ureq drops an idle connection after 15s by default, and from across the world a
+            // new one costs ~0.55s (TCP + TLS) on top of the request, so a change after a quiet
+            // spell paid it on both sides. Past the daemon's 60s full round the connection stays
+            // open for good; below the 180s a proxy commonly keeps an idle one (Traefik's
+            // default). One closed earlier is noticed before reuse and replaced (note #333).
+            .max_idle_age(Duration::from_secs(90))
             .http_status_as_error(false)
             // Which ai-kanban this is, for the relay's admin (`key list`) and for the relay to
             // refuse one too old for it.

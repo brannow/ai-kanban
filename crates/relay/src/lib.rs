@@ -16,6 +16,7 @@
 
 pub mod admin;
 pub mod debug;
+pub mod heads;
 pub mod pages;
 pub mod store;
 
@@ -37,12 +38,6 @@ pub use store::{Principal, ServerDb, ServerError};
 /// full batch and still refuses a client gone wrong before it is parsed.
 pub(crate) const BODY_LIMIT: usize = 8 * 1024 * 1024;
 
-/// How often each notification stream checks its room when nothing woke it. A push to this
-/// relay wakes every stream at once (`Relay::pushed`); the tick is for what no handler sees:
-/// `docker exec` admin commands write from another process. One indexed `MAX(seq)` per second
-/// is the cheapest thing that sees those.
-const POLL: Duration = Duration::from_secs(1);
-
 /// Empty rooms are removed after this long.
 pub const EMPTY_ROOM_AGE: i64 = 7 * 24 * 3600;
 
@@ -51,16 +46,14 @@ pub struct Relay {
     pub db: Arc<Mutex<ServerDb>>,
     /// Set by `--debug`: where every request and stream event is written (`debug.rs`).
     pub trace: Option<debug::Sink>,
-    /// Bumped after every push, so a stream looks at its room now rather than at its next tick:
-    /// for clients far from the relay that tick was up to a second of every change's trip
-    /// (note #333). A counter in a `watch` rather than a `Notify`, because a stream busy with
-    /// its query when the push lands still sees the bump on its next wait.
-    pushed: Arc<tokio::sync::watch::Sender<u64>>,
+    /// Every room's head and who may see it, polled once for all notification streams
+    /// (`heads.rs`).
+    heads: heads::Heads,
 }
 
 impl Relay {
     pub fn new(db: ServerDb) -> Self {
-        Self { db: Arc::new(Mutex::new(db)), trace: None, pushed: Arc::new(tokio::sync::watch::Sender::new(0)) }
+        Self { db: Arc::new(Mutex::new(db)), trace: None, heads: heads::Heads::default() }
     }
 
     pub fn with_trace(mut self, sink: debug::Sink) -> Self {
@@ -214,8 +207,9 @@ async fn push(
 ) -> ApiResult<protocol::Pushed> {
     let p = r.auth(&headers)?;
     let pushed = r.db().push(&room, &p, &body.changes)?;
-    // After the commit, so a woken stream's own connection already sees the new head.
-    r.pushed.send_modify(|n| *n = n.wrapping_add(1));
+    // After the commit, so the poll it sets off already sees the new head. Without it the
+    // change waited for the next tick: up to a second of every change's trip (note #333).
+    r.heads.poke();
     Ok(Json(pushed))
 }
 
@@ -249,37 +243,28 @@ async fn events(
     let p = r.auth(&headers)?;
     let (room_id, head) = r.db().member_head(&room, &p)?;
     let log = r.trace.clone().zip(traced).map(|(sink, Extension(t))| debug::StreamLog::new(sink, t.0, &format!("{}/{}", p.user, p.tag), &room));
-    let (tag, key_id) = (p.tag.clone(), p.key_id);
-    // Its own connection, opened per tick, like `http::stream`: a reader polling through the
-    // shared mutex would contend with every push. In-memory databases (tests) have no path, so
-    // they fall back to the shared handle.
-    let path: Option<PathBuf> = r.db().path().map(PathBuf::from);
-    let db = r.db.clone();
-    let mut pushed = r.pushed.subscribe();
+    let key_id = p.key_id;
+    let mut snapshots = r.heads.subscribe(&r.db);
+    let connected = std::time::Instant::now();
     let stream = async_stream::stream! {
         // Moved in, so it is dropped -- and logs the close -- with the stream.
         let mut log = log;
         let mut last = head;
         if let Some(l) = &log { l.head(last) }
         yield Ok::<_, Infallible>(SseEvent::default().event("head").data(last.to_string()));
-        loop {
-            // A push to any room wakes every stream; each checks only its own, so a wake for
-            // another room costs one query and sends nothing. The relay keeps the sender for
-            // its whole life, so `changed` does not fail; if it did, the pattern would not
-            // match and the tick alone would go on.
-            tokio::select! {
-                _ = tokio::time::sleep(POLL) => {}
-                Ok(()) = pushed.changed() => {}
-            }
-            let now = match &path {
-                Some(path) => rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                    .ok()
-                    .and_then(|c| head_if_allowed(&c, room_id, &tag, key_id)),
-                None => db.lock().ok().and_then(|d| head_if_allowed(&d.conn, room_id, &tag, key_id)),
-            };
-            // None means the room was deleted, or the key, the user or the membership is gone:
-            // end the stream, and the client's next request says which.
+        // Woken only when a poll saw something change, in any room: checking ours is a lookup.
+        while snapshots.changed().await.is_ok() {
+            let snap = snapshots.borrow_and_update().clone();
+            // Access is checked on every change, like every other route checks it per request:
+            // a stream must not outlive a revoked key, a left room or a deleted one. Only on a
+            // poll that started after this stream connected, though; an older one may predate
+            // the join this stream rests on.
+            let now = snap.heads.get(&room_id).copied().filter(|_| snap.allowed.contains(&(room_id, key_id)));
             let Some(now) = now else {
+                if snap.taken < connected {
+                    continue;
+                }
+                // The client's next request says which.
                 if let Some(l) = &mut log { l.why = "access gone (room, membership, key or user)" }
                 break;
             };
@@ -293,27 +278,6 @@ async fn events(
     // The keep-alive comment doubles as the heartbeat the design promises: it keeps proxies
     // from cutting an idle stream, and its absence tells the client the stream is dead.
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30))))
-}
-
-/// The room's head, if the stream may still see it. Checked on every tick rather than once at
-/// connect, because every other route checks access per request: a stream that outlived a
-/// revoked key or a left room would be the one route that doesn't.
-fn head_if_allowed(conn: &rusqlite::Connection, room_id: i64, tag: &str, key_id: i64) -> Option<i64> {
-    let allowed: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM members m
-                             JOIN keys k ON k.tag = m.tag
-                            WHERE m.room_id = ?1 AND m.tag = ?2 AND m.left_at IS NULL
-                              AND k.id = ?3 AND k.revoked_at IS NULL)",
-            rusqlite::params![room_id, tag, key_id],
-            |r| r.get(0),
-        )
-        .ok()?;
-    if !allowed {
-        return None;
-    }
-    conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM changes WHERE room_id = ?1", [room_id], |r| r.get(0))
-        .ok()
 }
 
 /// How the relay runs.

@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# sync-smoke -- how long a task created in one web UI takes to show in another, through a real relay.
+#
+# Two clients on this machine, each a store of its own and `ai-kanban serve` on this checkout's
+# build, share one room. A task is created through A's web API; the clock stops when B's web API
+# returns it with A's title and body. That is the whole trip a person sees: A's sync, the relay,
+# B's notification stream, B's sync, B's page. Note #333 has what each part costs.
+#
+# Why two clients here rather than two machines: the trip is dominated by the round trips to the
+# relay, which are the same from one machine. Why a relay of the team's own rather than a local
+# one: those round trips are what is being measured.
+#
+#   1. on the relay: ./kanban key add "smoke A"   and   ./kanban key add "smoke B"
+#   2. scripts/sync-smoke setup <relay url> <key A> <key B>
+#   3. scripts/sync-smoke run [<gap>:<runs> ...]    default 5.3:6 23.3:8
+#
+# A gap under 15s measured connections kept open, a longer one what a quiet spell costs. Gaps that
+# are not whole seconds keep the runs from landing on the same point of the relay's 1s poll.
+#
+# The clients live in $AI_KANBAN_SMOKE_HOME (default ~/.ai-kanban-smoke) and are reused: a key is
+# tied to the store that first published with it, so a fresh store would need fresh keys.
+# `reset` deletes them; the relay keeps the room and keys until removed there:
+#   ./kanban room delete <room> --yes ; ./kanban key revoke <id> ; ./kanban key delete <id>
+set -euo pipefail
+
+repo=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+home=${AI_KANBAN_SMOKE_HOME:-$HOME/.ai-kanban-smoke}
+bin=${AI_KANBAN_SMOKE_BIN:-$repo/target/release/ai-kanban}
+port_a=7381 port_b=7382
+
+# Never the plugin's relay settings or another remote from the environment: only what setup saved.
+unset AI_KANBAN_PLUGIN_RELAY_URL AI_KANBAN_PLUGIN_RELAY_KEY AI_KANBAN_PLUGIN_RELAY_NAME AI_KANBAN_SERVER_URL AI_KANBAN_SERVER_KEY AI_KANBAN_SYNC
+a() { AI_KANBAN_DB=$home/a/kanban.db "$bin" "$@"; }
+b() { AI_KANBAN_DB=$home/b/kanban.db "$bin" "$@"; }
+
+case "${1:-}" in
+	setup)
+		[ $# -eq 4 ] || { echo "usage: sync-smoke setup <relay url> <key A> <key B>" >&2; exit 2; }
+		[ ! -e "$home" ] || { echo "sync-smoke: $home exists; run, or reset first" >&2; exit 1; }
+		cargo build --release -q --manifest-path "$repo/Cargo.toml" -p ai-kanban
+		mkdir -p "$home/a" "$home/b"
+		room=smoke-$(date +%s)
+		a remote "$2" --key "$3" --name smoke-a
+		b remote "$2" --key "$4" --name smoke-b
+		a board add smoke
+		a room connect "$room" --board smoke --yes
+		b room connect "$room" --new-board --yes
+		echo "$room" >"$home/room"
+		echo "Ready: room $room. Now: scripts/sync-smoke run"
+		;;
+	run)
+		shift
+		[ -f "$home/room" ] || { echo "sync-smoke: not set up; see the top of this script" >&2; exit 1; }
+		[ $# -gt 0 ] || set -- 5.3:6 23.3:8
+		[ -n "${AI_KANBAN_SMOKE_BIN:-}" ] || cargo build --release -q --manifest-path "$repo/Cargo.toml" -p ai-kanban
+		AI_KANBAN_DB=$home/a/kanban.db "$bin" serve --port $port_a >"$home/a/serve.log" 2>&1 &
+		pa=$!
+		AI_KANBAN_DB=$home/b/kanban.db "$bin" serve --port $port_b >"$home/b/serve.log" 2>&1 &
+		pb=$!
+		trap 'kill $pa $pb 2>/dev/null || true' EXIT
+		# Both clients' startup rounds, and their notification streams connected.
+		sleep 6
+		python3 -I "$repo/scripts/sync-smoke.py" $port_a $port_b "$(cat "$home/room")" "$("$bin" --version | head -1 | awk '{print $2}')" "$@"
+		;;
+	reset)
+		[ -f "$home/room" ] && echo "On the relay, if no longer needed: ./kanban room delete $(cat "$home/room") --yes, and revoke the two smoke keys"
+		rm -rf "$home"
+		;;
+	*)
+		sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+		exit 2
+		;;
+esac
