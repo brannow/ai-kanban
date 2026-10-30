@@ -37,9 +37,10 @@ pub use store::{Principal, ServerDb, ServerError};
 /// full batch and still refuses a client gone wrong before it is parsed.
 pub(crate) const BODY_LIMIT: usize = 8 * 1024 * 1024;
 
-/// How often each notification stream checks its room. Changes arrive through other requests
-/// and through `docker exec` admin commands in another process, so nothing can tell a stream
-/// directly; one indexed `MAX(seq)` per second is the cheapest thing that sees them all.
+/// How often each notification stream checks its room when nothing woke it. A push to this
+/// relay wakes every stream at once (`Relay::pushed`); the tick is for what no handler sees:
+/// `docker exec` admin commands write from another process. One indexed `MAX(seq)` per second
+/// is the cheapest thing that sees those.
 const POLL: Duration = Duration::from_secs(1);
 
 /// Empty rooms are removed after this long.
@@ -50,11 +51,16 @@ pub struct Relay {
     pub db: Arc<Mutex<ServerDb>>,
     /// Set by `--debug`: where every request and stream event is written (`debug.rs`).
     pub trace: Option<debug::Sink>,
+    /// Bumped after every push, so a stream looks at its room now rather than at its next tick:
+    /// for clients far from the relay that tick was up to a second of every change's trip
+    /// (note #333). A counter in a `watch` rather than a `Notify`, because a stream busy with
+    /// its query when the push lands still sees the bump on its next wait.
+    pushed: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 impl Relay {
     pub fn new(db: ServerDb) -> Self {
-        Self { db: Arc::new(Mutex::new(db)), trace: None }
+        Self { db: Arc::new(Mutex::new(db)), trace: None, pushed: Arc::new(tokio::sync::watch::Sender::new(0)) }
     }
 
     pub fn with_trace(mut self, sink: debug::Sink) -> Self {
@@ -207,7 +213,10 @@ async fn push(
     Json(body): Json<Push>,
 ) -> ApiResult<protocol::Pushed> {
     let p = r.auth(&headers)?;
-    Ok(Json(r.db().push(&room, &p, &body.changes)?))
+    let pushed = r.db().push(&room, &p, &body.changes)?;
+    // After the commit, so a woken stream's own connection already sees the new head.
+    r.pushed.send_modify(|n| *n = n.wrapping_add(1));
+    Ok(Json(pushed))
 }
 
 #[derive(Deserialize)]
@@ -246,6 +255,7 @@ async fn events(
     // they fall back to the shared handle.
     let path: Option<PathBuf> = r.db().path().map(PathBuf::from);
     let db = r.db.clone();
+    let mut pushed = r.pushed.subscribe();
     let stream = async_stream::stream! {
         // Moved in, so it is dropped -- and logs the close -- with the stream.
         let mut log = log;
@@ -253,7 +263,14 @@ async fn events(
         if let Some(l) = &log { l.head(last) }
         yield Ok::<_, Infallible>(SseEvent::default().event("head").data(last.to_string()));
         loop {
-            tokio::time::sleep(POLL).await;
+            // A push to any room wakes every stream; each checks only its own, so a wake for
+            // another room costs one query and sends nothing. The relay keeps the sender for
+            // its whole life, so `changed` does not fail; if it did, the pattern would not
+            // match and the tick alone would go on.
+            tokio::select! {
+                _ = tokio::time::sleep(POLL) => {}
+                Ok(()) = pushed.changed() => {}
+            }
             let now = match &path {
                 Some(path) => rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                     .ok()

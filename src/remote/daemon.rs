@@ -7,11 +7,19 @@
 //! minute regardless. The stream only says *that* something changed; the round pulls from its
 //! own cursor, so a missed notification costs a delay, never a change.
 //!
+//! A round set off by a change only moves changes. The checks that guard the room (protocol,
+//! key, high-water marks, a relay restored from a snapshot) and the member list run in a full
+//! round: at startup, after any round that failed, and once a minute. From across the world
+//! each of those requests is ~0.3s on every change's trip, and they answer questions whose
+//! answers change rarely (note #333). What a minute between checks risks is covered: a relay
+//! that stops accepting this client refuses its requests (426, 401), which fails the round
+//! and makes the next one full, and a copied store's reused change ids are refused (409).
+//!
 //! Nothing here may write to stdout: in the MCP process stdout is the protocol.
 
 use super::client::{Client, RemoteError};
 use super::config::{self, RemoteConfig};
-use super::engine::{check_identity, sync_board, sync_board_within};
+use super::engine::{check_identity, sync_board, sync_board_changes, sync_board_within};
 use crate::core::Store;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
@@ -63,12 +71,23 @@ impl Syncer {
                 let mut watched = HashSet::new();
                 let mut named = false;
                 let mut backoff = EVERY;
+                let mut healthy = true;
+                let mut last_full: Option<Instant> = None;
                 loop {
-                    let healthy = round(&store, &background, &mut watched, &mut named, &notify, &watching);
+                    let full = !healthy || last_full.is_none_or(|t| t.elapsed() >= EVERY);
+                    healthy = round(&store, &background, &mut watched, &mut named, &notify, &watching, full);
+                    if full && healthy {
+                        last_full = Some(Instant::now());
+                    }
                     // A store that cannot sync (offline, paused) is checked less and less often,
                     // up to every five minutes, instead of hammering a relay that is not there.
                     backoff = if healthy { EVERY } else { (backoff * 2).min(Duration::from_secs(300)) };
-                    match rx.recv_timeout(if healthy { EVERY } else { backoff }) {
+                    // The full round keeps its own clock: waiting a fresh minute after every
+                    // round, a session writing every 30s never reached the timer, and the overdue
+                    // full round landed on a write's round instead, adding its requests to that
+                    // change's trip (smoke run, note #333).
+                    let due = last_full.map_or(Duration::ZERO, |t| EVERY.saturating_sub(t.elapsed()));
+                    match rx.recv_timeout(if healthy { due } else { backoff }) {
                         Ok(()) => {
                             std::thread::sleep(SETTLE);
                             while rx.try_recv().is_ok() {}
@@ -118,8 +137,8 @@ impl Syncer {
 }
 
 /// One background round over every connected board. Returns whether the relay was reachable and
-/// sync is allowed.
-fn round(store: &Store, client: &Client, watched: &mut HashSet<String>, named: &mut bool, notify: &Sender<()>, live: &Live) -> bool {
+/// sync is allowed. Only a `full` round checks identity and refreshes the member list.
+fn round(store: &Store, client: &Client, watched: &mut HashSet<String>, named: &mut bool, notify: &Sender<()>, live: &Live, full: bool) -> bool {
     let boards = store.connected_boards().unwrap_or_default();
     if boards.is_empty() {
         // Nothing to sync yet, but a name from the plugin's settings has to reach the relay
@@ -134,19 +153,22 @@ fn round(store: &Store, client: &Client, watched: &mut HashSet<String>, named: &
     // Local and cheap, so first: even when the relay is unreachable, pending writes become
     // countable changes, and the header can say how many are waiting.
     let _ = store.flush();
-    match check_identity(store, client) {
-        Ok(()) => {}
-        Err(RemoteError::Paused(_)) => return false,
-        Err(e) => {
-            for (pid, _) in &boards {
-                let _ = store.sync_failed(*pid, &e.recorded());
+    if full {
+        match check_identity(store, client) {
+            Ok(()) => {}
+            Err(RemoteError::Paused(_)) => return false,
+            Err(e) => {
+                for (pid, _) in &boards {
+                    let _ = store.sync_failed(*pid, &e.recorded());
+                }
+                return false;
             }
-            return false;
         }
     }
     let mut ok = true;
     for (pid, room) in boards {
-        if sync_board(store, client, pid).is_err() {
+        let synced = if full { sync_board(store, client, pid) } else { sync_board_changes(store, client, pid) };
+        if synced.is_err() {
             ok = false;
         }
         if watched.insert(room.clone()) {

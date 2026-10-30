@@ -65,6 +65,23 @@ fn a_session_publishes_its_writes_and_receives_a_teammates_without_being_asked()
     });
     assert!(me.sync_status(pid).unwrap().unwrap().members.len() == 2, "the header learns the team");
 
+    // A round set off by a write only moves the change: the identity checks and the member list
+    // ran in the startup round and wait for the minute's full one. From across the world each
+    // of them was ~0.3s on every change's trip (note #333).
+    relay.log.lock().unwrap().clear();
+    me.create_task(pid, TaskDraft::new("quick")).unwrap();
+    syncer.kick();
+    until("the quick task on the relay", Duration::from_secs(10), || {
+        let _ = sync_board(&volker, &volker_client, vp);
+        volker.board(vp, &BoardQuery::board()).unwrap().tasks.iter().any(|t| t.title == "quick")
+    });
+    let mine: Vec<String> = relay.log.lock().unwrap().iter().filter(|l| l.contains(" > ")).filter(|l| l.contains("benny/b1") || l.contains("/v1/hello")).cloned().collect();
+    assert!(mine.iter().any(|l| l.contains("> POST /v1/rooms/sbahn/changes")), "the write was pushed: {mine:#?}");
+    for skipped in ["/v1/hello", "/v1/whoami", "/v1/me ", "/v1/rooms benny"] {
+        assert!(!mine.iter().any(|l| l.contains(skipped)), "a write's round asked {skipped}: {mine:#?}");
+    }
+    assert_eq!(me.sync_status(pid).unwrap().unwrap().members.len(), 2, "a round that did not ask keeps the team");
+
     // The round before a claim is bounded when the relay is gone, and does not fail.
     relay.stop();
     let start = Instant::now();

@@ -176,7 +176,9 @@ impl Client {
         // relay's 30s heartbeat, so a dead connection is noticed instead of waited on forever.
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(5)))
-            .timeout_recv_body(Some(Duration::from_secs(75)))
+            // Per read, not `timeout_recv_body`: that one bounds the whole body, so it cut every
+            // stream after 75s, and a push in the ~6s until the reconnect waited for it (#1085).
+            .timeout_per_read(Some(Duration::from_secs(75)))
             .http_status_as_error(false)
             // Which ai-kanban this is, for the relay's admin (`key list`) and for the relay to
             // refuse one too old for it.

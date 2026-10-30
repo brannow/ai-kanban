@@ -473,6 +473,63 @@ async fn the_event_stream_announces_changes_made_by_another_process() {
     assert!(seen.contains("data: 1"), "then the head after the other process wrote: {seen}");
 }
 
+/// A push to this relay wakes the stream at once instead of waiting for its next one-second
+/// tick: for clients far from the relay that tick was up to a second of every change's trip.
+/// The push lands 100ms after the stream's first event, so the tick is still ~900ms away and
+/// only the wake can deliver the head inside the bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_push_wakes_the_event_stream_without_waiting_for_its_tick() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.db");
+    let (key, relay) = {
+        let db = ServerDb::open(&path).unwrap();
+        let key = db.add_key("benny", "b1").unwrap();
+        (key, Relay::new(db))
+    };
+    let p = relay.db.lock().unwrap().authenticate(&key).unwrap();
+    relay.db.lock().unwrap().join("sbahn", &p).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = relay.clone();
+    tokio::spawn(async move { axum::serve(listener, router(served)).await.unwrap() });
+
+    let (connected_tx, connected_rx) = std::sync::mpsc::channel();
+    let stream_key = key.clone();
+    let reader = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        write!(s, "GET /v1/rooms/sbahn/events HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {stream_key}\r\n\r\n").unwrap();
+        let mut seen = String::new();
+        let mut buf = [0u8; 1024];
+        let mut connected = false;
+        loop {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "stream ended early: {seen}");
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+            if !connected && seen.contains("data: 0") {
+                connected = true;
+                connected_tx.send(()).unwrap();
+            }
+            if seen.contains("data: 1") {
+                return (std::time::Instant::now(), seen);
+            }
+        }
+    });
+
+    tokio::task::spawn_blocking(move || connected_rx.recv().unwrap()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let body = json!({ "changes": [change("b1", 1, task("b1", 1), None, "title", json!("x"))] });
+    let (s, v) = call(&relay, "POST", "/v1/rooms/sbahn/changes", Some(&key), Some(body)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let pushed_at = std::time::Instant::now();
+
+    let (seen_at, seen) = reader.await.unwrap();
+    let took = seen_at.saturating_duration_since(pushed_at);
+    assert!(took < std::time::Duration::from_millis(500), "the head arrived {took:?} after the push, so it waited for the tick: {seen}");
+}
+
 /// The stream re-checks access on every tick, like every other route checks it per request.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_event_stream_ends_when_its_key_is_revoked() {

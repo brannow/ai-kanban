@@ -515,6 +515,17 @@ impl Store {
         Ok(())
     }
 
+    /// A success that says nothing about who is in the room: a round that did not ask, or asked
+    /// and got no answer. The last known members stay.
+    pub fn sync_succeeded_keeping_members(&self, project_id: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sync_room_status (project_id, last_ok_at, last_error) VALUES (?1, ?2, NULL)
+             ON CONFLICT (project_id) DO UPDATE SET last_ok_at = excluded.last_ok_at, last_error = NULL",
+            params![project_id, now()],
+        )?;
+        Ok(())
+    }
+
     pub fn sync_failed(&self, project_id: i64, why: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO sync_room_status (project_id, last_error) VALUES (?1, ?2)

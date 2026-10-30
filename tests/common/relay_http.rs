@@ -6,10 +6,14 @@
 use ai_kanban_relay::{router, Relay, ServerDb};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 pub struct HttpRelay {
     pub url: String,
     pub db_path: PathBuf,
+    /// Every line of the relay's `--debug` trace, for tests that assert which requests a
+    /// client made.
+    pub log: Arc<Mutex<Vec<String>>>,
     addr: SocketAddr,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -23,7 +27,7 @@ impl HttpRelay {
         // Created and migrated before the server opens it; keys are added per test.
         ServerDb::open(&db_path).unwrap();
         let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        let mut r = HttpRelay { url: format!("http://{addr}"), db_path, addr, stop: None, thread: None, _dir: dir };
+        let mut r = HttpRelay { url: format!("http://{addr}"), db_path, log: Arc::default(), addr, stop: None, thread: None, _dir: dir };
         r.resume();
         r
     }
@@ -50,7 +54,7 @@ impl HttpRelay {
     pub fn resume(&mut self) {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (addr, path) = (self.addr, self.db_path.clone());
+        let (addr, path, log) = (self.addr, self.db_path.clone(), self.log.clone());
         let thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
             rt.block_on(async move {
@@ -61,7 +65,7 @@ impl HttpRelay {
                     }
                 };
                 ready_tx.send(()).unwrap();
-                let relay = Relay::new(ServerDb::open(&path).unwrap());
+                let relay = Relay::new(ServerDb::open(&path).unwrap()).with_trace(Arc::new(move |l| log.lock().unwrap().push(l)));
                 // Not a graceful shutdown: that waits for open notification streams to end, which a
                 // client only notices at its read timeout. Stopping drops every connection at once,
                 // like a relay that crashed or was killed.

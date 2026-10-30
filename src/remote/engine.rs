@@ -85,7 +85,15 @@ fn pause(store: &Store, why: &str) {
 /// One round for `project_id`: flush, push the outbox, pull and apply until caught up, and
 /// record who is in the room. Returns what moved.
 pub fn sync_board(store: &Store, client: &Client, project_id: i64) -> Result<Synced, RemoteError> {
-    finish(store, project_id, round(store, client, project_id, None))
+    finish(store, project_id, round(store, client, project_id, None, true))
+}
+
+/// A round that only moves changes: push and pull, no member list. For the rounds a write or
+/// a teammate's push sets off, whose whole point is getting that change across quickly; from
+/// across the world every extra request is ~0.3s on the trip (note #333). The member list is
+/// refreshed by the background round once a minute.
+pub fn sync_board_changes(store: &Store, client: &Client, project_id: i64) -> Result<Synced, RemoteError> {
+    finish(store, project_id, round(store, client, project_id, None, false))
 }
 
 /// A round that gives up starting new requests once `budget` is spent, and skips refreshing the
@@ -95,7 +103,7 @@ pub fn sync_board(store: &Store, client: &Client, project_id: i64) -> Result<Syn
 /// background round does.
 pub fn sync_board_within(store: &Store, client: &Client, project_id: i64, budget: std::time::Duration) -> Result<Synced, RemoteError> {
     let deadline = std::time::Instant::now() + budget;
-    finish(store, project_id, round(store, client, project_id, Some(deadline)))
+    finish(store, project_id, round(store, client, project_id, Some(deadline), false))
 }
 
 fn finish(store: &Store, project_id: i64, result: Result<Synced, RemoteError>) -> Result<Synced, RemoteError> {
@@ -120,7 +128,7 @@ fn finish(store: &Store, project_id: i64, result: Result<Synced, RemoteError>) -
     result
 }
 
-fn round(store: &Store, client: &Client, project_id: i64, deadline: Option<std::time::Instant>) -> Result<Synced, RemoteError> {
+fn round(store: &Store, client: &Client, project_id: i64, deadline: Option<std::time::Instant>, members: bool) -> Result<Synced, RemoteError> {
     let core = |e: crate::core::Error| RemoteError::Http(0, e.to_string());
     // With a deadline, no new request starts once it has passed. The round then ends early as
     // a success of what it did; it does not claim to be a full sync.
@@ -186,12 +194,22 @@ fn round(store: &Store, client: &Client, project_id: i64, deadline: Option<std::
         // and the header can show the team from a minute ago.
         return Ok(done);
     }
-    let members = client
-        .rooms()
-        .ok()
-        .and_then(|rooms| rooms.into_iter().find(|r| r.name == room))
-        .map(|r| r.members.into_iter().map(|m| (m.tag, m.user)).collect::<Vec<_>>())
-        .unwrap_or_default();
-    store.sync_succeeded(project_id, &members).map_err(core)?;
+    if !members {
+        store.sync_succeeded_keeping_members(project_id).map_err(core)?;
+        return Ok(done);
+    }
+    match client.rooms() {
+        Ok(rooms) => {
+            let members = rooms
+                .into_iter()
+                .find(|r| r.name == room)
+                .map(|r| r.members.into_iter().map(|m| (m.tag, m.user)).collect::<Vec<_>>())
+                .unwrap_or_default();
+            store.sync_succeeded(project_id, &members).map_err(core)?;
+        }
+        // The changes moved; a failed lookup only means the team shown is the last one known,
+        // not that the room is empty.
+        Err(_) => store.sync_succeeded_keeping_members(project_id).map_err(core)?,
+    }
     Ok(done)
 }

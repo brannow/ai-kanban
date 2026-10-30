@@ -420,6 +420,16 @@ is set and the run allows sync.
 - **Every 60s regardless.** Streams drop, laptops sleep, proxies cut idle connections, and a missed
   notification may only delay a pull, never lose one. While the relay is unreachable or sync is
   paused, rounds back off up to every five minutes.
+- **Rounds set off by a change only move changes**: push and pull, nothing else. The identity
+  checks (`hello`, `whoami`: protocol, key, high-water marks, a restored relay) and the member list
+  (`rooms`) run in a *full* round -- at startup, after any round that failed, and once a minute on
+  a clock of their own, so a write's round seldom finds one due (a fresh minute after every round
+  never came in a session writing every 30s, and the overdue checks then landed on a write). Why: they answer
+  questions whose answers rarely change, and from across the world each is ~0.3s on every
+  change's trip; with them a change took ~2-4s from Thailand to Thailand via Germany (note #333).
+  What the minute between checks risks is covered by the relay itself: a client it no longer
+  accepts is refused (426, 401), which fails the round and makes the next one full, and a copied
+  store's reused change ids are refused (409).
 - **Before a claim** (`task_update` to `doing`) **and before `task_add`**: a round on the tool
   call's own connection, so what the agent sees is current. No request starts after 2.5s and each
   is bounded at 1.2s, so even a relay that accepts connections and never answers costs the agent
@@ -436,7 +446,8 @@ is set and the run allows sync.
   kept for what older notes say.
 - **A relay restored from a snapshot loses nothing for good.** It has lost what arrived after
   the snapshot -- which every client marked sent -- and numbers new changes from the snapshot
-  on, below where clients had read to. Two checks, both in every round:
+  on, below where clients had read to. Two checks, the outgoing one in every full round (at least
+  once a minute, see "When it happens"), the incoming one in every round:
   - *Outgoing:* the client records the highest outbox seq the relay confirmed (`sync_sent`,
     migration 018). When `whoami` says the relay has less from this tag, it queues again what
     it last wrote in each room -- from `sync_fields`, with the original clocks, so nothing
@@ -519,7 +530,7 @@ different reasons.
   "older" for a 0.1.x client, which sent its HTTP library's), and the debug log shows it per
   request. That is how the admin sees who would be stopped before raising
   `MIN_PROTOCOL_VERSION`.
-- **Both sides enforce the range.** The client checks `hello` before every round and pauses
+- **Both sides enforce the range.** The client checks `hello` in every full round and pauses
   itself when it falls outside. The relay refuses with `426 Upgrade Required` a client that says
   it speaks less than the minimum -- so it does not rest on every client checking. A
   `User-Agent` that does not say (an older ai-kanban, another program) passes, as there is
@@ -603,9 +614,11 @@ ai-kanban-relay snapshot                              # also scheduled: --snapsh
   for a key of its own (a new tag). As a second net, a `cid` that arrives again with different content is refused.
 - **Bind:** `--listen` defaults to `127.0.0.1:7373`. The container passes `0.0.0.0:7373`. `hello`
   is the only route without a key.
-- **SSE notifications come from polling** `MAX(seq)` per room, not from the push handler, for the
-  same reason `src/http/stream.rs` polls: admin commands run in another process (`docker exec`),
-  and an admin forget must notify too.
+- **SSE notifications come from polling** `MAX(seq)` per room once a second, for the same reason
+  `src/http/stream.rs` polls: admin commands run in another process (`docker exec`), and an admin
+  forget must notify too. **A push wakes every stream at once** on top of that, so a teammate's
+  change is not held for up to a second at the relay (`a_push_wakes_the_event_stream_...`); the
+  tick remains for what no handler sees.
 
 ### Running the relay
 
