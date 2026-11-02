@@ -602,8 +602,11 @@ impl ServerDb {
     }
 
     pub fn room_info(&self, id: i64) -> Result<RoomInfo> {
+        // `created_by` holds the creator's tag, so a rename shows (#1080). Rooms made before
+        // that hold the name itself, which matches no tag and is shown as it was stored.
         let (name, created_at, created_by, board): (String, i64, String, Option<String>) = self.conn.query_row(
-            "SELECT name, created_at, created_by, board FROM rooms WHERE id = ?1",
+            "SELECT r.name, r.created_at, COALESCE(t.name, r.created_by), r.board
+               FROM rooms r LEFT JOIN tags t ON t.tag = r.created_by WHERE r.id = ?1",
             [id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
@@ -644,7 +647,7 @@ impl ServerDb {
         let tx = self.conn.unchecked_transaction()?;
         let created = tx.execute(
             "INSERT OR IGNORE INTO rooms (name, created_at, created_by, board) VALUES (?1, ?2, ?3, ?4)",
-            params![name, now(), p.user, board],
+            params![name, now(), p.tag, board],
         )? == 1;
         let id: i64 = tx.query_row("SELECT id FROM rooms WHERE name = ?1", [&name], |r| r.get(0))?;
         tx.execute(

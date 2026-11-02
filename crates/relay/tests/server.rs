@@ -200,6 +200,7 @@ fn a_version_1_database_upgrades_and_keeps_its_rooms() {
     let db = ServerDb::open(&path).unwrap();
     let rooms = db.rooms().unwrap();
     assert_eq!((rooms[0].name.as_str(), rooms[0].board.as_deref()), ("sbahn", None));
+    assert_eq!(rooms[0].created_by, "benny", "a room from before #1080 holds the name itself, and shows it");
     let v: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
     assert_eq!(v, 4, "every migration ran");
 }
@@ -666,16 +667,20 @@ async fn a_key_gets_its_tag_from_the_first_name_its_user_chooses() {
 
     let (_, v) = call(&relay, "POST", "/v1/rooms/sbahn/join", Some(&volker), None).await;
     assert_eq!(v["room"]["members"][0]["user"], "Volker K.", "the team sees the chosen name");
+    assert_eq!(v["room"]["created_by"], "Volker K.");
+    name(volker.clone(), "Volker Kaiser").await;
+    let (_, rooms) = call(&relay, "GET", "/v1/rooms", Some(&volker), None).await;
+    assert_eq!(rooms[0]["created_by"], "Volker Kaiser", "the room shows its creator's name now, not the one they had (#1080)");
 
     let rotated = {
         let db = relay.db.lock().unwrap();
         let (_, key) = db.rotate_key(db.key_id("v1").unwrap()).unwrap();
         let k = db.keys().unwrap().into_iter().find(|k| k.tag.as_deref() == Some("v1") && k.revoked_at.is_none()).unwrap();
-        assert_eq!((k.name.as_deref(), k.label.as_str()), (Some("Volker K."), "volker laptop"), "rotation keeps name and label");
+        assert_eq!((k.name.as_deref(), k.label.as_str()), (Some("Volker Kaiser"), "volker laptop"), "rotation keeps name and label");
         key
     };
     let (_, v) = call(&relay, "GET", "/v1/whoami", Some(&rotated), None).await;
-    assert_eq!((v["tag"].clone(), v["user"].clone()), (json!("v1"), json!("Volker K.")));
+    assert_eq!((v["tag"].clone(), v["user"].clone()), (json!("v1"), json!("Volker Kaiser")));
 
     let (s, _) = name(rotated.clone(), " \u{7}\n ").await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "a name needs something visible");

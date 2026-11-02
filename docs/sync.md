@@ -360,11 +360,14 @@ Each mutation on a connected board writes, **in the same transaction**, one chan
   forgets** (`ai-kanban-relay forget <room> <handle>`), because it is permanent for every member.
   Locally, forget on a connected board is refused and the message names that command. On boards
   that aren't connected, forget works as today.
-- **Names that must be unique** (workstreams per board, repos) merge **by name**. Two machines
-  creating `deploy` offline get one workstream, not a constraint failure.
-- **Repos travel as keys:** the normalized git remote (the `git:…` form of `projects.key`), or
-  `name:<name>` for a checkout without one. Each member's task links to their own checkout of
-  that remote, whatever it is called there. A key with no checkout on this machine is kept as
+- **Workstreams merge by name.** Two machines creating `deploy` offline get one workstream, not a
+  constraint failure and not two `deploy`s side by side. Here the name is what people mean.
+- **Repos travel as keys:** the normalized git remote (the `git:…` form of `projects.key`). Each
+  member's task links to their own checkout of that remote, whatever it is called there. A
+  checkout **without** a remote travels as `local:<tag>/<name>`, and only the machine with that
+  origin tag resolves it (a restored store still knows its tags from before). It used to travel as
+  `name:<name>`, which linked a teammate's ticket to any folder of the same name: two `notes`
+  folders on two laptops are unrelated. Teammates see it as `notes (v1's checkout)`. A key with no checkout on this machine is kept as
   *unmapped* and shown ("no checkout on this machine"), so a local edit never drops a teammate's
   link and the task does not read as "no repo set". Adding the checkout later adopts those links.
 - **Which checkouts a machine has is local setup.** Taking a repo off your board, or forgetting it,
@@ -699,6 +702,9 @@ docker exec kanban ai-kanban-relay key add benny laptop   # prints the key once,
   connected before. A different id stops the round before anything is applied, saying what
   happened and that `room disconnect` keeps the board, `room connect` joins the new room. A room
   deleted with nothing in its place says so too; the board keeps everything either way.
+- **A room's creator is kept as their tag, not their name** (#1080). `rooms.created_by` holds the
+  tag and `room list` shows that tag's current name, so a rename shows everywhere at once. Rooms
+  created before 0.2.5 hold the name itself; it matches no tag and is shown as stored.
 - **A teammate's work is marked as theirs wherever it shows**, so neither an agent nor a person
   mistakes it for their own: a ticket on the board `(agent, from volker)`, in its detail
   `filed 2d ago by volker (a teammate's, from the room)`, a note `(2d old, from volker)`, a

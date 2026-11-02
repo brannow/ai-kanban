@@ -215,6 +215,7 @@ pub struct RoomInfo {
     pub id: Option<i64>,
     pub name: String,
     pub created_at: i64,
+    /// Who opened the room, by their current name.
     pub created_by: String,
     pub members: Vec<Member>,
     pub changes: i64,

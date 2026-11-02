@@ -1414,6 +1414,23 @@ impl Store {
 // ---------------------------------------------------------------------------
 
 impl Store {
+    /// The key a checkout of this machine travels under (`core::project::repo_key`).
+    fn checkout_key(&self, path: &str, name: &str) -> Result<String> {
+        let tag = self.origin_tag()?.unwrap_or_default();
+        Ok(crate::core::project::repo_key(path, name, &tag))
+    }
+
+    /// A received key as this machine would write it: a `local:` key under a tag this store
+    /// published with before a restore is one of its own checkouts, keyed by its tag now.
+    fn own_key(&self, key: &str) -> Result<String> {
+        if let Some((tag, name)) = key.strip_prefix("local:").and_then(|k| k.split_once('/')) {
+            if self.is_own_tag(tag)? {
+                return Ok(format!("local:{}/{name}", self.origin_tag()?.unwrap_or_default()));
+            }
+        }
+        Ok(key.to_string())
+    }
+
     /// A task's repos as they travel: the key of every linked checkout, plus the keys kept for
     /// repos this machine has no checkout of. Sorted, so the same set is the same value.
     fn task_repo_keys(&self, task_id: i64) -> Result<Vec<String>> {
@@ -1423,7 +1440,7 @@ impl Store {
         )?;
         for row in st.query_map([task_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
             let (path, name) = row?;
-            keys.insert(crate::core::project::repo_key(&path, &name));
+            keys.insert(self.checkout_key(&path, &name)?);
         }
         let mut st = self.conn.prepare("SELECT key FROM sync_unmapped_repos WHERE task_id = ?1")?;
         for k in st.query_map([task_id], |r| r.get::<_, String>(0))? {
@@ -1437,11 +1454,12 @@ impl Store {
     fn set_task_repo_keys(&self, project_id: i64, task_id: i64, keys: &[String]) -> Result<()> {
         let mut by_key = std::collections::HashMap::new();
         for r in self.repos(project_id)? {
-            by_key.insert(crate::core::project::repo_key(&r.path, &r.name), r.id);
+            by_key.insert(self.checkout_key(&r.path, &r.name)?, r.id);
         }
         self.conn.execute("DELETE FROM task_repos WHERE task_id = ?1", [task_id])?;
         self.conn.execute("DELETE FROM sync_unmapped_repos WHERE task_id = ?1", [task_id])?;
         for k in keys {
+            let k = &self.own_key(k)?;
             match by_key.get(k) {
                 Some(repo) => self.conn.execute("INSERT OR IGNORE INTO task_repos (task_id, repo_id) VALUES (?1, ?2)", params![task_id, repo])?,
                 None => self.conn.execute("INSERT OR IGNORE INTO sync_unmapped_repos (task_id, key) VALUES (?1, ?2)", params![task_id, k])?,
@@ -1457,7 +1475,7 @@ impl Store {
         let Some((path, name)) = self.conn
             .query_row("SELECT path, name FROM repos WHERE id = ?1", [repo_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .optional()? else { return Ok(()) };
-        let key = crate::core::project::repo_key(&path, &name);
+        let key = self.checkout_key(&path, &name)?;
         self.conn.execute(
             "INSERT OR IGNORE INTO sync_unmapped_repos (task_id, key)
              SELECT tr.task_id, ?2 FROM task_repos tr
@@ -1475,7 +1493,7 @@ impl Store {
         let Some((path, name)) = self.conn
             .query_row("SELECT path, name FROM repos WHERE id = ?1", [repo_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .optional()? else { return Ok(()) };
-        let key = crate::core::project::repo_key(&path, &name);
+        let key = self.checkout_key(&path, &name)?;
         self.conn.execute(
             "INSERT OR IGNORE INTO task_repos (task_id, repo_id)
              SELECT u.task_id, ?1 FROM sync_unmapped_repos u JOIN tasks t ON t.id = u.task_id
@@ -1498,7 +1516,7 @@ impl Store {
             Err(e) => return Err(e.into()),
         };
         let keys = st.query_map([task_id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(keys.iter().map(|k| crate::core::project::repo_key_label(k).to_string()).collect())
+        Ok(keys.iter().map(|k| crate::core::project::repo_key_label(k)).collect())
     }
 }
 

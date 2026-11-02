@@ -376,22 +376,31 @@ fn git_remote(repo_root: &Path) -> Option<String> {
 }
 
 /// How a repo is known across machines: its normalized remote, the same form a board key
-/// takes, or its name when the checkout has no remote. Paths differ per machine and local ids
-/// mean nothing elsewhere, so neither can travel.
-pub(crate) fn repo_key(path: &str, name: &str) -> String {
+/// takes. Paths differ per machine and local ids mean nothing elsewhere, so neither can travel.
+///
+/// A checkout with no remote has nothing that identifies it beyond this machine: two folders
+/// called `api` on two laptops are two unrelated repos, and keying them by name linked a
+/// teammate's ticket to whatever folder of that name the receiver happened to have. So it
+/// travels as `local:<tag>/<name>`, scoped to the machine (`tag`, the store's origin tag) it
+/// lives on: it resolves there and nowhere else, and teammates see it as a repo they have no
+/// checkout of.
+pub(crate) fn repo_key(path: &str, name: &str, tag: &str) -> String {
     match git_remote(Path::new(path)) {
         Some(url) => format!("git:{}", normalize_remote(&url)),
-        None => format!("name:{name}"),
+        None => format!("local:{tag}/{name}"),
     }
 }
 
 /// What a repo key is called where no checkout exists to name it: the remote's last path
-/// segment, or the name.
-pub fn repo_key_label(key: &str) -> &str {
-    match key.strip_prefix("git:") {
-        Some(remote) => remote.rsplit('/').next().unwrap_or(remote),
-        None => key.strip_prefix("name:").unwrap_or(key),
+/// segment, or for a machine's own folder its name and whose machine it is on.
+pub fn repo_key_label(key: &str) -> String {
+    if let Some(remote) = key.strip_prefix("git:") {
+        return remote.rsplit('/').next().unwrap_or(remote).to_string();
     }
+    if let Some((tag, name)) = key.strip_prefix("local:").and_then(|k| k.split_once('/')) {
+        return format!("{name} ({tag}'s checkout)");
+    }
+    key.strip_prefix("name:").unwrap_or(key).to_string()
 }
 
 /// Collapses the many spellings of one remote into a single key.

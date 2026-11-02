@@ -574,7 +574,7 @@ impl Store {
             let mut out: HashMap<i64, Vec<String>> = HashMap::new();
             for row in st.query_map(rusqlite::params_from_iter(&ids), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
                 let (task, key) = row?;
-                out.entry(task).or_default().push(crate::core::project::repo_key_label(&key).to_string());
+                out.entry(task).or_default().push(crate::core::project::repo_key_label(&key));
             }
             Ok(out)
         })())?;

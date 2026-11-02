@@ -1,6 +1,7 @@
 //! Repos on shared tasks. A checkout's path and local id differ on every machine, so a task's
-//! repos travel as keys: the normalized git remote, or the name when there is none. Which
-//! checkouts a machine has is its own business and must never take a repo off the team's tasks.
+//! repos travel as keys: the normalized git remote, or for a checkout without one a key only its
+//! own machine resolves. Which checkouts a machine has is its own business and must never take
+//! a repo off the team's tasks.
 
 mod common;
 use common::sync::*;
@@ -117,19 +118,30 @@ fn taking_a_repo_off_my_board_does_not_take_it_off_the_teams_tasks() {
     assert!(benny.store.unmapped_repos(t.id).unwrap().is_empty());
 }
 
+/// A checkout with no remote is known only on its own machine. Two folders called `notes` on
+/// two laptops are unrelated, and must not be linked to each other because the names match.
 #[test]
-fn a_checkout_without_a_remote_travels_by_name() {
+fn a_checkout_without_a_remote_is_its_machines_own_and_never_matched_by_name() {
     let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let relay = relay();
     let benny = member(&relay, "benny", "b1", "sbb");
     let volker = member(&relay, "volker", "v1", "x");
     let br = benny.store.add_repo(benny.pid, &checkout(a.path(), "notes", None), None, Actor::User).unwrap();
-    volker.store.add_repo(volker.pid, &checkout(b.path(), "notes", None), None, Actor::User).unwrap();
+    let vr = volker.store.add_repo(volker.pid, &checkout(b.path(), "notes", None), None, Actor::User).unwrap();
     let t = benny.store.create_task(benny.pid, TaskDraft::new("write it down")).unwrap();
     link(&benny, t.id, br.id);
     converge(&relay, &[&benny, &volker]);
+
     let vt = task_by_title(&volker, "write it down");
-    assert_eq!(repo_names(&volker, vt.id), ["notes"]);
+    assert!(repo_names(&volker, vt.id).is_empty(), "his own `notes` is another folder");
+    assert_eq!(volker.store.unmapped_repos(vt.id).unwrap(), ["notes (b1's checkout)"]);
+
+    // Volker adds his folder: both travel, and each machine resolves only its own.
+    volker.store.update_task(volker.pid, vt.id, TaskPatch { repos: Some(vec![vr.id]), actor: Actor::Agent, ..Default::default() }).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    assert_eq!(benny.store.task_repos(benny.pid, t.id).unwrap().into_iter().map(|r| r.id).collect::<Vec<_>>(), [br.id]);
+    assert_eq!(benny.store.unmapped_repos(t.id).unwrap(), ["notes (v1's checkout)"]);
+    assert_eq!(volker.store.task_repos(volker.pid, vt.id).unwrap().into_iter().map(|r| r.id).collect::<Vec<_>>(), [vr.id]);
 }
 
 #[test]
