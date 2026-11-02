@@ -95,7 +95,9 @@ connected right now; `null` when the process does not sync), `last_ok_at`, `last
 `unsent_tasks`/`unsent_notes` and `members`, plus the store's `paused` reason. Its own small
 endpoint, asked every 10s: a stream connecting or dropping writes nothing the change feed sees,
 and rebuilding the board picker for it would close the dropdown under the person's hand. Task
-reads also carry `authors` beside `texts`: who wrote a history entry, when a teammate did.
+reads also carry `authors` beside `texts`: who wrote a history entry or a note (`event:<id>`,
+`note:<id>`), when a teammate did; and board and task reads `task_authors`, keyed by task id: who
+filed each teammate's ticket. The page marks those cards, notes and entries with `⇄ name`.
 
 ### Teammates' text in the page
 

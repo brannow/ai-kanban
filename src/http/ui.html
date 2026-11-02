@@ -7,6 +7,7 @@
     --fg: #dfe3ea; --dim: #8a93a3; --dim2: #626b7a;
     --accent: #6aa9ff; --user: #d19a66; --bug: #e06c75; --idea: #c678dd;
     --chore: #56b6c2; --urgent: #e06c75; --high: #d19a66; --ok: #98c379;
+    --remote: #e5c07b;
   }
   @media (prefers-color-scheme: light) {
     :root {
@@ -59,6 +60,9 @@
     border-radius: 6px; padding: 8px 10px; cursor: pointer;
   }
   .card:hover { border-color: var(--accent); }
+  /* A teammate's ticket, note or entry: marked so nobody mistakes it for their own. */
+  .card.remote { border-left-color: var(--remote); border-left-style: dashed; }
+  .from { color: var(--remote); white-space: nowrap; }
   .card .t { display: block; margin-bottom: 5px; word-break: break-word; }
   .card .m { font-size: 11px; color: var(--dim2); display: flex; gap: 8px; flex-wrap: wrap; }
   .card.bug { border-left-color: var(--bug); }

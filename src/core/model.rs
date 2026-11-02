@@ -533,6 +533,14 @@ impl Handles {
         self.origins.get(&format!("{kind}:{id}")).map(String::as_str)
     }
 
+    /// Who filed a task, if another member did: their name, or their tag once they left. On a
+    /// shared board a teammate's ticket says so wherever it is listed, so neither an agent nor
+    /// a person mistakes it for one of their own.
+    pub fn task_from(&self, id: i64) -> Option<String> {
+        let (origin, _) = self.tasks.get(&id)?;
+        (Some(origin.as_str()) != self.tag.as_deref()).then(|| self.names.get(origin).cloned().unwrap_or_else(|| origin.clone()))
+    }
+
     /// Who wrote it, if another member did: their name, or their tag once they left the room.
     /// None for this machine's own -- "agent" and "user" already say who that is.
     pub fn author(&self, kind: &str, id: i64) -> Option<String> {

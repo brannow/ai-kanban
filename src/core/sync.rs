@@ -271,6 +271,19 @@ impl Store {
             .optional()?)
     }
 
+    /// The relay's id for the room a board is in, once known (migration 019).
+    pub fn relay_room(&self, project_id: i64) -> Result<Option<i64>> {
+        Ok(self.conn
+            .query_row("SELECT relay_room FROM sync_rooms WHERE project_id = ?1", [project_id], |r| r.get(0))
+            .optional()?
+            .flatten())
+    }
+
+    pub fn set_relay_room(&self, project_id: i64, id: i64) -> Result<()> {
+        self.conn.execute("UPDATE sync_rooms SET relay_room = ?2 WHERE project_id = ?1", params![project_id, id])?;
+        Ok(())
+    }
+
     pub fn board_of_room(&self, room: &str) -> Result<Option<i64>> {
         Ok(self.conn.query_row("SELECT project_id FROM sync_rooms WHERE room = ?1", [room], |r| r.get(0)).optional()?)
     }

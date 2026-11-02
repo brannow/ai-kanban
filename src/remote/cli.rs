@@ -507,8 +507,11 @@ fn room_connect(store: &Store, room: &str, a: &Args) -> CliResult {
             p.id
         }
     };
-    c.join(&room, Some(&name))?;
+    let joined = c.join(&room, Some(&name))?;
     store.connect_board(pid, &room)?;
+    if let Some(id) = joined.room.id {
+        store.set_relay_room(pid, id)?;
+    }
     match sync_board(store, &c, pid) {
         Ok(s) => println!("connected. Published {} changes, received {}. The board now shows as: Board: {name} @{room}", s.pushed, s.applied),
         Err(e) => println!("connected, but the first sync failed: {e}\nIt is retried on the next sync; nothing is lost."),

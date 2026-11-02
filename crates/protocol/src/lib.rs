@@ -210,6 +210,9 @@ pub struct SetName {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomInfo {
+    /// The relay's id for the room (see `Page::room`). None from an older relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
     pub name: String,
     pub created_at: i64,
     pub created_by: String,
@@ -260,6 +263,10 @@ pub struct Page {
     pub head: i64,
     /// More changes exist past this page; pull again from the last `seq`.
     pub more: bool,
+    /// The relay's id for the room, which it never reuses: a room deleted and opened again
+    /// under its name has another. None from an older relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<i64>,
 }
 
 #[cfg(test)]

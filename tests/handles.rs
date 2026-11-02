@@ -421,3 +421,37 @@ async fn the_page_learns_how_each_shared_board_is_syncing() {
     assert_eq!(b["members"][0]["user"], "benny");
     assert!(v["boards"].get(private.to_string()).is_none(), "an unshared board has no badge");
 }
+
+/// A teammate's ticket and note say whose they are wherever they show -- on the board, in the
+/// task, in its notes, and on the page -- so neither an agent nor a person takes them for their
+/// own. This machine's own stay unmarked.
+#[tokio::test]
+async fn a_teammates_tickets_and_notes_are_marked_as_from_the_room() {
+    use ai_kanban::core::note::NoteDraft;
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "x");
+    let theirs = volker.store.create_task(volker.pid, TaskDraft::new("proxy times out")).unwrap();
+    volker.store.create_note(volker.pid, NoteDraft { task_id: Some(theirs.id), ..NoteDraft::new("nginx drops idle upstreams") }, Actor::Agent).unwrap();
+    let mine = benny.store.create_task(benny.pid, TaskDraft::new("mine to do")).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    benny.store.sync_succeeded(benny.pid, &[("b1".into(), "benny".into()), ("v1".into(), "Volker".into())]).unwrap();
+    let here = task_by_title(&benny, "proxy times out");
+
+    let board = board_text(&benny);
+    let line = |title: &str| board.lines().find(|l| l.contains(title)).unwrap().to_string();
+    assert!(line("proxy times out").contains("from Volker"), "{board}");
+    assert!(!line("mine to do").contains("from"), "my own is unmarked: {board}");
+
+    let detail = render::task_detail(&benny.store.task_detail(benny.pid, here.id).unwrap());
+    assert!(detail.contains("by Volker (a teammate's, from the room)"), "{detail}");
+    assert!(detail.contains("nginx drops idle upstreams") && detail.contains("from Volker)"), "the note too: {detail}");
+    let own = render::task_detail(&benny.store.task_detail(benny.pid, mine.id).unwrap());
+    assert!(!own.contains("from the room"), "{own}");
+
+    let pid = benny.pid;
+    let v = get_json(benny.store, &format!("/api/projects/{pid}/tasks/{}", here.id)).await;
+    assert_eq!(v["task_authors"][here.id.to_string()], "Volker", "{}", v["task_authors"]);
+    assert!(v["task_authors"].get(mine.id.to_string()).is_none());
+    assert!(v["authors"].as_object().unwrap().iter().any(|(k, w)| k.starts_with("note:") && w == "Volker"), "{}", v["authors"]);
+}

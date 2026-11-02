@@ -106,6 +106,23 @@ pub fn sync_board_within(store: &Store, client: &Client, project_id: i64, budget
     finish(store, project_id, round(store, client, project_id, Some(deadline), false))
 }
 
+/// The relay's "no room" and "not a member", said as what they mean for this board, and what
+/// to do. The board itself keeps everything either way.
+fn room_gone(room: &str, e: RemoteError) -> RemoteError {
+    match e {
+        RemoteError::NotFound(m) if m.contains("no room") => RemoteError::NotFound(format!(
+            "room {room} no longer exists on the relay (it was deleted). This board keeps everything it has; \
+             `ai-kanban room disconnect {room}` makes it private again"
+        )),
+        RemoteError::NotFound(m) if m.contains("not a member") => RemoteError::NotFound(format!(
+            "this board is no longer a member of room {room}: the room was deleted and opened again, or this \
+             machine left it. This board keeps everything it has; `ai-kanban room disconnect {room}` makes it \
+             private again"
+        )),
+        e => e,
+    }
+}
+
 fn finish(store: &Store, project_id: i64, result: Result<Synced, RemoteError>) -> Result<Synced, RemoteError> {
     match &result {
         // A pause is the store's state, reported once by the header, not as this board's error.
@@ -147,7 +164,7 @@ fn round(store: &Store, client: &Client, project_id: i64, deadline: Option<std::
         let out = store.outbox(project_id, MAX_BATCH).map_err(core)?;
         let Some(&(last, _)) = out.last() else { break };
         let changes: Vec<_> = out.into_iter().map(|(_, c)| c).collect();
-        client.push(&room, &changes)?;
+        client.push(&room, &changes).map_err(|e| room_gone(&room, e))?;
         store.outbox_sent(project_id, last).map_err(core)?;
         done.pushed += changes.len();
     }
@@ -157,13 +174,29 @@ fn round(store: &Store, client: &Client, project_id: i64, deadline: Option<std::
             return Ok(done);
         }
         let since = store.sync_status(project_id).map_err(core)?.map(|s| s.cursor).unwrap_or(0);
-        let page = client.pull(&room, since, MAX_PAGE)?;
+        let page = client.pull(&room, since, MAX_PAGE).map_err(|e| room_gone(&room, e))?;
         // The room's log is shorter than what this board has read: the relay went back to a
         // snapshot, and its new changes reuse numbers this board counts as read. Read it again
         // from the start; what is already here is ignored.
         if page.head < since {
             store.rewind_cursor(project_id, 0).map_err(core)?;
             continue;
+        }
+        // The same name, but is it the same room? One deleted on the relay and opened again by
+        // someone else has another id, and its tasks are not this board's -- checked before
+        // anything is applied. A board connected before ids were kept takes this one.
+        if let Some(id) = page.room {
+            match store.relay_room(project_id).map_err(core)? {
+                None => store.set_relay_room(project_id, id).map_err(core)?,
+                Some(mine) if mine != id => {
+                    return Err(RemoteError::NotFound(format!(
+                        "room {room} was deleted on the relay and opened again by someone else: it is another room \
+                         now. This board keeps everything it has; `ai-kanban room disconnect {room}` makes it private \
+                         again, and `ai-kanban room connect {room}` would join the new one"
+                    )));
+                }
+                Some(_) => {}
+            }
         }
         if page.changes.is_empty() {
             break;
@@ -184,7 +217,7 @@ fn round(store: &Store, client: &Client, project_id: i64, deadline: Option<std::
         let out = store.outbox(project_id, MAX_BATCH).map_err(core)?;
         let Some(&(last, _)) = out.last() else { break };
         let changes: Vec<_> = out.into_iter().map(|(_, c)| c).collect();
-        client.push(&room, &changes)?;
+        client.push(&room, &changes).map_err(|e| room_gone(&room, e))?;
         store.outbox_sent(project_id, last).map_err(core)?;
         done.pushed += changes.len();
     }

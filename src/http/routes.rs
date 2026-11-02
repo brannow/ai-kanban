@@ -235,6 +235,12 @@ fn add_handles(store: &Store, v: &mut serde_json::Value, texts: &[(&str, &str, i
     let handles: serde_json::Map<String, serde_json::Value> =
         h.tasks.keys().map(|id| (id.to_string(), json!(h.task(*id)))).collect();
     v["handles"] = serde_json::Value::Object(handles);
+    // Who filed each teammate's ticket: the page marks those cards.
+    let from: serde_json::Map<String, serde_json::Value> =
+        h.tasks.keys().filter_map(|id| h.task_from(*id).map(|w| (id.to_string(), json!(w)))).collect();
+    if !from.is_empty() {
+        v["task_authors"] = serde_json::Value::Object(from);
+    }
     let mut out = serde_json::Map::new();
     let mut authors = serde_json::Map::new();
     for (key, kind, id, raw) in texts {
@@ -455,6 +461,9 @@ pub async fn task(
     let mut texts: Vec<(&str, &str, i64, &str)> = detail.events.iter().zip(&event_keys)
         .map(|(e, k)| (k.as_str(), "event", e.id, e.body.as_str())).collect();
     texts.push((task_key.as_str(), "task", detail.task.id, detail.task.body.as_str()));
+    // Notes by key too, for `authors`: a teammate's note is marked on the page.
+    let note_keys: Vec<String> = detail.notes.iter().map(|n| format!("note:{}", n.id)).collect();
+    texts.extend(detail.notes.iter().zip(&note_keys).map(|(n, k)| (k.as_str(), "note", n.id, n.body.as_str())));
     let mut v = json!({
         "now": detail.now,
         "task": detail.task,

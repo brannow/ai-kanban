@@ -352,3 +352,48 @@ fn after_a_restore_a_client_that_only_read_still_gets_what_comes_next() {
     round(&benny);
     assert!(titles(&benny).contains(&"carla's, after the restore".to_string()), "{:?}", titles(&benny));
 }
+
+/// A room deleted on the relay and opened again under the same name is another room: its
+/// tasks are not the old room's, and a board that was in the old one must not take them in.
+#[test]
+fn a_room_deleted_and_opened_again_under_its_name_is_not_the_same_room() {
+    let relay = HttpRelay::start();
+    let benny = machine(&relay, "benny", "b1", "sbb");
+    let round = |m: &Machine| sync_board(&m.store, &m.client, m.pid);
+    benny.store.create_task(benny.pid, TaskDraft::new("from the old room")).unwrap();
+    check_identity(&benny.store, &benny.client).unwrap();
+    round(&benny).unwrap();
+
+    relay.admin().delete_room("sbahn").unwrap();
+    let carla = machine(&relay, "carla", "c1", "carla's board");
+    carla.store.create_task(carla.pid, TaskDraft::new("in the new room")).unwrap();
+    check_identity(&carla.store, &carla.client).unwrap();
+    round(&carla).unwrap();
+
+    let err = round(&benny).unwrap_err().to_string();
+    assert!(err.contains("opened again by someone else") && err.contains("room disconnect sbahn"), "says what happened: {err}");
+    assert_eq!(titles(&benny), ["from the old room"], "the new room's task stays out of the old board");
+
+    // With work of its own waiting, the push is what notices first -- and says the same.
+    benny.store.create_task(benny.pid, TaskDraft::new("written after")).unwrap();
+    let err = round(&benny).unwrap_err().to_string();
+    assert!(err.contains("no longer a member of room sbahn"), "{err}");
+    assert!(!titles(&benny).contains(&"in the new room".to_string()));
+}
+
+/// A room deleted on the relay, with nothing in its place: the board says so in words, and
+/// keeps all it has.
+#[test]
+fn a_room_deleted_on_the_relay_says_so_and_the_board_keeps_everything() {
+    let relay = HttpRelay::start();
+    let benny = machine(&relay, "benny", "b1", "sbb");
+    benny.store.create_task(benny.pid, TaskDraft::new("mine")).unwrap();
+    check_identity(&benny.store, &benny.client).unwrap();
+    sync_board(&benny.store, &benny.client, benny.pid).unwrap();
+    relay.admin().delete_room("sbahn").unwrap();
+    let err = sync_board(&benny.store, &benny.client, benny.pid).unwrap_err().to_string();
+    assert!(err.contains("no longer exists on the relay") && err.contains("room disconnect sbahn"), "{err}");
+    assert_eq!(titles(&benny), ["mine"]);
+    let recorded = benny.store.sync_status(benny.pid).unwrap().unwrap().last_error.unwrap();
+    assert!(recorded.contains("no longer exists"), "and the header has it: {recorded}");
+}

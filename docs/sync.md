@@ -691,6 +691,20 @@ docker exec kanban ai-kanban-relay key add benny laptop   # prints the key once,
   trips are real. `scripts/relay-load` opens N streams against a local relay limited to 1024 open
   files and reports CPU, files and push latency. Both are run by hand, not in CI: one needs the real
   relay, the other a quiet machine. Their numbers, and what they changed: note #333.
+- **A room is known by its id as well as its name.** A room deleted on the relay and opened again
+  under the same name is another room; bound by name alone, a board from the old one kept pulling
+  and took in the new room's tasks without a word. The relay never reuses a room id and sends it
+  with every pull (`Page.room`) and in `RoomInfo.id`; the client keeps it per board
+  (`sync_rooms.relay_room`, migration 019), set at connect, taken on the first pull by a board
+  connected before. A different id stops the round before anything is applied, saying what
+  happened and that `room disconnect` keeps the board, `room connect` joins the new room. A room
+  deleted with nothing in its place says so too; the board keeps everything either way.
+- **A teammate's work is marked as theirs wherever it shows**, so neither an agent nor a person
+  mistakes it for their own: a ticket on the board `(agent, from volker)`, in its detail
+  `filed 2d ago by volker (a teammate's, from the room)`, a note `(2d old, from volker)`, a
+  history entry `volker: …`. On the page a dashed coloured edge and `⇄ volker` on the card, in
+  the panel, on notes and history entries (`task_authors`, `authors`). This machine's own work is
+  unmarked, so an unshared board reads exactly as before.
 - **History says who.** A teammate's history entries carry the tag of the machine that wrote
   them (`sync_ids`), named by the room's member list as the person is called now: `volker:`
   for their agent, `volker (by hand):` for what they did themselves, their tag once they left.

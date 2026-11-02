@@ -275,6 +275,7 @@ fn task_line(
     if t.priority != Priority::Normal { meta.push(t.priority.to_string()); }
     // On a shared board: who is on it. The one fact that stops two people starting the same work.
     if let Some(who) = claimed_by { meta.push(format!("by {who}")); }
+    if let Some(from) = h.task_from(t.id) { meta.push(format!("from {from}")); }
     if let Some(b) = t.blocked_by {
         // The blocker's status, not just its id. A finished blocker is no longer a reason
         // to skip the task, and the id alone cannot say so -- which left tasks reading as
@@ -383,7 +384,10 @@ pub fn task_detail(d: &TaskDetail) -> String {
     let mut out = format!("Board: {}\n\n{} {}\n", d.project.name, h.task(t.id), one_line(&t.title));
     let mut meta = vec![t.status.to_string(), t.task_type.to_string(), format!("{} priority", t.priority), t.origin.to_string()];
     if let Some(r) = &d.external_ref { meta.push(format!("tracks issue {r}")); }
-    meta.push(format!("filed {}", since(d.now, t.created_at)));
+    meta.push(match h.task_from(t.id) {
+        Some(from) => format!("filed {} by {from} (a teammate's, from the room)", since(d.now, t.created_at)),
+        None => format!("filed {}", since(d.now, t.created_at)),
+    });
     out.push_str(&format!("  {}\n", meta.join(", ")));
 
     if !d.repos.is_empty() || !d.unmapped_repos.is_empty() {
@@ -430,7 +434,8 @@ pub fn task_detail(d: &TaskDetail) -> String {
     if !d.notes.is_empty() {
         out.push_str("\nnotes\n");
         for n in &d.notes {
-            out.push_str(&format!("  #{} {}  ({})\n", n.id, truncate(&n.title, 45), age(d.now, n.updated_at)));
+            let from = h.author("note", n.id).map(|w| format!(", from {w}")).unwrap_or_default();
+            out.push_str(&format!("  #{} {}  ({}{from})\n", n.id, truncate(&n.title, 45), age(d.now, n.updated_at)));
         }
     }
     if !d.events.is_empty() {

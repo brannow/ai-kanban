@@ -538,6 +538,7 @@ impl Store {
         .and_then(|mut d: TaskDetail| {
             let mut texts: Vec<(&str, i64)> = d.events.iter().map(|e| ("event", e.id)).collect();
             texts.push(("task", id));
+            texts.extend(d.notes.iter().map(|n| ("note", n.id)));
             d.handles = self.handles(&texts)?;
             Ok(d)
         })

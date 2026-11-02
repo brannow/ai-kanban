@@ -619,7 +619,7 @@ impl ServerDb {
             [id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        Ok(RoomInfo { name, created_at, created_by, members, changes, head, board, last_change_at })
+        Ok(RoomInfo { id: Some(id), name, created_at, created_by, members, changes, head, board, last_change_at })
     }
 
     pub fn rooms(&self) -> Result<Vec<RoomInfo>> {
@@ -841,7 +841,7 @@ impl ServerDb {
         }
         let more = changes.len() > limit;
         changes.truncate(limit);
-        Ok(Page { changes, head: self.head(room_id)?, more })
+        Ok(Page { changes, head: self.head(room_id)?, more, room: Some(room_id) })
     }
 
     /// What forgetting `r` in `room` would remove.

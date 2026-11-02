@@ -36,7 +36,10 @@ const HANDLES = {};
 const TEXTS = {};
 // Who wrote a history entry, when a teammate did: "volker", under the same key as its text.
 const AUTHORS = {};
-function by(key, actor) { return AUTHORS[key] ? `${AUTHORS[key]} \u00b7 ${actor}` : actor; }
+function by(key, actor) { return AUTHORS[key] ? `\u21c4 ${AUTHORS[key]} \u00b7 ${actor}` : actor; }
+// Who filed a teammate's ticket, by local id: those cards are marked as from the room.
+const TASK_AUTHORS = {};
+function from(id) { return TASK_AUTHORS[id] ? `<span class="from" title="a teammate's ticket, from the room">\u21c4 ${esc(TASK_AUTHORS[id])}</span>` : ''; }
 function tref(id) { return HANDLES[id] || ('#' + id); }
 function shown(key, raw) { return Object.prototype.hasOwnProperty.call(TEXTS, key) ? TEXTS[key] : raw; }
 
@@ -47,6 +50,7 @@ async function api(path, opts = {}) {
   if (body && body.handles) Object.assign(HANDLES, body.handles);
   if (body && body.texts) Object.assign(TEXTS, body.texts);
   if (body && body.authors) Object.assign(AUTHORS, body.authors);
+  if (body && body.task_authors) Object.assign(TASK_AUTHORS, body.task_authors);
   if (!res.ok) {
     const e = body && body.error || {};
     let msg = e.message || `${res.status} ${res.statusText}`;
@@ -242,10 +246,11 @@ function render() {
   $('#workstream').closest('label').hidden = isAll();
   $('#columns').innerHTML = b.columns.map(col => {
     const cards = col.tasks.map(t => `
-      <div class="card ${esc(t.task_type)}" data-id="${t.id}" data-pid="${t.project_id}">
+      <div class="card ${esc(t.task_type)}${TASK_AUTHORS[t.id] ? ' remote' : ''}" data-id="${t.id}" data-pid="${t.project_id}">
         <span class="t">${esc(tref(t.id))} ${esc(t.title)}</span>
         <span class="m">
           ${isAll() ? `<span class="board">${esc(boardName(t.project_id))}</span>` : ''}
+          ${from(t.id)}
           <span>${esc(t.task_type)}</span>
           ${t.priority !== 'normal' ? `<span class="pri-${esc(t.priority)}">${esc(t.priority)}</span>` : ''}
           ${t.origin === 'user' ? '<span class="badge-user">user</span>' : ''}
@@ -398,7 +403,7 @@ async function openTask(id, pid) {
       <button id="close">close</button>
     </div>
     <div class="m dim2" style="font-size:11px">
-      board ${esc(body.project.name)} · ${esc(t.task_type)} · ${esc(t.origin)} · v${t.version}<br>
+      board ${esc(body.project.name)} · ${esc(t.task_type)} · ${esc(t.origin)} · v${t.version}${TASK_AUTHORS[t.id] ? ` · ${from(t.id)} filed it` : ''}<br>
       created ${ago(t.created_at)} ago · updated ${ago(t.updated_at)} ago${lastActivity(body.events) !== null
         ? ` · last activity ${ago(lastActivity(body.events))} ago` : ''}
     </div>
@@ -437,6 +442,7 @@ async function openTask(id, pid) {
     ${body.notes.length ? `<section><h3>notes</h3>${body.notes.map(n => `
       <div class="note">
         <b>#${n.id} ${esc(n.title)}</b> <span class="dim2">${ago(n.updated_at)}</span>
+        ${AUTHORS['note:' + n.id] ? `<span class="from">\u21c4 ${esc(AUTHORS['note:' + n.id])}</span>` : ''}
         ${n.body ? `<div style="margin-top:5px">${esc(n.body)}</div>` : ''}
         ${n.paths.length ? `<div class="paths">${n.paths.map(esc).join(' · ')}</div>` : ''}
       </div>`).join('')}</section>` : ''}
