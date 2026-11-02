@@ -87,13 +87,28 @@ not slowed. The first sync round then asks the relay whose key it is, and the st
 tag (a store with no tag has never published, so it has nothing to collide with; a key copied
 from another machine is still caught by the high-water check, see "When sync pauses").
 
-An existing remote always wins: settings naming another relay or key are not taken, and every
-`board` answer opens with a heads-up that says so and how to switch (`ai-kanban remote
---disconnect`, then a new session). Overwriting would move the store to another identity, which
-`remote` itself refuses while boards are connected. This also settles two Claude configurations
-on one machine (`~/.claude`, `~/.claude-private`): there is one store and one remote, and
-whichever was set first stays. Decided 2026-10-29, after the first marketplace install showed
-that without it the key had to go through a terminal or the chat.
+**With no board connected the settings win; with boards connected the machine's remote does.**
+A new key typed into the menu -- the relay wiped and set up again, a key reissued -- takes effect
+at the next start, and the first round adopts the key's tag (nothing is in a room under the old
+one, which is when `set_origin_tag` allows the change; work published under it stays this
+store's own). With boards connected, settings naming another relay or key are not taken and
+`board` opens with a heads-up saying so; `ai-kanban remote <url> --key <key>` switches, checked
+against the relay. Decided 2026-11-03, replacing "an existing remote always wins", which left a
+dead key in use (and a heads-up at every start) on a machine with nothing shared.
+
+Why connected boards still keep their key: nothing local can tell a rotated key in the menu from
+a stale one in a **second Claude configuration** on the same machine (`~/.claude-private`,
+`~/.claude-team`). Both share one store and one `remote.json`; taking each configuration's
+settings at its start would let a stale key cut the boards off for both. So **all configurations
+on one machine must carry the same key**, or leave it empty. Letting the relay decide -- on a
+rejected key, try the one in the settings and keep it if the relay accepts it -- would settle
+rotation without a terminal; not built yet.
+
+**Relay trouble never stops local work and is only mentioned where it matters.** Sync runs in a
+background thread; no tool or page waits for it. A connected board's `board` header says
+`offline` (passes by itself) or `sync failing: <what>; local work is unaffected` (someone has
+to act), and nothing on boards that are not shared. The web UI's room badge dot is grey when
+offline and amber when someone has to act, the tooltip saying the board works as usual.
 
 The commands below do the same by hand, and the rest of connecting. Claude can run them when
 asked (the plugin puts `ai-kanban` on its shell's PATH); none of them needs the key once the
@@ -704,6 +719,14 @@ docker exec kanban ai-kanban-relay key add benny laptop   # prints the key once,
   connected before. A different id stops the round before anything is applied, saying what
   happened and that `room disconnect` keeps the board, `room connect` joins the new room. A room
   deleted with nothing in its place says so too; the board keeps everything either way.
+- **Connecting to a room that holds none of this machine's work forgets what was sent to a room
+  of that name before.** `sync_fields` remembers per room *name* what the room last received,
+  and a disconnect keeps it (the room-held-elsewhere guard reads it). After the relay was wiped,
+  or the room deleted and reopened, that memory read as "already sent": connecting published
+  only what was written afterwards. `room connect` now sees in its preview that the room has
+  none of this store's tasks (or does not exist) and, after the backup, drops that memory, so the
+  board goes over whole. The guard is skipped only for a room that does not exist: a machine that
+  only ever received from a room also has none of its own tasks there.
 - **A room's creator is kept as their tag, not their name** (#1080). `rooms.created_by` holds the
   tag and `room list` shows that tag's current name, so a rename shows everywhere at once. Rooms
   created before 0.2.5 hold the name itself; it matches no tag and is shown as stored.

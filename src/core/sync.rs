@@ -310,6 +310,16 @@ impl Store {
             .optional()?)
     }
 
+    /// Forgets what this store last sent to a room of this name (`sync_fields`), so connecting
+    /// sends the board whole. For when the room on the relay holds none of this store's work:
+    /// it was deleted and opened again, or the relay wiped and set up anew, and the memory
+    /// describes a room that is gone. Kept, it read as "already sent" and the new room got only
+    /// what was written after the connect.
+    pub fn forget_sent(&self, room: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM sync_fields WHERE room = ?1", [room])?;
+        Ok(())
+    }
+
     /// How many of this store's own tasks, published into `room`, it still has a row for on
     /// any board. Set against what the room holds under this store's tags, it tells whether a
     /// board that published there is gone.

@@ -797,7 +797,10 @@ function renderRoom() {
   if (!s) return;
   // Live from this process's own stream when it syncs; else judged from the last round.
   const fresh = s.live ?? (s.last_ok_at && SYNC.now - s.last_ok_at <= 120 && !s.last_error);
-  el.className = fresh ? 'live' : '';
+  // Amber when someone has to act (a rejected key, a room gone, sync paused); offline stays
+  // grey, it passes by itself. The board works either way, and the tooltip says so.
+  const act = SYNC.paused || (s.last_error && !s.last_error.startsWith('offline'));
+  el.className = fresh ? 'live' : act ? 'warn' : '';
   el.textContent = '';
   el.append(`\u21c4 ${s.room} `);
   const dot = document.createElement('span');
@@ -812,6 +815,7 @@ function renderRoom() {
     unsent ? `${s.unsent_tasks} task(s), ${s.unsent_notes} note(s) not sent yet` : 'nothing unsent',
     s.last_error ? `last error: ${s.last_error}` : null,
     SYNC.paused ? `sync paused: ${SYNC.paused}` : null,
+    act ? 'this board works locally as usual; it syncs again once that is fixed' : null,
     s.members.length ? 'team: ' + s.members.map(m => `${m.user} (${m.tag})`).join(', ') : null,
   ].filter(Boolean).join('\n');
 }

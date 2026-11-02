@@ -274,8 +274,10 @@ fn a_shared_board_names_its_room_its_team_and_anything_wrong_with_its_sync() {
     let h = header(&s, pid);
     assert!(h.contains("team: b1 benny (you), v1 volker  (offline, ") && h.ends_with(", 1 task unsent)"), "one task, however many fields it took: {h}");
     // Anything but unreachable needs someone to act, and says what.
+    assert!(!h.contains("unaffected"), "offline passes by itself, nothing to reassure about: {h}");
     s.sync_failed(pid, &RemoteError::Unauthorized.recorded()).unwrap();
     assert!(header(&s, pid).contains("(sync failing: key rejected, "), "{}", header(&s, pid));
+    assert!(header(&s, pid).contains("; local work is unaffected"), "a relay problem is not the agent's stop sign: {}", header(&s, pid));
     s.sync_failed(pid, &RemoteError::NotFound("no room sbahn".into()).recorded()).unwrap();
     assert!(header(&s, pid).contains("sync failing: room not found"), "{}", header(&s, pid));
 

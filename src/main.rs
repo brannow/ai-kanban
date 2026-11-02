@@ -407,11 +407,13 @@ async fn run_mcp() -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open_default()?;
     eprintln!("ai-kanban: store at {}", Store::default_path()?.display());
 
-    // A relay in the plugin's settings becomes this machine's remote if it has none (local
-    // only: the first sync round asks the relay who the key is). One that differs is not taken,
-    // and the agent is told so. A failure here must not cost the session its board.
+    // The relay in the plugin's settings becomes this machine's remote (local only: the first
+    // sync round asks the relay who the key is), unless boards are connected through another
+    // relay -- then the agent is told. A failure here must not cost the session its board; a
+    // store that cannot say counts as connected, the side that changes nothing.
     use ai_kanban::remote::config::{adopt_plugin_settings, Adoption};
-    let notice = match adopt_plugin_settings() {
+    let connected = store.connected_boards().map(|b| !b.is_empty()).unwrap_or(true);
+    let notice = match adopt_plugin_settings(connected) {
         Ok(Adoption::Adopted(cfg)) => {
             eprintln!("ai-kanban: relay {} from the plugin settings saved as this machine's remote", cfg.url);
             None

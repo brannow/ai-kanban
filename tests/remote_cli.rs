@@ -359,6 +359,58 @@ fn connecting_refuses_a_board_that_would_miss_the_rooms_tasks() {
     assert!(m.store().project_by_name_or_key("sbahn").is_err(), "no stray board made");
 }
 
+/// The relay wiped and set up again, as before going live: the board was disconnected, the
+/// old remote removed, a new key set (here with another tag). Connecting to the new room of
+/// the same name sends the board whole -- not just what was written after the connect, which
+/// is what the remembered "already sent to bmu" made of it.
+#[test]
+fn connecting_to_a_room_set_up_anew_sends_the_whole_board() {
+    let old = HttpRelay::start();
+    let benny = Machine::new();
+    let bp = benny.board("bmu");
+    benny.store().create_task(bp, TaskDraft::new("from before")).unwrap();
+    benny.ok(&["remote", &old.url, "--key", &old.key("benny", "b1")]);
+    benny.ok(&["room", "connect", "bmu", "--board", "bmu", "--yes"]);
+    benny.ok(&["room", "disconnect", "bmu", "--keep-foreign", "--yes"]);
+    benny.ok(&["remote", "--disconnect", "--yes"]);
+
+    let fresh = HttpRelay::start();
+    benny.ok(&["remote", &fresh.url, "--key", &fresh.key("benny", "b2")]);
+    benny.store().create_task(bp, TaskDraft::new("after the wipe")).unwrap();
+    benny.ok(&["room", "connect", "bmu", "--board", "bmu", "--yes"]);
+
+    let volker = Machine::new();
+    volker.board("x");
+    volker.ok(&["remote", &fresh.url, "--key", &fresh.key("volker", "v1")]);
+    volker.ok(&["room", "connect", "bmu", "--board", "x", "--yes"]);
+    let vs = volker.store();
+    let vp = vs.project_by_name_or_key("x").unwrap().id;
+    let mut titles: Vec<String> = vs.board(vp, &BoardQuery::board()).unwrap().tasks.into_iter().map(|t| t.title).collect();
+    titles.sort();
+    assert_eq!(titles, ["after the wipe", "from before"]);
+}
+
+/// A room this machine only received from holds none of its own tasks, which is how a room set
+/// up anew looks too. It must still not be connected to a second board here: its tasks are
+/// mapped onto the first board's rows and would not arrive on the second.
+#[test]
+fn a_room_only_received_from_still_cannot_go_to_a_second_board() {
+    let relay = HttpRelay::start();
+    let (benny, volker) = (Machine::new(), Machine::new());
+    let bp = benny.board("sbb");
+    benny.store().create_task(bp, TaskDraft::new("benny's")).unwrap();
+    benny.ok(&["remote", &relay.url, "--key", &relay.key("benny", "b1")]);
+    benny.ok(&["room", "connect", "sbahn", "--board", "sbb", "--yes"]);
+    volker.board("x");
+    volker.ok(&["remote", &relay.url, "--key", &relay.key("volker", "v1")]);
+    volker.ok(&["room", "connect", "sbahn", "--board", "x", "--yes"]);
+    volker.ok(&["room", "disconnect", "sbahn", "--keep-foreign", "--yes"]);
+
+    volker.board("second");
+    let out = volker.fails(&["room", "connect", "sbahn", "--board", "second", "--yes"]);
+    assert!(out.contains("on board \"x\""), "{out}");
+}
+
 /// The web UI syncs by itself, both ways: what is done on the page goes out within seconds,
 /// and what a teammate does shows up on it -- with no agent session running.
 #[test]

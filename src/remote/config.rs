@@ -87,8 +87,9 @@ pub enum Adoption {
     Adopted(RemoteConfig),
     /// This machine already uses exactly that relay and key.
     Same,
-    /// This machine already uses another relay or key, and keeps it. Overwriting it would move
-    /// the store to another identity, which `ai-kanban remote` refuses for connected boards too.
+    /// This machine already uses another relay or key, with boards connected through it, and
+    /// keeps it: nothing local can tell a rotated key from a stale one in another Claude
+    /// configuration, and taking the wrong one would cut every connected board off.
     Kept { machine: RemoteConfig },
 }
 
@@ -109,25 +110,38 @@ fn setting(raw: Option<String>) -> Option<String> {
     raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty() && !v.starts_with("${"))
 }
 
-/// Saves the relay from the plugin's settings as this machine's remote, unless it already has
-/// one. Purely local: the first sync round asks the relay who the key belongs to.
-pub fn adopt_plugin_settings() -> crate::core::Result<Adoption> {
+/// Saves the relay from the plugin's settings as this machine's remote (see `decide`). Purely
+/// local: the first sync round asks the relay who the key belongs to.
+pub fn adopt_plugin_settings(connected: bool) -> crate::core::Result<Adoption> {
     let (url, key) = (setting(std::env::var(PLUGIN_URL).ok()), setting(std::env::var(PLUGIN_KEY).ok()));
-    let decision = decide(url.zip(key), RemoteConfig::load_file()?);
+    let decision = decide(url.zip(key), RemoteConfig::load_file()?, connected);
     if let Adoption::Adopted(cfg) = &decision {
         cfg.save()?;
     }
     Ok(decision)
 }
 
-/// The rule, apart from the environment and the file: an existing remote always wins.
-pub fn decide(settings: Option<(String, String)>, machine: Option<RemoteConfig>) -> Adoption {
+/// The rule, apart from the environment and the file: with no board connected the settings
+/// win; with boards connected the machine's remote does.
+///
+/// With nothing connected there is nothing to protect, and the settings menu is where people
+/// put a key: a relay wiped and set up again, or a new key, must take effect without a
+/// terminal. It used to lose to any remote already saved, leaving a dead key in use and a
+/// heads-up at every start on a machine with nothing shared.
+///
+/// With boards connected the machine keeps its remote, because nothing local can tell which of
+/// two keys is the good one: a rotated key in the menu looks the same as a stale one in a
+/// second Claude configuration (`~/.claude`, `~/.claude-team`) sharing this store and its one
+/// `remote.json` -- and taking that one at every start of that configuration would cut the
+/// connected boards off for both. Only the relay can tell; until it is asked, the agent gets a
+/// heads-up.
+pub fn decide(settings: Option<(String, String)>, machine: Option<RemoteConfig>, connected: bool) -> Adoption {
     let Some((url, key)) = settings else { return Adoption::Unset };
     let offered = RemoteConfig { url: normalize_url(&url), key };
     match machine {
-        None => Adoption::Adopted(offered),
         Some(m) if m == offered => Adoption::Same,
-        Some(m) => Adoption::Kept { machine: m },
+        Some(m) if connected => Adoption::Kept { machine: m },
+        _ => Adoption::Adopted(offered),
     }
 }
 
@@ -148,13 +162,22 @@ mod tests {
     }
 
     #[test]
-    fn the_machine_keeps_its_remote_and_only_an_empty_one_is_filled() {
+    fn the_settings_win_unless_boards_are_connected() {
         let s = || Some(("kanban.example.com".to_string(), "akb_1".to_string()));
-        assert_eq!(decide(None, Some(cfg("https://a", "k"))), Adoption::Unset);
-        assert_eq!(decide(s(), None), Adoption::Adopted(cfg("https://kanban.example.com", "akb_1")));
-        assert_eq!(decide(s(), Some(cfg("https://kanban.example.com", "akb_1"))), Adoption::Same);
-        assert_eq!(decide(s(), Some(cfg("https://kanban.example.com", "akb_2"))), Adoption::Kept { machine: cfg("https://kanban.example.com", "akb_2") });
-        assert_eq!(decide(s(), Some(cfg("https://other", "akb_1"))), Adoption::Kept { machine: cfg("https://other", "akb_1") });
+        let offered = cfg("https://kanban.example.com", "akb_1");
+        for connected in [false, true] {
+            assert_eq!(decide(None, Some(cfg("https://a", "k")), connected), Adoption::Unset);
+            assert_eq!(decide(s(), None, connected), Adoption::Adopted(offered.clone()));
+            assert_eq!(decide(s(), Some(offered.clone()), connected), Adoption::Same);
+        }
+        // Nothing connected, nothing to protect: the relay set up again, a new key in the menu.
+        for machine in [cfg("https://kanban.example.com", "akb_dead"), cfg("https://other", "akb_1")] {
+            assert_eq!(decide(s(), Some(machine), false), Adoption::Adopted(offered.clone()));
+        }
+        // Connected: a stale key in a second Claude configuration must not cut the boards off.
+        for machine in [cfg("https://kanban.example.com", "akb_2"), cfg("https://other", "akb_1")] {
+            assert_eq!(decide(s(), Some(machine.clone()), true), Adoption::Kept { machine });
+        }
     }
 }
 

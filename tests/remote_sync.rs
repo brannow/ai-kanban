@@ -123,6 +123,25 @@ fn a_store_that_never_published_takes_the_tag_of_its_first_key() {
     assert_eq!(store.paused().unwrap(), None);
 }
 
+/// The relay wiped and set up again, the board disconnected meanwhile: the new key may come
+/// with another tag. Nothing this store holds is in a room any more, so it takes the key's tag
+/// instead of pausing on one nothing depends on -- and still knows its old one as its own.
+#[test]
+fn a_store_with_nothing_connected_takes_a_new_keys_tag() {
+    let relay = HttpRelay::start();
+    let benny = machine(&relay, "benny", "b1", "sbb");
+    benny.store.create_task(benny.pid, TaskDraft::new("mine")).unwrap();
+    sync_board(&benny.store, &benny.client, benny.pid).unwrap();
+    benny.store.disconnect_board(benny.pid, false).unwrap();
+
+    let fresh = HttpRelay::start();
+    let client = Client::new(&fresh.url, &fresh.key("benny", "b2"), Duration::from_secs(5));
+    check_identity(&benny.store, &client).unwrap();
+    assert_eq!(benny.store.origin_tag().unwrap().as_deref(), Some("b2"));
+    assert!(benny.store.is_own_tag("b1").unwrap(), "work published as b1 is still this store's");
+    assert_eq!(benny.store.paused().unwrap(), None);
+}
+
 #[test]
 fn a_fresh_store_on_a_key_already_in_use_elsewhere_is_still_caught() {
     // The same key on a second machine: the fresh store takes the tag, and the high-water check

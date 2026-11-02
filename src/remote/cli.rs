@@ -418,12 +418,18 @@ fn room_connect(store: &Store, room: &str, a: &Args) -> CliResult {
     // room they are answering them about.
     let existing = find_room(&c, &room)?;
     let mut published_before = 0;
+    // Whether the room is known to hold nothing this machine published: it does not exist yet,
+    // or its log has none of this store's tasks. Then what this store remembers sending to a
+    // room by that name is of one that is gone (deleted and reopened, or a relay set up anew),
+    // and is forgotten once the connect is confirmed.
+    let mut fresh = existing.is_none();
     match &existing {
         // A relay from before open reads cannot show it; connecting must still work there.
         Some(info) => match look(&c, &cfg.url, info, Some(store)) {
             Ok((p, mine)) => {
                 println!("{p}");
                 published_before = mine;
+                fresh = mine == 0;
             }
             Err(e) => println!("(cannot show what is in room \"{room}\": {e})\n"),
         },
@@ -441,7 +447,9 @@ fn room_connect(store: &Store, room: &str, a: &Args) -> CliResult {
         Pick::Board(pid) => Some(*pid),
         Pick::New(_) => None,
     };
-    if let Some((elsewhere, tasks)) = store.room_held_elsewhere(&room, target)? {
+    // Skipped only for a room that does not exist: one that does may hold tasks this machine
+    // received onto another board, and a room of nothing but those still looks "fresh".
+    if let Some((elsewhere, tasks)) = if existing.is_none() { None } else { store.room_held_elsewhere(&room, target)? } {
         let held = store.project(elsewhere)?.name;
         let fix = match &pick {
             Pick::Board(pid) => format!("or merge it into this one first: ai-kanban board merge \"{}\" \"{held}\"", store.project(*pid)?.name),
@@ -490,13 +498,22 @@ fn room_connect(store: &Store, room: &str, a: &Args) -> CliResult {
         return Ok(());
     }
 
-    let backup = Store::default_path()?
-        .parent()
-        .map(|d| d.to_path_buf())
-        .unwrap_or_default()
-        .join(format!("kanban-before-connect-{room}-{}.db", crate::core::now()));
+    // Whole seconds name it, so a second connect within the same one gets a counter rather
+    // than a refusal to overwrite the first backup.
+    let dir = Store::default_path()?.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+    let stamp = crate::core::now();
+    let mut backup = dir.join(format!("kanban-before-connect-{room}-{stamp}.db"));
+    for n in 2.. {
+        if !backup.exists() {
+            break;
+        }
+        backup = dir.join(format!("kanban-before-connect-{room}-{stamp}-{n}.db"));
+    }
     store.backup_to(&backup)?;
     println!("backup written: {}", backup.display());
+    if fresh {
+        store.forget_sent(&room)?;
+    }
 
     let pid = match pick {
         Pick::Board(pid) => pid,

@@ -41,7 +41,12 @@ pub fn check_identity(store: &Store, client: &Client) -> Result<(), RemoteError>
     // A store with no tag has never published, so it holds no numbers under any tag: it takes
     // the key's, as `ai-kanban remote` would. That lets a key from the plugin's settings be saved
     // without a round trip at startup. A copied key is still caught by the high-water check below.
-    if tag.is_none() && store.set_origin_tag(&who.tag).is_ok() {
+    //
+    // So does a store whose boards are all disconnected: nothing it holds is in a room under
+    // its old tag any more, which is when `set_origin_tag` allows the change (and why
+    // `ai-kanban remote` makes it too). A new key from the settings menu then just works,
+    // instead of pausing on a tag nothing depends on.
+    if tag.as_deref() != Some(who.tag.as_str()) && store.set_origin_tag(&who.tag).is_ok() {
         tag = Some(who.tag.clone());
     }
     if tag.as_deref() != Some(who.tag.as_str()) {

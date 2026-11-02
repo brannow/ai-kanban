@@ -66,9 +66,9 @@ pub fn claim_warning(handle: &str, who: &[String], since: i64, now: i64) -> Stri
 /// identity), so whoever changed the settings needs to hear that it did not take effect.
 pub fn relay_settings_kept(machine_url: &str) -> String {
     format!(
-        "Heads-up: ai-kanban's plugin settings name a different relay or key than this machine uses \
-         ({machine_url}). Kept this machine's. To switch, run `ai-kanban remote --disconnect` in a \
-         terminal and start a new session.\n\n"
+        "Heads-up: ai-kanban's plugin settings name a different relay or key than the one this \
+         machine's shared boards use ({machine_url}). Kept that one; local work is unaffected. If \
+         the settings are the right ones, run `ai-kanban remote <url> --key <key>` in a terminal.\n\n"
     )
 }
 
@@ -210,8 +210,10 @@ fn header(snap: &BoardSnapshot) -> String {
 /// Staleness is stated rather than hidden: the board is a local copy, and "last sync 3h ago"
 /// is the difference between "nobody is on this" and "nobody was on this three hours ago".
 fn sync_line(s: &crate::core::sync::SyncStatus, now: i64) -> String {
+    // A problem someone has to fix says so, and that the board itself is fine: the relay is an
+    // extra, and an agent reading "failing" must not stop working or go repair it.
     if let Some(why) = &s.paused {
-        return format!("sync paused: {why}\n");
+        return format!("sync paused: {why} (local work is unaffected)\n");
     }
     let mut state = Vec::new();
     if s.off {
@@ -246,11 +248,12 @@ fn sync_line(s: &crate::core::sync::SyncStatus, now: i64) -> String {
         if doing > 0 { notes.push(format!("{doing} doing")); }
         if notes.is_empty() { format!("{tag} {user}") } else { format!("{tag} {user} ({})", notes.join(", ")) }
     }).collect::<Vec<_>>().join(", ");
+    let unaffected = if state.iter().any(|s| s.starts_with("sync failing")) { "; local work is unaffected" } else { "" };
     match (team.is_empty(), state.is_empty()) {
         (true, true) => String::new(),
-        (true, false) => format!("sync: {}\n", state.join(", ")),
+        (true, false) => format!("sync: {}{unaffected}\n", state.join(", ")),
         (false, true) => format!("team: {team}\n"),
-        (false, false) => format!("team: {team}  ({})\n", state.join(", ")),
+        (false, false) => format!("team: {team}  ({}){unaffected}\n", state.join(", ")),
     }
 }
 
