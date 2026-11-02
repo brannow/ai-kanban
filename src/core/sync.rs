@@ -1269,6 +1269,34 @@ impl Store {
     /// Handles for every task on a connected board, and the origin of each listed text that
     /// another member wrote. `texts` names them as (`"event"` | `"task"` | `"note"`, local id);
     /// for a task or note it is the body, whose origin is whoever last wrote it.
+    /// Every room's members by tag, for naming who wrote what. A tag in two rooms is one
+    /// machine.
+    pub(crate) fn member_names(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut names = std::collections::HashMap::new();
+        let mut st = self.conn.prepare("SELECT members FROM sync_room_status")?;
+        for members in st.query_map([], |r| r.get::<_, String>(0))? {
+            let members: Vec<Value> = serde_json::from_str(&members?).unwrap_or_default();
+            for m in members {
+                if let (Some(t), Some(u)) = (m["tag"].as_str(), m["user"].as_str()) {
+                    names.insert(t.to_string(), u.to_string());
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    /// A repo key with no checkout here, as people read it: a folder without a remote is
+    /// named by whose machine it is on. Never fails: the hook reads this on stores that may
+    /// predate the tables, and a bare tag is still an answer.
+    pub(crate) fn unmapped_repo(&self, key: &str, names: &std::collections::HashMap<String, String>) -> crate::core::model::UnmappedRepo {
+        let (name, tag) = crate::core::project::parse_repo_key(key);
+        let owner = tag.map(|t| match self.is_own_tag(&t) {
+            Ok(true) => "you".to_string(),
+            _ => names.get(&t).cloned().unwrap_or(t),
+        });
+        crate::core::model::UnmappedRepo { name, owner }
+    }
+
     pub fn handles(&self, texts: &[(&str, i64)]) -> Result<Handles> {
         if !self.any_connected()? {
             return Ok(Handles::default());
@@ -1291,16 +1319,7 @@ impl Store {
                 _ => {}
             }
         }
-        // Every room's members, for naming who wrote what. A tag in two rooms is one machine.
-        let mut st = self.conn.prepare("SELECT members FROM sync_room_status")?;
-        for members in st.query_map([], |r| r.get::<_, String>(0))? {
-            let members: Vec<Value> = serde_json::from_str(&members?).unwrap_or_default();
-            for m in members {
-                if let (Some(t), Some(u)) = (m["tag"].as_str(), m["user"].as_str()) {
-                    h.names.insert(t.to_string(), u.to_string());
-                }
-            }
-        }
+        h.names = self.member_names()?;
         let me = tag.unwrap_or_default();
         for &(kind, local) in texts {
             let origin: Option<String> = match kind {
@@ -1507,16 +1526,20 @@ impl Store {
         Ok(())
     }
 
-    /// Labels of the repos on a task that have no checkout here. Empty on a store too old to
-    /// have the table, which the read-only hook can meet.
-    pub fn unmapped_repos(&self, task_id: i64) -> Result<Vec<String>> {
+    /// The repos on a task that have no checkout here. Empty on a store too old to have the
+    /// table, which the read-only hook can meet.
+    pub fn unmapped_repos(&self, task_id: i64) -> Result<Vec<crate::core::model::UnmappedRepo>> {
         let mut st = match self.conn.prepare("SELECT key FROM sync_unmapped_repos WHERE task_id = ?1 ORDER BY key") {
             Ok(st) => st,
             Err(e) if crate::core::workstream::is_missing_schema(&e) => return Ok(vec![]),
             Err(e) => return Err(e.into()),
         };
         let keys = st.query_map([task_id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(keys.iter().map(|k| crate::core::project::repo_key_label(k)).collect())
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+        let names = self.member_names().unwrap_or_default();
+        Ok(keys.iter().map(|k| self.unmapped_repo(k, &names)).collect())
     }
 }
 

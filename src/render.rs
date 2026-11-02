@@ -397,8 +397,13 @@ pub fn task_detail(d: &TaskDetail) -> String {
         for r in &d.repos {
             out.push_str(&format!("  {}  {}\n", r.name, r.path));
         }
-        for label in &d.unmapped_repos {
-            out.push_str(&format!("  {label}  (no checkout on this machine)\n"));
+        for u in &d.unmapped_repos {
+            let why = match u.owner.as_deref() {
+                None => "no checkout on this machine".to_string(),
+                Some("you") => "your folder, no longer on this board".to_string(),
+                Some(o) => format!("{o}'s folder: no git remote, so it exists only on their machine"),
+            };
+            out.push_str(&format!("  {}  ({why})\n", u.name));
         }
     } else if d.board_has_repos && t.status.is_open() {
         // The board only flags it; here, at the moment of starting, it says what to do.

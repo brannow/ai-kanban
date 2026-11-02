@@ -402,6 +402,27 @@ pub struct ProjectSummary {
     pub handles: Handles,
 }
 
+/// A repo on a shared task with no checkout on this machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnmappedRepo {
+    /// The remote's last path segment, or the folder's name.
+    pub name: String,
+    /// For a folder with no git remote, whose machine it is on ("you" for this one): nobody
+    /// else can have a checkout of it. None for a remote, which anyone could clone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+impl UnmappedRepo {
+    /// How the board line lists it: by name, with the owner for someone else's folder.
+    pub fn label(&self) -> String {
+        match self.owner.as_deref() {
+            Some(o) if o != "you" => format!("{} ({o}'s)", self.name),
+            _ => self.name.clone(),
+        }
+    }
+}
+
 /// One task with everything needed to resume it: full history and the notes attached to it.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskDetail {
@@ -414,9 +435,8 @@ pub struct TaskDetail {
     /// With their paths: task_show is where an agent commits to the work, so it is where it
     /// learns which checkouts that work is in.
     pub repos: Vec<Repo>,
-    /// Repos on this (shared) task that a teammate linked and this machine has no checkout of,
-    /// by label.
-    pub unmapped_repos: Vec<String>,
+    /// Repos on this (shared) task that a teammate linked and this machine has no checkout of.
+    pub unmapped_repos: Vec<UnmappedRepo>,
     pub external_ref: Option<String>,
     /// Whether the board tracks repos at all, so an empty `repos` can be told apart from a
     /// board where the question does not arise.

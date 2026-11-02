@@ -367,7 +367,9 @@ Each mutation on a connected board writes, **in the same transaction**, one chan
   checkout **without** a remote travels as `local:<tag>/<name>`, and only the machine with that
   origin tag resolves it (a restored store still knows its tags from before). It used to travel as
   `name:<name>`, which linked a teammate's ticket to any folder of the same name: two `notes`
-  folders on two laptops are unrelated. Teammates see it as `notes (v1's checkout)`. A key with no checkout on this machine is kept as
+  folders on two laptops are unrelated. Teammates see it by its owner's name, said once: `notes
+  (volker's folder: no git remote, so it exists only on their machine)` in the detail, `[notes
+  (volker's)]` on the board line (`UnmappedRepo`: a name, and an owner only for such folders). A key with no checkout on this machine is kept as
   *unmapped* and shown ("no checkout on this machine"), so a local edit never drops a teammate's
   link and the task does not read as "no repo set". Adding the checkout later adopts those links.
 - **Which checkouts a machine has is local setup.** Taking a repo off your board, or forgetting it,

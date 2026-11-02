@@ -28,6 +28,10 @@ fn link(m: &Member, task: i64, repo: i64) {
     m.store.update_task(m.pid, task, TaskPatch { repos: Some(vec![repo]), actor: Actor::Agent, ..Default::default() }).unwrap();
 }
 
+fn names(unmapped: Vec<UnmappedRepo>) -> Vec<String> {
+    unmapped.into_iter().map(|u| u.name).collect()
+}
+
 fn repo_names(m: &Member, task: i64) -> Vec<String> {
     m.store.task_repos(m.pid, task).unwrap().into_iter().map(|r| r.name).collect()
 }
@@ -48,7 +52,7 @@ fn a_repo_links_to_each_members_own_checkout_of_the_same_remote() {
     let vt = task_by_title(&volker, "fix svc");
     assert_eq!(volker.store.task_repos(volker.pid, vt.id).unwrap().into_iter().map(|r| r.id).collect::<Vec<_>>(), [vr.id]);
     assert_eq!(repo_names(&volker, vt.id), ["service"], "his own checkout, under his own name");
-    assert_eq!(volker.store.unmapped_repos(vt.id).unwrap(), Vec::<String>::new());
+    assert!(volker.store.unmapped_repos(vt.id).unwrap().is_empty());
 }
 
 #[test]
@@ -64,7 +68,7 @@ fn a_repo_with_no_checkout_here_is_kept_shown_and_never_dropped_by_a_local_edit(
 
     let vt = task_by_title(&volker, "fix svc");
     assert!(repo_names(&volker, vt.id).is_empty());
-    assert_eq!(volker.store.unmapped_repos(vt.id).unwrap(), ["svc"]);
+    assert_eq!(names(volker.store.unmapped_repos(vt.id).unwrap()), ["svc"]);
     let shown = render::task_detail(&volker.store.task_detail(volker.pid, vt.id).unwrap());
     assert!(shown.contains("svc  (no checkout on this machine)"), "{shown}");
     let line = render::board(&volker.store.board(volker.pid, &BoardQuery::board()).unwrap());
@@ -110,7 +114,7 @@ fn taking_a_repo_off_my_board_does_not_take_it_off_the_teams_tasks() {
     converge(&relay, &[&benny, &volker]);
     let vt = task_by_title(&volker, "fix svc");
     assert_eq!(repo_names(&volker, vt.id), ["svc"], "volker's link stands");
-    assert_eq!(benny.store.unmapped_repos(t.id).unwrap(), ["svc"], "benny still sees it, as not checked out here");
+    assert_eq!(names(benny.store.unmapped_repos(t.id).unwrap()), ["svc"], "benny still sees it, as not checked out here");
 
     // A deliberate change to the task's repos does travel.
     volker.store.update_task(volker.pid, vt.id, TaskPatch { repos: Some(vec![]), actor: Actor::Agent, ..Default::default() }).unwrap();
@@ -134,14 +138,28 @@ fn a_checkout_without_a_remote_is_its_machines_own_and_never_matched_by_name() {
 
     let vt = task_by_title(&volker, "write it down");
     assert!(repo_names(&volker, vt.id).is_empty(), "his own `notes` is another folder");
-    assert_eq!(volker.store.unmapped_repos(vt.id).unwrap(), ["notes (b1's checkout)"]);
+    // By tag until a round has told this store the members' names, then by name.
+    assert_eq!(volker.store.unmapped_repos(vt.id).unwrap(), [UnmappedRepo { name: "notes".into(), owner: Some("b1".into()) }]);
+    let members = [("b1".to_string(), "benny".to_string()), ("v1".to_string(), "volker".to_string())];
+    volker.store.sync_succeeded(volker.pid, &members).unwrap();
+    benny.store.sync_succeeded(benny.pid, &members).unwrap();
+    assert_eq!(volker.store.unmapped_repos(vt.id).unwrap(), [UnmappedRepo { name: "notes".into(), owner: Some("benny".into()) }]);
+    let shown = render::task_detail(&volker.store.task_detail(volker.pid, vt.id).unwrap());
+    assert!(shown.contains("notes  (benny's folder: no git remote, so it exists only on their machine)"), "said once, by name: {shown}");
+    let line = render::board(&volker.store.board(volker.pid, &BoardQuery::board()).unwrap());
+    assert!(line.contains("[notes (benny's)]"), "{line}");
 
     // Volker adds his folder: both travel, and each machine resolves only its own.
     volker.store.update_task(volker.pid, vt.id, TaskPatch { repos: Some(vec![vr.id]), actor: Actor::Agent, ..Default::default() }).unwrap();
     converge(&relay, &[&benny, &volker]);
     assert_eq!(benny.store.task_repos(benny.pid, t.id).unwrap().into_iter().map(|r| r.id).collect::<Vec<_>>(), [br.id]);
-    assert_eq!(benny.store.unmapped_repos(t.id).unwrap(), ["notes (v1's checkout)"]);
+    assert_eq!(benny.store.unmapped_repos(t.id).unwrap(), [UnmappedRepo { name: "notes".into(), owner: Some("volker".into()) }]);
     assert_eq!(volker.store.task_repos(volker.pid, vt.id).unwrap().into_iter().map(|r| r.id).collect::<Vec<_>>(), [vr.id]);
+
+    // Benny takes his folder off the board: kept on the task, and named as his own.
+    benny.store.remove_repo(benny.pid, br.id, Actor::User).unwrap();
+    let shown = render::task_detail(&benny.store.task_detail(benny.pid, t.id).unwrap());
+    assert!(shown.contains("notes  (your folder, no longer on this board)"), "{shown}");
 }
 
 #[test]

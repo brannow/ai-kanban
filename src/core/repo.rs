@@ -567,6 +567,7 @@ impl Store {
         // label, so a shared task does not read as "no repo set" on this machine. Tolerant: the
         // table is newer than stores the hook may read.
         let unmapped = tolerant((|| -> rusqlite::Result<HashMap<i64, Vec<String>>> {
+            let mut names = None;
             let mut st = self.conn.prepare(&format!(
                 "SELECT u.task_id, u.key FROM sync_unmapped_repos u JOIN tasks t ON t.id = u.task_id
                   WHERE t.project_id = ? AND u.task_id IN ({holes}) ORDER BY u.key"
@@ -574,7 +575,8 @@ impl Store {
             let mut out: HashMap<i64, Vec<String>> = HashMap::new();
             for row in st.query_map(rusqlite::params_from_iter(&ids), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
                 let (task, key) = row?;
-                out.entry(task).or_default().push(crate::core::project::repo_key_label(&key));
+                let names = names.get_or_insert_with(|| self.member_names().unwrap_or_default());
+                out.entry(task).or_default().push(self.unmapped_repo(&key, names).label());
             }
             Ok(out)
         })())?;

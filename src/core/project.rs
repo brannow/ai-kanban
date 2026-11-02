@@ -391,16 +391,17 @@ pub(crate) fn repo_key(path: &str, name: &str, tag: &str) -> String {
     }
 }
 
-/// What a repo key is called where no checkout exists to name it: the remote's last path
-/// segment, or for a machine's own folder its name and whose machine it is on.
-pub fn repo_key_label(key: &str) -> String {
+/// What a repo key is called where no checkout exists to name it -- the remote's last path
+/// segment, or the folder's name -- and, for a folder with no remote, the tag of the machine
+/// it is on.
+pub fn parse_repo_key(key: &str) -> (String, Option<String>) {
     if let Some(remote) = key.strip_prefix("git:") {
-        return remote.rsplit('/').next().unwrap_or(remote).to_string();
+        return (remote.rsplit('/').next().unwrap_or(remote).to_string(), None);
     }
     if let Some((tag, name)) = key.strip_prefix("local:").and_then(|k| k.split_once('/')) {
-        return format!("{name} ({tag}'s checkout)");
+        return (name.to_string(), Some(tag.to_string()));
     }
-    key.strip_prefix("name:").unwrap_or(key).to_string()
+    (key.strip_prefix("name:").unwrap_or(key).to_string(), None)
 }
 
 /// Collapses the many spellings of one remote into a single key.
