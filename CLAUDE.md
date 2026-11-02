@@ -81,6 +81,7 @@ cargo run -p ai-kanban-relay -- --db /tmp/r.db --debug   # the sync relay, loggi
 scripts/kanban-test claude b2   # a second client next to yours: own store, config, this build
 scripts/sync-smoke run          # web UI to web UI through the real relay, timed (setup: see header)
 scripts/relay-load              # what N notification streams cost a local relay: CPU, files, latency
+scripts/relay-stress            # W members writing at once: push/pull p99, delivery, heartbeats (#1090)
 ```
 
 **Set `AI_KANBAN_DB` when running anything by hand.** Without it you are writing to your real

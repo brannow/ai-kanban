@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# relay-stress -- many members writing at once against one relay (#1090): push and pull latency,
+# how fast a push reaches every stream in its room, and whether the relay's heartbeats stay on
+# time while its single database lock is busy.
+#
+#   scripts/relay-stress [W ...]        default 10 50 100 writers; RELAY_STRESS_STREAMS (300),
+#                                       RELAY_STRESS_SECONDS (65: long enough for two heartbeats),
+#                                       RELAY_STRESS_RATE (rounds/s per writer; 0 = no pause)
+#
+# Each W gets a fresh local relay on this checkout's build, with room for its open files so the
+# stream cap does not decide the result. Writers push and pull with no pause: far harsher than
+# people, whose agents write every few seconds at most -- the question is where it breaks.
+set -uo pipefail
+
+repo=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+bin=$repo/target/release/ai-kanban-relay
+port=7391
+streams=${RELAY_STRESS_STREAMS:-300}
+seconds=${RELAY_STRESS_SECONDS:-65}
+cargo build --release -q --manifest-path "$repo/Cargo.toml" -p ai-kanban-relay || exit 1
+[ $# -gt 0 ] || set -- 10 50 100
+
+key() { "$bin" --db "$1" key add "$2" | awk '/Team relay key/ {print $NF}'; }
+
+for w in "$@"; do
+	dir=$(mktemp -d)
+	keys=("$(key "$dir/r.db" streams)")
+	for i in $(seq 1 "$w"); do keys+=("$(key "$dir/r.db" "writer $i")"); done
+	(ulimit -n 16384; exec "$bin" --db "$dir/r.db" --listen 127.0.0.1:$port >"$dir/relay.log" 2>&1) &
+	relay=$!
+	sleep 1
+	python3 -I "$repo/scripts/relay-stress.py" $port $relay "$seconds" "$streams" "${keys[@]}"
+	kill $relay 2>/dev/null; wait $relay 2>/dev/null
+	rm -rf "$dir"
+done
