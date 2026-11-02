@@ -231,8 +231,13 @@ fn key(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("delete") => {
             let selector = a.arg(2).ok_or_else(|| usage("key delete <tag|id>"))?;
-            let n = db.delete_keys(selector)?;
-            println!("{n} revoked key(s) of {selector} deleted. The tag stays reserved: it is never given to another machine.");
+            let gone = db.delete_keys(selector)?;
+            let ids = gone.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(", ");
+            println!("deleted key{} {ids}.", if gone.len() == 1 { "" } else { "s" });
+            // A key never used had no tag to keep.
+            if let Some(tag) = gone.iter().find_map(|(_, t)| t.clone()) {
+                println!("Tag {tag} stays reserved: it is never given to another machine, since its handles may be in a room.");
+            }
         }
         Some("label") => {
             let id = db.key_id(a.arg(2).ok_or_else(|| usage("key label <tag|id> <label>"))?)?;

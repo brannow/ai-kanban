@@ -1035,7 +1035,7 @@ async fn a_revoked_key_is_replaced_by_rotating_and_deleted_only_once_revoked() {
     let live = f.relay.db.lock().unwrap().key_id("b1").unwrap();
     let err = f.relay.db.lock().unwrap().delete_keys(&live.to_string()).unwrap_err().to_string();
     assert!(err.contains("revoke it first"), "{err}");
-    assert_eq!(f.relay.db.lock().unwrap().delete_keys(&old.to_string()).unwrap(), 1);
+    assert_eq!(f.relay.db.lock().unwrap().delete_keys(&old.to_string()).unwrap(), [(old, Some("b1".to_string()))]);
     assert!(f.relay.db.lock().unwrap().keys().unwrap().iter().all(|k| k.id != old), "gone from the list");
     let err = f.relay.db.lock().unwrap().delete_keys("b1").unwrap_err().to_string();
     assert!(err.contains("revoke it first"), "by tag, a live key is refused too: {err}");

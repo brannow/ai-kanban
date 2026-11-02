@@ -443,24 +443,26 @@ impl ServerDb {
     /// not something the relay can know: a machine may have named itself and filed tasks as
     /// `#12-x1` while offline. Handed to someone else, the tag's handles would collide in a
     /// room without anything noticing. Tags cost nothing; reusing one could cost a board.
-    /// Returns how many keys went.
-    pub fn delete_keys(&self, selector: &str) -> Result<usize> {
-        let ids: Vec<(i64, Option<i64>)> = match selector.parse::<i64>() {
-            Ok(id) => self.conn.prepare("SELECT id, revoked_at FROM keys WHERE id = ?1")?.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?,
-            Err(_) => self.conn.prepare("SELECT id, revoked_at FROM keys WHERE tag = ?1")?.query_map([selector], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?,
+    /// Returns the keys that went: id, and tag if it had one.
+    pub fn delete_keys(&self, selector: &str) -> Result<Vec<(i64, Option<String>)>> {
+        let sql = match selector.parse::<i64>() {
+            Ok(_) => "SELECT id, revoked_at, tag FROM keys WHERE id = ?1",
+            Err(_) => "SELECT id, revoked_at, tag FROM keys WHERE tag = ?1",
         };
-        if ids.is_empty() {
+        let rows: Vec<(i64, Option<i64>, Option<String>)> =
+            self.conn.prepare(sql)?.query_map([selector], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        if rows.is_empty() {
             return Err(ServerError::NotFound(format!("no key {selector} (a key id or a tag, from key list --all)")));
         }
-        if let Some((live, _)) = ids.iter().find(|(_, revoked)| revoked.is_none()) {
+        if let Some((live, _, _)) = rows.iter().find(|(_, revoked, _)| revoked.is_none()) {
             return Err(ServerError::Conflict(format!("key {live} is live; revoke it first (key revoke {live}), then delete it")));
         }
         let tx = self.conn.unchecked_transaction()?;
-        for (id, _) in &ids {
+        for (id, _, _) in &rows {
             tx.execute("DELETE FROM keys WHERE id = ?1", [id])?;
         }
         tx.commit()?;
-        Ok(ids.len())
+        Ok(rows.into_iter().map(|(id, _, tag)| (id, tag)).collect())
     }
 
     pub fn label_key(&self, id: i64, label: &str) -> Result<()> {
