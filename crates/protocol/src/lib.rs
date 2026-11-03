@@ -129,6 +129,15 @@ pub struct Change {
     #[serde(default)]
     pub value: serde_json::Value,
     pub clock: Clock,
+    /// Re-sent by a member who holds it, on behalf of `clock.tag`, its author: after a move to
+    /// another relay, so the room is whole even if the author never comes back (docs/sync.md,
+    /// "Moving to another relay"). The author and clock stay the original ones; the relay
+    /// records who carried it. A receiver applies a carried change only where it has nothing
+    /// for that field yet, so carrying fills gaps and can never overwrite anything -- neither a
+    /// newer edit nor another member's work. Absent (false) on every other change, which keeps
+    /// their bodies, and the relay's duplicate check on them, as they were.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub carried: bool,
     /// Envelope fields this build does not know, kept and passed on. Without this a relay older
     /// than its clients would strip what a newer client added, and an additive envelope change
     /// would need a new route like a breaking one. Maps serialize with sorted keys, so the
@@ -177,7 +186,18 @@ pub struct Hello {
     pub protocol_min: u32,
     pub protocol_max: u32,
     pub server_version: String,
+    /// Made once with the relay's database, never changed. A client that finds another one
+    /// than it last synced with is on a relay that moved or was set up anew, and sends what it
+    /// holds again (docs/sync.md, "Moving to another relay"). None from an older relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
 }
+
+/// The header a client names its origin tag in, on every authenticated request. A key the
+/// relay has not bound to a tag yet takes this one if no other key holds it, and is refused
+/// rather than bound to another if one does: a machine keeps its tag across relays, and with
+/// it the identity of every task it created. Empty when the machine has no tag yet.
+pub const CLAIM_HEADER: &str = "x-ai-kanban-tag";
 
 /// The highest counters the server has accepted from one tag. A client whose own counters are
 /// lower was restored from a backup or copied, and would reissue ids the room already has.
@@ -342,6 +362,7 @@ mod tests {
             field: None,
             value: serde_json::Value::Null,
             clock: Clock { wall_ms: 0, counter: 0, tag: "b1".into() },
+            carried: false,
             extra: Default::default(),
         };
         assert_eq!(ch.cid_parts(), Some(("b1", 12)));

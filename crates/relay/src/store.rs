@@ -32,6 +32,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrate_002_room_board.sql"),
     include_str!("migrate_003_keys_and_names.sql"),
     include_str!("migrate_004_key_client.sql"),
+    include_str!("migrate_005_instance_and_seen_tags.sql"),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -350,6 +351,12 @@ impl ServerDb {
     /// that the tag never changes -- handles like `#122-v1` are published under it -- and only
     /// the name does. Names may repeat; tags tell their owners apart.
     pub fn name_key(&self, key_id: i64, name: &str) -> Result<Principal> {
+        self.name_key_as(key_id, name, None)
+    }
+
+    /// `name_key`, for a client that says which tag its machine already publishes under
+    /// (`protocol::CLAIM_HEADER`). Only a key not bound yet uses it.
+    pub fn name_key_as(&self, key_id: i64, name: &str, claim: Option<&str>) -> Result<Principal> {
         let name = valid_name(name)?;
         let tx = self.conn.unchecked_transaction()?;
         let tag: Option<String> = tx.query_row("SELECT tag FROM keys WHERE id = ?1", [key_id], |r| r.get(0))?;
@@ -358,12 +365,34 @@ impl ServerDb {
                 tx.execute("UPDATE tags SET name = ?2 WHERE tag = ?1", params![tag, name])?;
                 tag
             }
-            None => {
+            // The tag the machine already publishes under, if it says so: it keeps the identity
+            // of everything it created across relays. Refused if another key holds it, never
+            // swapped for another tag -- a key bound to the wrong one cannot be unbound, and
+            // would make a teammate's tasks this machine's (#1132).
+            None => match claim.filter(|t| protocol::valid_tag(t) && *t != protocol::SERVER_TAG) {
+                Some(wanted) => {
+                    let taken: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM tags WHERE tag = ?1)", [wanted], |r| r.get(0))?;
+                    if taken {
+                        return Err(ServerError::Conflict(format!(
+                            "this machine publishes as {wanted}, and on this relay tag {wanted} belongs to another key. \
+                             A second key for the same machine comes from `key rotate {wanted}`; a machine of its own \
+                             needs `key add` and a store that never published as {wanted}"
+                        )));
+                    }
+                    tx.execute("INSERT INTO tags (tag, name, created_at) VALUES (?1, ?2, ?3)", params![wanted, name, now()])?;
+                    tx.execute("UPDATE keys SET tag = ?2 WHERE id = ?1", params![key_id, wanted])?;
+                    wanted.to_string()
+                }
+                None => {
                 let initial = initial(&name);
                 let mut n = 1;
                 let tag = loop {
                     let tag = format!("{initial}{n}");
-                    let taken: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM tags WHERE tag = ?1)", [&tag], |r| r.get(0))?;
+                    let taken: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM tags WHERE tag = ?1) OR EXISTS(SELECT 1 FROM seen_tags WHERE tag = ?1)",
+                        [&tag],
+                        |r| r.get(0),
+                    )?;
                     if !taken && tag != protocol::SERVER_TAG {
                         break tag;
                     }
@@ -372,7 +401,8 @@ impl ServerDb {
                 tx.execute("INSERT INTO tags (tag, name, created_at) VALUES (?1, ?2, ?3)", params![tag, name, now()])?;
                 tx.execute("UPDATE keys SET tag = ?2 WHERE id = ?1", params![key_id, tag])?;
                 tag
-            }
+                }
+            },
         };
         tx.commit()?;
         Ok(Principal { user: name, tag, key_id })
@@ -503,6 +533,11 @@ impl ServerDb {
         Ok(())
     }
 
+    /// This relay's instance id (`Hello::instance`): made with the database, the same in a copy.
+    pub fn instance(&self) -> Result<String> {
+        Ok(self.conn.query_row("SELECT value FROM instance WHERE id = 1", [], |r| r.get(0))?)
+    }
+
     /// The live key a bearer key is, without binding anything: the key's id and its tag and
     /// name if it has them. For the naming route, which must run before the tag is fixed, and
     /// for the debug log, which must not change what it watches.
@@ -524,10 +559,16 @@ impl ServerDb {
     /// been named gets a generated name, and with it its tag: a client from before names
     /// (0.1.x) never sends one, and must still work with a key issued since.
     pub fn authenticate(&self, key: &str) -> Result<Principal> {
+        self.authenticate_as(key, None)
+    }
+
+    /// `authenticate`, with the tag the client says its machine publishes under
+    /// (`protocol::CLAIM_HEADER`), used only by a key not bound yet.
+    pub fn authenticate_as(&self, key: &str, claim: Option<&str>) -> Result<Principal> {
         let (key_id, named) = self.lookup(key)?;
         let p = match named {
             Some((tag, user)) => Principal { user, tag, key_id },
-            None => self.name_key(key_id, &generated_name()?)?,
+            None => self.name_key_as(key_id, &generated_name()?, claim)?,
         };
         // Minute resolution is plenty for "when was this key last seen", and it keeps a
         // chatty client from turning every pull into a write.
@@ -720,6 +761,9 @@ impl ServerDb {
 // The change log
 // ---------------------------------------------------------------------------
 
+/// The field of a forget's tombstone (`forget`), as clients read it.
+const FORGOTTEN: &str = "forgotten";
+
 fn body_hash(body: &str) -> String {
     hash_key(body)
 }
@@ -746,7 +790,17 @@ impl ServerDb {
                 Some((tag, _)) => return Err(bad(format!("change id carries tag {tag}, but this key is {}", p.tag))),
                 None => return Err(bad("change id must be <tag>:<positive number>".into())),
             }
-            if ch.clock.tag != p.tag {
+            // A carried change keeps its author's clock (see `Change::carried`): receivers only
+            // ever fill a gap with it, so it cannot win a conflict under someone else's tag. A
+            // carried tombstone is the server's own, from the relay the room moved from.
+            if ch.carried {
+                if !protocol::valid_tag(&ch.clock.tag) && ch.clock.tag != protocol::SERVER_TAG {
+                    return Err(bad(format!("a carried change's clock carries no valid tag ({:?})", ch.clock.tag)));
+                }
+                if (ch.clock.tag == protocol::SERVER_TAG) != (ch.field.as_deref() == Some(FORGOTTEN)) {
+                    return Err(bad("only a forget is carried under the server's tag, and only under it".into()));
+                }
+            } else if ch.clock.tag != p.tag {
                 return Err(bad(format!("clock carries tag {}, but this key is {}", ch.clock.tag, p.tag)));
             }
             if !ch.entity.valid() {
@@ -757,9 +811,22 @@ impl ServerDb {
             }
         }
 
+        // A forget carried from the relay this room moved from is done again here, as this
+        // relay's own: the same removal, its own tombstone, and nothing about the task can be
+        // pushed back. First, so the batch's own changes about it are already turned away.
+        for ch in changes.iter().filter(|c| c.carried && c.clock.tag == protocol::SERVER_TAG) {
+            if ch.entity.kind == "event" {
+                return Err(ServerError::BadRequest(format!("change {}: only a task or a note can be forgotten", ch.cid)));
+            }
+            self.forget(room, &ch.entity)?;
+        }
         let mut out = Pushed::default();
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         for ch in changes {
+            if ch.carried && ch.clock.tag == protocol::SERVER_TAG {
+                out.forgotten += 1;
+                continue;
+            }
             if self.is_forgotten(room_id, &ch.entity)? || ch.subject.as_ref().map(|s| self.is_forgotten(room_id, s)).transpose()?.unwrap_or(false) {
                 out.forgotten += 1;
                 continue;
@@ -800,6 +867,10 @@ impl ServerDb {
             }
             if ch.entity.origin == p.tag {
                 bump(&tx, &p.tag, &ch.entity.kind, ch.entity.id)?;
+            }
+            // Spoken for from now on: a generated tag never takes one (see `name_key_as`).
+            for t in [Some(ch.entity.origin.as_str()), s_origin, Some(ch.clock.tag.as_str())].into_iter().flatten() {
+                tx.execute("INSERT OR IGNORE INTO seen_tags (tag) VALUES (?1)", [t])?;
             }
             out.accepted += 1;
         }
@@ -893,13 +964,14 @@ impl ServerDb {
             cid: format!("{}:{seq}", protocol::SERVER_TAG),
             entity: r.clone(),
             subject: None,
-            field: Some("forgotten".into()),
+            field: Some(FORGOTTEN.into()),
             value: serde_json::Value::Bool(true),
             clock: protocol::Clock {
                 wall_ms: now() * 1000,
                 counter: 0,
                 tag: protocol::SERVER_TAG.into(),
             },
+            carried: false,
             extra: Default::default(),
         };
         let body = serde_json::to_string(&tomb).map_err(|e| ServerError::Other(e.to_string()))?;

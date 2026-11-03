@@ -172,13 +172,15 @@ fn remote_set(store: &Store, url: &str, key: &str, name: Option<&str>) -> CliRes
     need_network()?;
     let url = config::normalize_url(url);
     let connected = store.connected_boards()?;
-    if let Some(old) = RemoteConfig::load()? {
-        if old.url != url && !connected.is_empty() {
-            return Err(format!(
-                "{} board(s) are connected to rooms on {}. Disconnect them first (ai-kanban room disconnect <room>), \
-                 or keep the relay and use: ai-kanban remote --move <url>",
-                connected.len(), old.url
-            ).into());
+    let offered = RemoteConfig::new(&url, key);
+    let old = RemoteConfig::load_file()?;
+    // Another relay or key with boards connected: the team is moving, or the key was replaced.
+    // The boards stay connected (docs/sync.md, "Moving to another relay"); what only the old
+    // relay has comes along first.
+    if let Some(old) = old.as_ref().filter(|o| !o.same_remote(&offered) && !connected.is_empty()) {
+        let n = super::engine::drain(store, old, std::time::Duration::from_secs(10));
+        if n > 0 {
+            println!("synced {n} board(s) with {} one last time", old.url);
         }
     }
     let c = Client::new(&url, key, TIMEOUT);
@@ -194,6 +196,7 @@ fn remote_set(store: &Store, url: &str, key: &str, name: Option<&str>) -> CliRes
         }
         None => None,
     };
+    super::engine::claim(store, &c);
     let who = c.identify(name)?;
     if let Some(tag) = store.origin_tag()? {
         if tag != who.tag && !connected.is_empty() {
@@ -205,7 +208,10 @@ fn remote_set(store: &Store, url: &str, key: &str, name: Option<&str>) -> CliRes
         }
     }
     store.set_origin_tag(&who.tag)?;
-    let cfg = RemoteConfig { url: url.clone(), key: key.trim().into() };
+    let cfg = match &old {
+        Some(o) => o.replaced_by(&offered),
+        None => offered,
+    };
     cfg.save()?;
     println!("ok: logged in as {}, origin tag {} (protocol {}, relay {})", who.user, who.tag, hello.protocol_max, hello.server_version);
     println!("The team sees you as {}; change it any time: ai-kanban remote --name <name>", who.user);

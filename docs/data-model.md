@@ -437,6 +437,13 @@ nothing shared.
 | `sync_parked` | received changes this binary cannot store yet |
 | `sync_forgotten` | entities a room forgot, kept forever |
 | `sync_unmapped_repos` | repo keys on shared tasks with no checkout on this machine |
+| `sync_names` (020) | the last name each tag went by, kept when it leaves a member list: after a relay move a teammate not back yet still shows by name |
+| `sync_left_relays` (020) | relay instances this store moved away from, so a session still holding the old relay cannot move the board back there |
+
+Migration 020 also added `sync_node.relay_instance` (the relay this store last synced with: another
+one is a move, which sends everything held there again), `sync_node.own_name` (the name a new
+relay's key is given when the plugin settings name none) and `sync_rooms.rejoin` (the room is on
+a relay where this store is not a member yet). Why each: `docs/sync.md`, "Moving to another relay".
 
 Every column of `tasks`, `notes` and `events` is classified as synced or local in
 `src/core/sync.rs`; `tests/sync_core.rs` fails on a column in neither list.

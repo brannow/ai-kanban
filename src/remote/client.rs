@@ -4,7 +4,8 @@
 //! the sync thread. `ureq` has no overall timeout by default; one here is what keeps a tool call
 //! that pulls before a claim from hanging the session when the relay is unreachable.
 
-use crate::sync::protocol::{Change, Hello, Joined, Page, Push, Pushed, RoomInfo, WhoAmI};
+use crate::sync::protocol::{Change, Hello, Joined, Page, Push, Pushed, RoomInfo, WhoAmI, CLAIM_HEADER};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
@@ -63,31 +64,83 @@ pub struct Client {
     url: String,
     key: String,
     agent: ureq::Agent,
+    /// The tag this machine publishes under, sent with every request so that a key not bound
+    /// yet takes it (see `claim`). Shared by clones: the watch threads use the same key.
+    claim: Arc<Mutex<String>>,
+    /// The relay instance `check_identity` last passed for with this client (`verified`): the
+    /// one the store was on then. `None` until it has. Shared by clones.
+    verified: Arc<Mutex<Option<Option<String>>>>,
 }
 
 impl Client {
     /// `timeout` bounds each whole call, connecting included.
     pub fn new(url: &str, key: &str, timeout: Duration) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .timeout_connect(Some(timeout.min(Duration::from_secs(5))))
-            // ureq drops an idle connection after 15s by default, and from across the world a
-            // new one costs ~0.55s (TCP + TLS) on top of the request, so a change after a quiet
-            // spell paid it on both sides. Past the daemon's 60s full round the connection stays
-            // open for good; below the 180s a proxy commonly keeps an idle one (Traefik's
-            // default). One closed earlier is noticed before reuse and replaced (note #333).
-            .max_idle_age(Duration::from_secs(90))
-            .http_status_as_error(false)
-            // Which ai-kanban this is, for the relay's admin (`key list`) and for the relay to
-            // refuse one too old for it.
-            .user_agent(crate::sync::protocol::client_agent(env!("CARGO_PKG_VERSION")))
-            .build()
-            .into();
-        Client { url: super::config::normalize_url(url), key: key.trim().to_string(), agent }
+        Client { url: super::config::normalize_url(url), key: key.trim().to_string(), agent: agent(timeout), claim: Arc::default(), verified: Arc::default() }
+    }
+
+    /// The same relay and key with another timeout, sharing what this one knows: the claimed
+    /// tag, and that the relay was checked (`verified`). For the round before a claim, which
+    /// needs short requests but must not wait for its own check.
+    pub fn with_timeout(&self, timeout: Duration) -> Self {
+        Client { agent: agent(timeout), ..self.clone() }
+    }
+}
+
+/// The HTTP agent every client call goes through, with `timeout` bounding each whole call.
+fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .timeout_connect(Some(timeout.min(Duration::from_secs(5))))
+        // ureq drops an idle connection after 15s by default, and from across the world a
+        // new one costs ~0.55s (TCP + TLS) on top of the request, so a change after a quiet
+        // spell paid it on both sides. Past the daemon's 60s full round the connection stays
+        // open for good; below the 180s a proxy commonly keeps an idle one (Traefik's
+        // default). One closed earlier is noticed before reuse and replaced (note #333).
+        .max_idle_age(Duration::from_secs(90))
+        .http_status_as_error(false)
+        // Which ai-kanban this is, for the relay's admin (`key list`) and for the relay to
+        // refuse one too old for it.
+        .user_agent(crate::sync::protocol::client_agent(env!("CARGO_PKG_VERSION")))
+        .build()
+        .into()
+}
+
+impl Client {
+
+    /// Asks the relay to bind a key it has not bound yet to `tag`, the one this machine already
+    /// publishes under. On every request, because whichever comes first binds the key -- the
+    /// round before a claim, a room listing and the web UI can all come before naming it. A
+    /// machine that keeps its tag across relays keeps its tasks' identity: a relay set up anew
+    /// otherwise hands tags out by who comes first, and can give this machine a teammate's
+    /// (#1132, docs/sync.md "Moving to another relay"). A relay that does not know the header
+    /// ignores it; `check_identity` catches what it binds instead.
+    pub fn claim(&self, tag: Option<&str>) {
+        *self.claim.lock().unwrap_or_else(|e| e.into_inner()) = tag.unwrap_or_default().to_string();
+    }
+
+    /// `check_identity` passed with the store on relay `instance`: this client may sync for
+    /// it. A round checks again whenever the store is on another instance by then -- moved by
+    /// another process, while this one still holds the old relay.
+    pub fn verified(&self, instance: Option<String>) {
+        *self.verified.lock().unwrap_or_else(|e| e.into_inner()) = Some(instance);
+    }
+
+    /// Whether `check_identity` passed with the store on relay `instance`.
+    pub fn is_verified_for(&self, instance: Option<&str>) -> bool {
+        self.verified.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|v| v.as_deref() == instance)
+    }
+
+    fn claimed(&self) -> String {
+        self.claim.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Whether this client talks to `cfg`'s relay with `cfg`'s key.
+    pub fn is_for(&self, cfg: &super::RemoteConfig) -> bool {
+        self.url == cfg.url && self.key == cfg.key
     }
 
     fn room_url(&self, room: &str, rest: &str) -> String {
@@ -100,7 +153,7 @@ impl Client {
     }
 
     pub fn whoami(&self) -> Result<WhoAmI, RemoteError> {
-        let res = self.agent.get(format!("{}/v1/whoami", self.url)).header("authorization", self.bearer()).call().map_err(offline)?;
+        let res = self.agent.get(format!("{}/v1/whoami", self.url)).header("authorization", self.bearer()).header(CLAIM_HEADER, self.claimed()).call().map_err(offline)?;
         read(res)
     }
 
@@ -111,7 +164,7 @@ impl Client {
         let body = serde_json::to_vec(&crate::sync::protocol::SetName { name: name.to_string() }).map_err(|e| RemoteError::Http(0, e.to_string()))?;
         let res = self.agent
             .put(format!("{}/v1/me", self.url))
-            .header("authorization", self.bearer())
+            .header("authorization", self.bearer()).header(CLAIM_HEADER, self.claimed())
             .header("content-type", "application/json")
             .send(body)
             .map_err(offline)?;
@@ -131,13 +184,13 @@ impl Client {
     }
 
     pub fn rooms(&self) -> Result<Vec<RoomInfo>, RemoteError> {
-        let res = self.agent.get(format!("{}/v1/rooms", self.url)).header("authorization", self.bearer()).call().map_err(offline)?;
+        let res = self.agent.get(format!("{}/v1/rooms", self.url)).header("authorization", self.bearer()).header(CLAIM_HEADER, self.claimed()).call().map_err(offline)?;
         read(res)
     }
 
     /// `board` names the joining board; the relay keeps it if this join creates the room.
     pub fn join(&self, room: &str, board: Option<&str>) -> Result<Joined, RemoteError> {
-        let mut req = self.agent.post(self.room_url(room, "join")).header("authorization", self.bearer());
+        let mut req = self.agent.post(self.room_url(room, "join")).header("authorization", self.bearer()).header(CLAIM_HEADER, self.claimed());
         if let Some(b) = board {
             req = req.query("board", b);
         }
@@ -145,7 +198,7 @@ impl Client {
     }
 
     pub fn leave(&self, room: &str) -> Result<(), RemoteError> {
-        let res = self.agent.post(self.room_url(room, "leave")).header("authorization", self.bearer()).send_empty().map_err(offline)?;
+        let res = self.agent.post(self.room_url(room, "leave")).header("authorization", self.bearer()).header(CLAIM_HEADER, self.claimed()).send_empty().map_err(offline)?;
         match res.status().as_u16() {
             204 | 200 => Ok(()),
             _ => read::<serde_json::Value>(res).map(|_| ()),
@@ -155,7 +208,7 @@ impl Client {
     pub fn push(&self, room: &str, changes: &[Change]) -> Result<Pushed, RemoteError> {
         let res = self.agent
             .post(self.room_url(room, "changes"))
-            .header("authorization", self.bearer())
+            .header("authorization", self.bearer()).header(CLAIM_HEADER, self.claimed())
             .header("content-type", "application/json")
             // Not `send_json`: ureq pretty-prints it, which about doubles every push.
             .send(serde_json::to_vec(&Push { changes: changes.to_vec() }).map_err(|e| RemoteError::Http(0, e.to_string()))?)
@@ -166,7 +219,7 @@ impl Client {
     pub fn pull(&self, room: &str, since: i64, limit: usize) -> Result<Page, RemoteError> {
         let res = self.agent
             .get(self.room_url(room, &format!("changes?since={since}&limit={limit}")))
-            .header("authorization", self.bearer())
+            .header("authorization", self.bearer()).header(CLAIM_HEADER, self.claimed())
             .call()
             .map_err(offline)?;
         read(res)
@@ -191,7 +244,7 @@ impl Client {
             .user_agent(crate::sync::protocol::client_agent(env!("CARGO_PKG_VERSION")))
             .build()
             .into();
-        let res = agent.get(self.room_url(room, "events")).header("authorization", self.bearer()).call().map_err(offline)?;
+        let res = agent.get(self.room_url(room, "events")).header("authorization", self.bearer()).header(CLAIM_HEADER, self.claimed()).call().map_err(offline)?;
         if res.status().as_u16() != 200 {
             return read::<serde_json::Value>(res).map(|_| ());
         }

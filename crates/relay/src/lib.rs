@@ -133,7 +133,7 @@ impl Relay {
         let agent = client_check(headers)?;
         let key = bearer(headers).ok_or(ServerError::Unauthorized)?;
         let db = self.db();
-        let p = db.authenticate(key)?;
+        let p = db.authenticate_as(key, claimed(headers))?;
         if let Some(agent) = agent {
             db.saw_client(p.key_id, agent)?;
         }
@@ -214,12 +214,18 @@ type ApiResult<T> = Result<Json<T>, ServerError>;
 
 /// The one route without a key: a client has to learn whether it can talk to this server at
 /// all before it has anything worth authenticating.
-async fn hello() -> Json<Hello> {
-    Json(Hello {
+async fn hello(State(r): State<Relay>) -> ApiResult<Hello> {
+    Ok(Json(Hello {
         protocol_min: protocol::MIN_PROTOCOL_VERSION,
         protocol_max: protocol::PROTOCOL_VERSION,
         server_version: env!("CARGO_PKG_VERSION").to_string(),
-    })
+        instance: Some(r.db().instance()?),
+    }))
+}
+
+/// The tag the client says its machine publishes under, if it says one.
+fn claimed(headers: &HeaderMap) -> Option<&str> {
+    headers.get(protocol::CLAIM_HEADER).and_then(|v| v.to_str().ok()).map(str::trim).filter(|t| !t.is_empty())
 }
 
 async fn whoami(State(r): State<Relay>, headers: HeaderMap) -> ApiResult<WhoAmI> {
@@ -236,7 +242,7 @@ async fn set_name(State(r): State<Relay>, headers: HeaderMap, Json(body): Json<p
     let key = bearer(&headers).ok_or(ServerError::Unauthorized)?;
     let db = r.db();
     let (key_id, _) = db.lookup(key)?;
-    let p = db.name_key(key_id, &body.name)?;
+    let p = db.name_key_as(key_id, &body.name, claimed(&headers))?;
     if let Some(agent) = agent {
         db.saw_client(key_id, agent)?;
     }

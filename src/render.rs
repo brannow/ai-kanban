@@ -64,11 +64,17 @@ pub fn claim_warning(handle: &str, who: &[String], since: i64, now: i64) -> Stri
 /// Said first on `board` when the plugin's settings name a relay or key other than the one this
 /// machine already uses. The machine's wins (overwriting it would move the store to another
 /// identity), so whoever changed the settings needs to hear that it did not take effect.
-pub fn relay_settings_kept(machine_url: &str) -> String {
+pub fn relay_settings_kept(machine_url: &str, left: bool) -> String {
+    let why = if left {
+        "a relay or key this machine already moved away from"
+    } else {
+        "a different relay or key than this machine uses, set from elsewhere (another Claude configuration, or `ai-kanban remote`)"
+    };
     format!(
-        "Heads-up: ai-kanban's plugin settings name a different relay or key than the one this \
-         machine's shared boards use ({machine_url}). Kept that one; local work is unaffected. If \
-         the settings are the right ones, run `ai-kanban remote <url> --key <key>` in a terminal.\n\n"
+        "Heads-up: ai-kanban's plugin settings in this Claude configuration name {why}. It stays on \
+         {machine_url}; local work is unaffected. If that is the right relay, the person updates the \
+         settings here (/plugin -> ai-kanban -> Configure) to match; if the settings here are the right \
+         ones, re-entering them changes nothing -- run `ai-kanban remote <url> --key <key>` instead.\n\n"
     )
 }
 

@@ -32,6 +32,18 @@ impl HttpRelay {
         r
     }
 
+    /// Another relay serving a copy of `other`'s database, at another address: the same relay
+    /// moved to a new host, through the relay's own snapshot so the WAL comes with it.
+    pub fn from_copy(other: &HttpRelay) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("server.db");
+        other.admin().snapshot(&db_path).unwrap();
+        let addr = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let mut r = HttpRelay { url: format!("http://{addr}"), db_path, log: Arc::default(), addr, stop: None, thread: None, _dir: dir };
+        r.resume();
+        r
+    }
+
     /// An admin handle on the relay's database, like `docker exec ai-kanban-relay ...`.
     pub fn admin(&self) -> ServerDb {
         ServerDb::open(&self.db_path).unwrap()

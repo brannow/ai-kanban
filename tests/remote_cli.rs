@@ -300,23 +300,34 @@ fn removing_the_remote_uncouples_every_board_and_forgets_the_key() {
     assert!(m.ok(&["remote"]).contains("No remote set"));
 }
 
+/// A new relay with boards connected is the team moving: the boards stay connected, the old
+/// relay gets one last round, and the board goes on in its room on the new one, under the same
+/// tag (docs/sync.md, "Moving to another relay"). Until 0.3.0 this was refused with
+/// "disconnect them first".
 #[test]
-fn a_new_relay_url_is_refused_while_boards_are_connected_but_a_move_is_fine() {
+fn a_new_relay_with_boards_connected_moves_them_there() {
     let relay = HttpRelay::start();
     let m = Machine::new();
-    m.board("a");
-    let key = relay.key("benny", "b1");
-    m.ok(&["remote", &relay.url, "--key", &key]);
+    let pid = m.board("a");
+    m.ok(&["remote", &relay.url, "--key", &relay.key("benny", "b1"), "--name", "benny"]);
     m.ok(&["room", "connect", "one", "--board", "a", "--yes"]);
+    m.store().create_task(pid, TaskDraft::new("before the move")).unwrap();
+
     let other = HttpRelay::start();
-    let refused = m.fails(&["remote", &other.url, "--key", &other.key("benny", "b1")]);
-    assert!(refused.contains("Disconnect them first") && refused.contains("--move"), "{refused}");
+    let (_, fresh) = other.admin().issue_key("benny laptop").unwrap();
+    let out = m.ok(&["remote", &other.url, "--key", &fresh]);
+    assert!(out.contains("synced 1 board(s)") && out.contains("origin tag b1"), "{out}");
+    let synced = m.ok(&["room", "sync"]);
+    assert!(synced.contains("one: pushed"), "{synced}");
+    let rooms = other.admin().rooms().unwrap();
+    assert_eq!(rooms.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["one"], "the room is on the new relay");
+    assert!(rooms[0].changes > 0);
 
     // The same relay under another name -- here, localhost for 127.0.0.1.
-    let moved = relay.url.replace("127.0.0.1", "localhost");
+    let moved = other.url.replace("127.0.0.1", "localhost");
     assert!(m.ok(&["remote", "--move", &moved]).contains("now reached at"));
     assert!(m.ok(&["room", "sync"]).contains("one: pushed"));
-    let not_a_move = m.fails(&["remote", "--move", &other.url]);
+    let not_a_move = m.fails(&["remote", "--move", &relay.url]);
     assert!(not_a_move.contains("rejected the key") || not_a_move.contains("different relay"), "{not_a_move}");
 }
 

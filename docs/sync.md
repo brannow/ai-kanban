@@ -533,7 +533,141 @@ Sync stops for the whole store, never local work, when continuing would corrupt 
   `ai-kanban room connect` again. Work
   published under the old tag stays the store's own (`sync_own_tags`).
 
+After a move to another relay (below), three more:
+
+- the tag this store publishes under belongs to another key on the new relay;
+- the new relay gave this key a tag that other people's work on this store already carries
+  (a relay that does not know the claim);
+- the room on the new relay is someone else's under the same name.
+
 A good check lifts the pause by itself; `ai-kanban remote` and `ai-kanban room status` show it.
+
+### Moving to another relay
+
+A team moves its relay to another server, or its relay is set up again from nothing. Either way
+nothing changes for the people in it: each enters the new relay's URL and key in the plugin
+settings, and their boards stay connected, keep every task and carry on. Nobody disconnects or
+reconnects, and the order in which they come back does not matter. No task is lost, counted
+twice, or shown as someone else's. Decided 2026-11-03 (#1133), after `tests/relay_move.rs`
+showed the old way (disconnect, new key, connect) losing and misattributing work (#1130, #1132).
+
+**Why it can be invisible.** The relay is a mailbox, not the source of truth: every member holds
+the whole board, and the room is the union of those copies. A move only has to put the copies
+together again on the new relay, without anything stale winning, anything counted twice, or
+anyone's work becoming somebody else's.
+
+**What makes it safe**, each against a failure seen in a test or in the code:
+
+1. **A machine keeps its tag across relays.** A task is known everywhere by (tag, number). A tag
+   that changes owner turns two people's tasks into one person's, and sends that person's new
+   tasks into numbers already taken (#1132: owners swapped on both sides, two new tasks never
+   arrived, a pause telling the wrong story). Tags used to be the relay's to hand out, by who
+   named a key first. Now every request carries the tag the store publishes under
+   (`x-ai-kanban-tag`). A key not bound yet takes that tag if no other key holds it, and is
+   refused (409) rather than bound to a different one if it is taken. A header rather than a
+   field of the naming request, because *any* first request binds a key: the round before a
+   claim, `room_list` and the web UI can all come before the naming. A relay also never
+   generates a tag that already appears on changes in one of its rooms, which keeps a new
+   member out of an absent member's numbers.
+   If another key on the new relay already holds the tag, sync pauses and says so: binding
+   this machine's key to any other tag would split its work in two, and only the admin can
+   sort the keys out (`key rotate`).
+   The client holds the line even against a relay that does not know the claim: a store
+   refuses a tag that other people's tasks on it already carry, and pauses instead of taking it.
+   **The name travels too.** Without a name in the plugin settings, a new relay's key is named
+   with the one this machine went by (`sync_node.own_name`), not a generated "clever-crane";
+   and every tag's last known name is kept (`sync_names`), so a teammate not back yet still
+   shows by name rather than as a bare tag.
+
+2. **The client knows it is another relay.** `hello` carries the relay's instance id, made once
+   with its database. The store remembers the instance it last synced with:
+   - **same instance, shorter log:** restored from a snapshot, handled as below ("each machine
+     sends its own again");
+   - **same instance, other URL:** the relay's database was copied to a new host. Not a move at
+     all; nothing happens;
+   - **another instance:** a move or a wipe. Handled once, for every connected board: the
+     room's id from the old relay is forgotten (so it does not read as "deleted and reopened by
+     someone else"), the room is joined again (created, if nobody is back yet), the cursor goes
+     back to 0, and everything the store holds about the room is queued again (point 3).
+   A room that already exists on the new relay with content, from members none of whom this
+   store has work from, is not this team's room: it is left again, and sync pauses instead of
+   merging into it.
+   A store from before 0.3.0 has no instance recorded. On its first sync with a relay that
+   names one it tells from the relay itself: one that has less from this store than it sent,
+   or lacks a room the store is in under that room's id, is another relay. On the same relay
+   neither is true, and only the instance is recorded.
+   A relay too old to have an instance id, after one that had it, cannot be told apart, so it
+   is not moved to: sync pauses with what to do, and nothing is sent.
+   Nothing goes to a relay a client has not been checked against with the store where it is
+   now: a round checks again whenever the store has moved since -- through another process,
+   while this one still holds the old relay. The round before a claim does not run the check
+   inside its 2.5s budget; it skips its pull until the background round has checked.
+
+3. **Everything held goes out again, and none of it can win against a newer edit.** What this
+   machine wrote goes out as itself, with the clocks of the original edits, as after a restore.
+   What others wrote goes out **carried**: original author and clock unchanged, the relay
+   recording who carried it. A receiver applies a carried field only where it has no value for
+   that field at all. So a carried change fills a gap and never overwrites anything: a stale
+   copy cannot undo an edit made in the meantime (#1130), and carrying cannot be used to
+   change another member's work. The cost: the relay accepts changes on another member's
+   behalf, limited to filling gaps (it refused those outright before). What it buys: the room
+   is whole even if a member never comes back (left the team, laptop dead), and the order does
+   not matter. Fill-only holds between clients from 0.3.0 on: an older one reads a carried
+   change as an ordinary one. An honest move stays safe with it, since the clocks are the
+   original ones; what it loses is only the guard against a member forging changes to others'
+   work. Whoever comes back first brings everybody's work, and each later member's copy
+   only fills what is still missing.
+   Only what is on the board now goes out: `sync_fields` is kept by room name, and also holds
+   what an earlier board under that name published, or what was moved off the board since.
+   A field of a placeholder (a task first met through someone's edit to it, not yet its own
+   fields) is not a value, and a carried change fills it.
+   Considered and dropped: each member re-sends only their own work (the restore behaviour).
+   It keeps the relay's authorship rule strict, but the room stays incomplete until every
+   author is back, and for good if one never is.
+
+4. **Forgets come along.** A forget is the relay admin's tombstone. A member that applied one
+   remembers it (`sync_forgotten`) and carries it to the new relay, which keeps it as its own;
+   receivers apply it as before. Without it, a member who had not pulled the forget yet would
+   bring the task back. The relay cannot check that a carried tombstone is one the old relay
+   made, so a member could forge one and remove a task from the room; accepted (2026-11-03) as
+   the price of a move that needs nobody, in a room whose members the admin chose. Considered and
+   dropped: the admin exports tombstones and imports them on the new relay. That works for a
+   planned move, but not for a relay that was lost.
+
+5. **The old relay is drained first, if it is still there.** When the URL or key changes, one
+   last round runs against the old remote before the new one is touched -- at session start
+   before the sync thread and the tools exist, or in `ai-kanban remote` -- so a change that
+   reached only the old relay is not left behind. Bounded (8-10s); after a wipe there is nothing
+   to drain, and it costs one connect timeout.
+
+6. **No process moves the board back.** A session started before the move still holds the old
+   URL and key. Its sync thread rereads the saved remote before every round and switches with
+   it; until then, a store refuses to treat a relay it moved away from (`sync_left_relays`) as
+   a new move, unless the saved remote is that relay again -- a person deciding to go back.
+
+**Reconnecting by hand works the same way.** A room deleted on the relay and opened again still
+takes disconnect and connect. That connect, too, sends what the board published before with the
+clocks it was written at, and carries others' work where the relay takes it, instead of stamping
+the whole board as of now (0.2.7), which let a member's stale copy undo a teammate's newer edits
+(#1130).
+
+**What people do:** the relay admin runs the new relay and issues keys (`key add <label>`); each
+member puts the URL and key into the plugin settings, or runs `ai-kanban remote <url> --key <key>`.
+That is all.
+
+**The settings now win while boards are connected.** Until 0.3.0 the machine's remote won once a
+board was connected (0.2.7): a stale key in a second Claude configuration looks like a rotated
+one, and taking it would cut every board off. With moves invisible, the settings menu is where a
+move is made, so new settings are taken. "New" means this configuration's settings changed since
+it last started (`remote.json` keeps, per configuration, what it last saw), not that they differ
+from the machine's remote: a configuration that only disagrees is behind -- the switch was made
+in the other one, or with `ai-kanban remote` -- and is told so instead of flipping the machine
+back. A URL and key the machine replaced are remembered too and never taken again. A
+configuration seen for the first time, the first start after the upgrade included, does what it
+did before: switches only if no board is connected.
+
+**Not covered:** a team that splits, some moving and some staying, ends up with two rooms that
+drift apart. Nothing on one machine can tell that apart from a move in progress.
 
 ### Hooks
 

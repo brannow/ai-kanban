@@ -142,6 +142,31 @@ fn a_store_with_nothing_connected_takes_a_new_keys_tag() {
     assert_eq!(benny.store.paused().unwrap(), None);
 }
 
+/// A relay set up anew can hand a teammate's old tag to this machine. Taking it would make
+/// their tasks this store's own and send its next tasks into their numbers (#1132), so the
+/// store pauses instead, says why, and keeps its tag.
+#[test]
+fn a_key_with_a_teammates_old_tag_pauses_instead_of_taking_their_work() {
+    let relay = HttpRelay::start();
+    let benny = machine(&relay, "benny", "b1", "sbb");
+    let volker = machine(&relay, "volker", "v1", "sbahn upgrade");
+    volker.store.create_task(volker.pid, TaskDraft::new("volker's")).unwrap();
+    for m in [&volker, &benny] {
+        check_identity(&m.store, &m.client).unwrap();
+        sync_board(&m.store, &m.client, m.pid).unwrap();
+    }
+    assert_eq!(titles(&benny), ["volker's"]);
+    benny.store.disconnect_board(benny.pid, false).unwrap();
+
+    let fresh = HttpRelay::start();
+    let client = Client::new(&fresh.url, &fresh.key("benny", "v1"), Duration::from_secs(5));
+    let err = check_identity(&benny.store, &client).unwrap_err();
+    assert!(matches!(err, RemoteError::Paused(ref why) if why.contains("tag v1") && why.contains("other people's work")), "{err:?}");
+    assert_eq!(benny.store.origin_tag().unwrap().as_deref(), Some("b1"), "the store keeps its own tag");
+    assert!(benny.store.set_origin_tag("v1").is_err(), "and refuses it when asked directly");
+    assert!(benny.store.paused().unwrap().is_some());
+}
+
 #[test]
 fn a_fresh_store_on_a_key_already_in_use_elsewhere_is_still_caught() {
     // The same key on a second machine: the fresh store takes the tag, and the high-water check
@@ -265,6 +290,13 @@ fn the_round_before_a_claim_is_bounded_even_by_a_relay_that_never_answers() {
     s.create_task(pid, TaskDraft::new("claimed while the network is bad")).unwrap();
 
     let client = Client::new(&format!("http://{addr}"), "akb_x", Duration::from_millis(1200));
+    // Never checked, it sends nothing: the round before a claim does not run the check inside
+    // its budget, and leaves it to the background round.
+    let start = std::time::Instant::now();
+    assert!(matches!(sync_board_within(&s, &client, pid, Duration::from_millis(2500)), Ok(d) if d.pushed == 0));
+    assert!(start.elapsed() < Duration::from_millis(100), "took {:?}", start.elapsed());
+    // Checked earlier in the session, and the relay has gone silent since.
+    client.verified(s.relay_instance().unwrap());
     let start = std::time::Instant::now();
     let r = sync_board_within(&s, &client, pid, Duration::from_millis(2500));
     assert!(start.elapsed() < Duration::from_millis(3500), "took {:?}", start.elapsed());

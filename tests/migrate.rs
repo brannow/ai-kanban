@@ -152,7 +152,8 @@ fn pre_testing_status_store(path: &std::path::Path) {
     let conn = rusqlite::Connection::open(path).unwrap();
     // Undo 012 too, or migrating from 9 re-adds a column this store already has. A rename
     // is enough: SQLite rewrites the triggers with it, and 012 drops the FTS table anyway.
-    // And 019, for the same reason: it adds `sync_rooms.relay_room`.
+    // And 019 and 020, for the same reason: they add `sync_rooms.relay_room`,
+    // `sync_rooms.rejoin` and `sync_node.relay_instance`.
     conn.execute_batch(
         "PRAGMA writable_schema = ON;
          UPDATE sqlite_schema
@@ -161,6 +162,8 @@ fn pre_testing_status_store(path: &std::path::Path) {
          PRAGMA writable_schema = RESET;
          ALTER TABLE tasks RENAME COLUMN external_ref TO planio;
          ALTER TABLE sync_rooms DROP COLUMN relay_room;
+         ALTER TABLE sync_rooms DROP COLUMN rejoin;
+         ALTER TABLE sync_node DROP COLUMN relay_instance; ALTER TABLE sync_node DROP COLUMN own_name; DROP TABLE sync_names; DROP TABLE sync_left_relays;
          PRAGMA user_version = 9;",
     ).unwrap();
     assert!(
@@ -245,6 +248,8 @@ fn pre_external_ref_store(path: &std::path::Path) {
         "ALTER TABLE tasks RENAME COLUMN external_ref TO planio;
          UPDATE tasks SET planio = CAST(planio AS INTEGER) WHERE planio IS NOT NULL;
          ALTER TABLE sync_rooms DROP COLUMN relay_room;
+         ALTER TABLE sync_rooms DROP COLUMN rejoin;
+         ALTER TABLE sync_node DROP COLUMN relay_instance; ALTER TABLE sync_node DROP COLUMN own_name; DROP TABLE sync_names; DROP TABLE sync_left_relays;
          PRAGMA user_version = 11;",
     ).unwrap();
 }
@@ -297,6 +302,7 @@ fn a_store_migrated_by_the_draft_of_014_is_repaired_by_015() {
         let s = ai_kanban::core::Store::open(&path).unwrap();
         s.conn.execute_batch(
             "DROP TABLE sync_own_tags; DROP TABLE sync_unmapped_repos; ALTER TABLE sync_rooms DROP COLUMN relay_room;
+             ALTER TABLE sync_rooms DROP COLUMN rejoin; ALTER TABLE sync_node DROP COLUMN relay_instance; ALTER TABLE sync_node DROP COLUMN own_name; DROP TABLE sync_names; DROP TABLE sync_left_relays;
              PRAGMA user_version = 14;
              UPDATE sync_node SET tag = 'b1' WHERE id = 1;",
         ).unwrap();

@@ -27,6 +27,7 @@ use super::config::{self, RemoteConfig};
 use super::engine::{check_identity, sync_board, sync_board_changes, sync_board_within};
 use crate::core::Store;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -63,7 +64,8 @@ enum Kick {
 
 pub struct Syncer {
     kick: Sender<Kick>,
-    claim: Client,
+    /// Replaced by the sync thread when the saved remote changes (see `start_with`).
+    claim: Arc<Mutex<Client>>,
     live: Live,
 }
 
@@ -82,10 +84,14 @@ impl Syncer {
         }
         let cfg = RemoteConfig::load().ok().flatten()?;
         let (tx, rx) = channel::<Kick>();
-        let background = Client::new(&cfg.url, &cfg.key, Duration::from_secs(30));
+        let mut background = Client::new(&cfg.url, &cfg.key, Duration::from_secs(30));
         let notify = tx.clone();
         let live: Live = Arc::default();
         let watching = live.clone();
+        let claim = Arc::new(Mutex::new(background.with_timeout(CLAIM_REQUEST)));
+        let claiming = claim.clone();
+        // Bumped when the saved remote changes; a room's stream on the old relay ends with it.
+        let generation = Arc::new(AtomicU64::new(0));
         std::thread::Builder::new()
             .name("ai-kanban-sync".into())
             .spawn(move || {
@@ -97,9 +103,26 @@ impl Syncer {
                 let mut backoff = EVERY;
                 let mut healthy = true;
                 let mut last_full: Option<Instant> = None;
+                let mut current = cfg;
                 loop {
+                    // The saved remote changed under this session -- `ai-kanban remote` with a new
+                    // relay, or another session's settings (docs/sync.md, "Moving to another
+                    // relay"). Taken at once: a session that kept the old relay would read it as
+                    // a move back there, and the store refuses that (`engine::moved`).
+                    if let Ok(Some(now)) = RemoteConfig::load()
+                        && !now.same_remote(&current)
+                    {
+                        background = Client::new(&now.url, &now.key, Duration::from_secs(30));
+                        *claiming.lock().unwrap_or_else(|e| e.into_inner()) = background.with_timeout(CLAIM_REQUEST);
+                        generation.fetch_add(1, Ordering::Relaxed);
+                        watching.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                        watched.clear();
+                        last_full = None;
+                        current = now;
+                    }
                     let full = !healthy || last_full.is_none_or(|t| t.elapsed() >= EVERY);
-                    healthy = round(&store, &background, &mut watched, &mut named, &notify, &watching, full, &applied);
+                    let streams = (&generation, generation.load(Ordering::Relaxed));
+                    healthy = round(&store, &background, &mut watched, &mut named, &notify, &watching, streams, full, &applied);
                     if full && healthy {
                         last_full = Some(Instant::now());
                     }
@@ -133,7 +156,7 @@ impl Syncer {
                 }
             })
             .ok()?;
-        Some(Syncer { kick: tx, claim: Client::new(&cfg.url, &cfg.key, CLAIM_REQUEST), live })
+        Some(Syncer { kick: tx, claim, live })
     }
 
     /// Something was written: publish it soon.
@@ -170,7 +193,8 @@ impl Syncer {
         if store.paused().ok().flatten().is_some() || self.current(&room, cursor) {
             return;
         }
-        let _ = sync_board_within(store, &self.claim, project_id, CLAIM_BUDGET);
+        let claim = self.claim.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let _ = sync_board_within(store, &claim, project_id, CLAIM_BUDGET);
     }
 
     /// The rooms whose notification stream is connected right now, as `current` judges it: what
@@ -190,8 +214,8 @@ impl Syncer {
 /// sync is allowed. Only a `full` round checks identity and refreshes the member list.
 #[allow(clippy::too_many_arguments)]
 fn round(
-    store: &Store, client: &Client, watched: &mut HashSet<String>, named: &mut bool, notify: &Sender<Kick>, live: &Live, full: bool,
-    applied: &dyn Fn(),
+    store: &Store, client: &Client, watched: &mut HashSet<String>, named: &mut bool, notify: &Sender<Kick>, live: &Live,
+    streams: (&Arc<AtomicU64>, u64), full: bool, applied: &dyn Fn(),
 ) -> bool {
     let boards = store.connected_boards().unwrap_or_default();
     if boards.is_empty() {
@@ -227,7 +251,7 @@ fn round(
             Err(_) => ok = false,
         }
         if watched.insert(room.clone()) {
-            watch(client.clone(), room, notify.clone(), live.clone());
+            watch(client.clone(), room, notify.clone(), live.clone(), streams.0.clone(), streams.1);
         }
     }
     if arrived {
@@ -243,15 +267,20 @@ fn unsent(store: &Store) -> bool {
     store.has_unsent().unwrap_or(true)
 }
 
-/// Follows one room's notification stream for the life of the process, reconnecting with
-/// backoff, and turns every announced head into a round.
-fn watch(client: Client, room: String, notify: Sender<Kick>, live: Live) {
+/// Follows one room's notification stream for the life of the process, or until the saved
+/// remote changes (`generation` moves past `mine`), reconnecting with backoff, and turns every
+/// announced head into a round.
+fn watch(client: Client, room: String, notify: Sender<Kick>, live: Live, generation: Arc<AtomicU64>, mine: u64) {
     let _ = std::thread::Builder::new().name(format!("ai-kanban-watch-{room}")).spawn(move || {
         let mut backoff = Duration::from_secs(5);
         loop {
             let started = Instant::now();
             let mut alive = true;
             let _ = client.watch(&room, |head| {
+                if generation.load(Ordering::Relaxed) != mine {
+                    alive = false;
+                    return false;
+                }
                 let mut l = live.lock().unwrap_or_else(|e| e.into_inner());
                 match head {
                     Some(h) => {
@@ -269,6 +298,9 @@ fn watch(client: Client, room: String, notify: Sender<Kick>, live: Live) {
                 alive
             });
             // Disconnected: until it is back, a claim catches up the slow way.
+            if generation.load(Ordering::Relaxed) != mine {
+                return;
+            }
             live.lock().unwrap_or_else(|e| e.into_inner()).remove(&room);
             if !alive {
                 return;

@@ -55,6 +55,7 @@ async fn a_push_and_a_pull_are_logged_both_ways_and_still_work() {
         field: Some("title".into()),
         value: json!("Fix the timetable"),
         clock: Clock { wall_ms: 1_000, counter: 0, tag: "b1".into() },
+        carried: false,
         extra: Default::default(),
     };
     let (s, v) = call(&relay, "POST", "/v1/rooms/sbahn/changes", Some(&key), Some(json!({ "changes": [change] }).to_string())).await;

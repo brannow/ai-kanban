@@ -295,7 +295,7 @@ fn a_teammate_whose_clock_runs_ahead_does_not_win_my_later_edit() {
         seq: 999, author: "volker".into(), received_at: 0,
         change: Change {
             cid: "v1:1".into(), entity: me.clone(), subject: Some(me.clone()), field: Some("title".into()),
-            value: json!("their title"), clock: Clock { wall_ms: future, counter: 0, tag: "v1".into() }, extra: Default::default(),
+            value: json!("their title"), clock: Clock { wall_ms: future, counter: 0, tag: "v1".into() }, carried: false, extra: Default::default(),
         },
     };
     benny.store.apply(benny.pid, &[ahead]).unwrap();
@@ -416,7 +416,7 @@ fn a_change_that_arrives_after_a_tombstone_cannot_bring_the_task_back() {
         seq, author: "x".into(), received_at: 0,
         change: Change {
             cid: cid.into(), entity: gone.clone(), subject: if tag == "srv" { None } else { Some(gone.clone()) },
-            field: Some(field.into()), value, clock: Clock { wall_ms: seq * 10, counter: 0, tag: tag.into() }, extra: Default::default(),
+            field: Some(field.into()), value, clock: Clock { wall_ms: seq * 10, counter: 0, tag: tag.into() }, carried: false, extra: Default::default(),
         },
     };
     volker.store.apply(volker.pid, &[pulled(1, "srv:1", "forgotten", json!(true), "srv")]).unwrap();
@@ -474,7 +474,7 @@ fn a_change_this_binary_cannot_store_is_parked_and_the_rest_still_apply() {
         seq, author: "benny".into(), received_at: 0,
         change: Change {
             cid: format!("b1:{seq}"), entity: t.clone(), subject: Some(t.clone()), field: Some(field.into()), value,
-            clock: Clock { wall_ms: 100 + seq, counter: 0, tag: "b1".into() }, extra: Default::default(),
+            clock: Clock { wall_ms: 100 + seq, counter: 0, tag: "b1".into() }, carried: false, extra: Default::default(),
         },
     };
     let r = volker.store.apply(volker.pid, &[
@@ -503,7 +503,7 @@ fn a_parked_change_reapplied_later_still_loses_to_a_newer_value() {
         seq, author: "benny".into(), received_at: 0,
         change: Change {
             cid: format!("b1:{seq}"), entity: t.clone(), subject: Some(t.clone()), field: Some("title".into()), value: json!(title),
-            clock: Clock { wall_ms: wall, counter: 0, tag: "b1".into() }, extra: Default::default(),
+            clock: Clock { wall_ms: wall, counter: 0, tag: "b1".into() }, carried: false, extra: Default::default(),
         },
     };
     volker.store.apply(volker.pid, &[change(2, 200, "newer")]).unwrap();
@@ -853,4 +853,40 @@ fn a_room_held_by_one_board_is_refused_to_another_and_merging_moves_it() {
     let mut titles: Vec<String> = volker.store.board(second, &BoardQuery::board()).unwrap().tasks.into_iter().map(|t| t.title).collect();
     titles.sort();
     assert_eq!(titles, ["benny's, renamed", "volker's"], "each task once, and current");
+}
+
+/// A change carried on its author's behalf after a move never overwrites a field the receiver
+/// already has, however new its clock (docs/sync.md, "Moving to another relay"). That it fills
+/// gaps is what `tests/relay_move.rs` shows, with whole boards.
+#[test]
+fn a_carried_change_never_overwrites_a_field_already_there() {
+    let relay = relay();
+    let benny = member(&relay, "benny", "b1", "sbb");
+    let volker = member(&relay, "volker", "v1", "sbahn upgrade");
+    let t = benny.store.create_task(benny.pid, TaskDraft::new("benny's")).unwrap();
+    converge(&relay, &[&benny, &volker]);
+    benny.store.update_task(benny.pid, t.id, TaskPatch { status: Some(Status::Testing), ..patch() }).unwrap();
+    push(&relay, &benny);
+
+    // Volker carries a stale copy of the status under Benny's tag, stamped far in the future.
+    let entity = ai_kanban::sync::protocol::Ref { kind: "task".into(), origin: "b1".into(), id: t.id };
+    let carried = |seq: i64, field: &str, value: serde_json::Value| Change {
+        cid: format!("v1:{}", 10_000 + seq),
+        entity: entity.clone(),
+        subject: Some(entity.clone()),
+        field: Some(field.into()),
+        value,
+        clock: ai_kanban::sync::protocol::Clock { wall_ms: i64::MAX / 2, counter: 0, tag: "b1".into() },
+        carried: true,
+        extra: Default::default(),
+    };
+    relay.push(ROOM, &volker.p, &[carried(1, "status", serde_json::json!("backlog"))]).unwrap();
+    pull(&relay, &benny);
+    assert_eq!(task_by_title(&benny, "benny's").status, Status::Testing, "the carried copy does not undo the edit");
+
+    // A member joining later reads the log in order: the real edit first, the carried copy then
+    // finds the field taken.
+    let carla = member(&relay, "carla", "c1", "carla's");
+    pull(&relay, &carla);
+    assert_eq!(task_by_title(&carla, "benny's").status, Status::Testing);
 }

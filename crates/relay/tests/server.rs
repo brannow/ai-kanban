@@ -56,6 +56,7 @@ fn change(tag: &str, seq: i64, entity: Ref, subject: Option<Ref>, field: &str, v
         field: Some(field.into()),
         value,
         clock: Clock { wall_ms: 1_000 + seq, counter: 0, tag: tag.into() },
+        carried: false,
         extra: Default::default(),
     }
 }
@@ -202,7 +203,7 @@ fn a_version_1_database_upgrades_and_keeps_its_rooms() {
     assert_eq!((rooms[0].name.as_str(), rooms[0].board.as_deref()), ("sbahn", None));
     assert_eq!(rooms[0].created_by, "benny", "a room from before #1080 holds the name itself, and shows it");
     let v: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(v, 4, "every migration ran");
+    assert_eq!(v, 5, "every migration ran");
 }
 
 /// Version 3 rebuilds the key tables and drops users. Run on a database shaped like the live
@@ -1049,4 +1050,138 @@ async fn a_revoked_key_is_replaced_by_rotating_and_deleted_only_once_revoked() {
     { let db = f.relay.db.lock().unwrap(); let id = db.key_id("v1").unwrap(); db.revoke_key(id).unwrap(); db.delete_keys("v1").unwrap(); }
     let (id, _) = f.relay.db.lock().unwrap().issue_key("another volker").unwrap();
     assert_eq!(f.relay.db.lock().unwrap().name_key(id, "Volker").unwrap().tag, "v2", "v1 stays reserved");
+}
+
+// ---------------------------------------------------------------------------
+// Moving to another relay (docs/sync.md): the instance, and a machine keeping its tag
+// ---------------------------------------------------------------------------
+
+/// `call`, with the tag the client says its machine publishes under.
+async fn call_claiming(relay: &Relay, method: &str, uri: &str, key: &str, claim: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {key}"))
+        .header(ai_kanban_protocol::CLAIM_HEADER, claim)
+        .body(Body::empty())
+        .unwrap();
+    let res = router(relay.clone()).oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn hello_names_the_relays_instance_and_a_copy_of_its_database_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.db");
+    let first = ServerDb::open(&path).unwrap().instance().unwrap();
+    assert_eq!(first.len(), 32);
+    let copy = dir.path().join("copy.db");
+    std::fs::copy(&path, &copy).unwrap();
+    assert_eq!(ServerDb::open(&copy).unwrap().instance().unwrap(), first, "a copy on a new host is the same relay");
+    assert_ne!(ServerDb::open_in_memory().unwrap().instance().unwrap(), first, "one set up anew is another");
+
+    let (s, v) = call(&Relay::new(ServerDb::open(&path).unwrap()), "GET", "/v1/hello", None, None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["instance"], first.as_str());
+}
+
+/// A relay set up anew, and a machine that published as b2 on the old one: its new key takes
+/// b2 back on whatever request comes first, even before it names itself, whoever came first.
+#[tokio::test]
+async fn a_new_key_takes_the_tag_its_machine_already_publishes_under() {
+    let db = ServerDb::open_in_memory().unwrap();
+    let (_, other) = db.issue_key("someone first").unwrap();
+    let (_, mine) = db.issue_key("benny laptop").unwrap();
+    let relay = Relay::new(db);
+    // Someone else names their key first, as "Benny" too: generated, b1.
+    let (s, v) = call(&relay, "PUT", "/v1/me", Some(&other), Some(json!({ "name": "Benny" }))).await;
+    assert_eq!((s, v["tag"].as_str()), (StatusCode::OK, Some("b1")), "{v}");
+    // Mine claims b2 on a plain room listing, before any naming.
+    let (s, v) = call_claiming(&relay, "GET", "/v1/rooms", &mine, "b2").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (_, v) = call(&relay, "GET", "/v1/whoami", Some(&mine), None).await;
+    assert_eq!(v["tag"], "b2", "{v}");
+}
+
+/// The claimed tag is another key's: refused, and the key stays unbound rather than getting a
+/// tag that is not its machine's -- a key bound to the wrong tag can never be unbound.
+#[tokio::test]
+async fn a_claim_for_a_tag_another_key_holds_is_refused_and_binds_nothing() {
+    let db = ServerDb::open_in_memory().unwrap();
+    db.add_key("volker", "v1").unwrap();
+    let (id, key) = db.issue_key("not volker").unwrap();
+    let relay = Relay::new(db);
+    let (s, v) = call_claiming(&relay, "GET", "/v1/whoami", &key, "v1").await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v.to_string().contains("belongs to another key"), "{v}");
+    let bound = relay.db.lock().unwrap().keys().unwrap().into_iter().find(|k| k.id == id).unwrap().tag;
+    assert_eq!(bound, None, "still unbound");
+}
+
+/// After a move, an absent member's work can be in a room before they are back. A new member
+/// must not be handed their tag; the absent member claiming it back may take it.
+#[tokio::test]
+async fn generated_tags_skip_tags_already_on_changes_and_their_owner_can_claim_them_back() {
+    let f = fixture();
+    join(&f, &f.volker, "sbahn").await;
+    // Volker edits a task b7 created: b7 is spoken for, though no key on this relay holds it.
+    let (s, v) = push(&f, &f.volker, "sbahn", vec![change("v1", 1, task("b7", 3), None, "status", json!("doing"))]).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let db = f.relay.db.lock().unwrap();
+    for _ in 2..7 {
+        let (id, _) = db.issue_key("another b").unwrap();
+        db.name_key(id, "Bernd").unwrap();
+    }
+    let (id, _) = db.issue_key("one more").unwrap();
+    assert_eq!(db.name_key(id, "Bea").unwrap().tag, "b8", "b7 is skipped");
+    let (id, _) = db.issue_key("b7 is back").unwrap();
+    assert_eq!(db.name_key_as(id, "Bo", Some("b7")).unwrap().tag, "b7");
+}
+
+/// After a move, a member re-sends what it holds of others' work under their original clock,
+/// marked carried. Accepted, recorded as carried by the one who pushed it; receivers only fill
+/// gaps with it. A carried server tag is only ever a forget's.
+#[tokio::test]
+async fn a_carried_change_keeps_its_authors_clock_and_says_who_carried_it() {
+    let f = fixture();
+    join(&f, &f.benny, "sbahn").await;
+    join(&f, &f.volker, "sbahn").await;
+    let mut carried = change("b1", 1, task("v1", 7), Some(task("v1", 7)), "title", json!("volker's title"));
+    carried.clock.tag = "v1".into();
+    carried.carried = true;
+    let (s, v) = push(&f, &f.benny, "sbahn", vec![carried]).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let page = pull(&f, &f.volker, "sbahn", 0).await;
+    let c = &page["changes"][0];
+    assert_eq!((c["author"].as_str(), c["change"]["clock"]["tag"].as_str(), c["change"]["carried"].as_bool()), (Some("benny"), Some("v1"), Some(true)));
+
+    let mut not_a_forget = change("b1", 2, task("v1", 7), None, "title", json!("x"));
+    not_a_forget.clock.tag = "srv".into();
+    not_a_forget.carried = true;
+    let (s, _) = push(&f, &f.benny, "sbahn", vec![not_a_forget]).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "the server's tag is only carried on a forget");
+}
+
+/// A forget from the relay the room moved from, carried by a member who applied it: done again
+/// here as this relay's own, so a member who missed it cannot bring the task back.
+#[tokio::test]
+async fn a_carried_forget_is_done_again_and_turns_late_pushes_away() {
+    let f = fixture();
+    join(&f, &f.benny, "sbahn").await;
+    join(&f, &f.volker, "sbahn").await;
+    let t = task("v1", 812);
+    let mut tomb = change("b1", 1, t.clone(), None, "forgotten", json!(true));
+    tomb.clock.tag = "srv".into();
+    tomb.carried = true;
+    let (s, v) = push(&f, &f.benny, "sbahn", vec![tomb]).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let page = pull(&f, &f.volker, "sbahn", 0).await;
+    let c = &page["changes"][0]["change"];
+    assert_eq!((c["field"].as_str(), c["clock"]["tag"].as_str(), c["carried"].as_bool()), (Some("forgotten"), Some("srv"), None), "the relay's own tombstone: {page}");
+
+    // Volker had not pulled the forget before the move, and still holds the task.
+    let (_, v) = push(&f, &f.volker, "sbahn", vec![change("v1", 1, t.clone(), Some(t.clone()), "title", json!("secret title"))]).await;
+    assert_eq!((v["accepted"].clone(), v["forgotten"].clone()), (json!(0), json!(1)));
 }

@@ -227,9 +227,34 @@ impl Store {
         if connected > 0 && self.origin_tag()?.as_deref() != Some(tag) {
             return Err(Error::Other("disconnect every board before changing this store's origin tag".into()));
         }
+        if let Some(n) = self.tag_of_others(tag)? {
+            return Err(Error::Other(format!(
+                "tag {tag} is on other people's work on this machine ({n} task(s), notes or edits). Taking it would make \
+                 their work yours. Ask the relay admin for a new key"
+            )));
+        }
         self.conn.execute("UPDATE sync_node SET tag = ?1 WHERE id = 1", [tag])?;
         self.conn.execute("INSERT OR IGNORE INTO sync_own_tags (tag) VALUES (?1)", [tag])?;
         Ok(())
+    }
+
+    /// How much on this store carries `tag` while being someone else's: entities they created
+    /// and fields they wrote. `None` when nothing does, or the tag is this store's own.
+    ///
+    /// A task is known everywhere by (tag, number), so a store that took another member's tag
+    /// would read their work as its own and hand out numbers they already used -- what a relay
+    /// set up anew does when it gives tags out in another order (#1132).
+    pub fn tag_of_others(&self, tag: &str) -> Result<Option<i64>> {
+        if self.is_own_tag(tag)? {
+            return Ok(None);
+        }
+        let n: i64 = self.conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM sync_ids WHERE origin = ?1)
+                  + (SELECT COUNT(*) FROM sync_fields WHERE tag = ?1 AND origin <> ?1)",
+            [tag],
+            |r| r.get(0),
+        )?;
+        Ok((n > 0).then_some(n))
     }
 
     /// Whether `tag` is one this store has published under, now or before a restore.
@@ -541,8 +566,16 @@ impl Store {
         self.conn.execute(
             "INSERT INTO sync_room_status (project_id, last_ok_at, last_error, members) VALUES (?1, ?2, NULL, ?3)
              ON CONFLICT (project_id) DO UPDATE SET last_ok_at = excluded.last_ok_at, last_error = NULL, members = excluded.members",
-            params![project_id, now(), Value::Array(members).to_string()],
+            params![project_id, now(), Value::Array(members.clone()).to_string()],
         )?;
+        for m in &members {
+            if let (Some(t), Some(u)) = (m["tag"].as_str(), m["user"].as_str()) {
+                self.conn.execute(
+                    "INSERT INTO sync_names (tag, name) VALUES (?1, ?2) ON CONFLICT (tag) DO UPDATE SET name = excluded.name",
+                    params![t, u],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -663,53 +696,217 @@ impl Store {
     /// From `sync_fields`, which keeps each field's last published value with the clock it was
     /// written at: the original clocks, so nothing republished can win over what a teammate
     /// wrote since -- for them a republished change already here is simply ignored. Only what
-    /// is stored under `tag`: the relay accepts a change only under its writer's own tag.
+    /// is stored under `tag`: the relay restored still has the rest, from the others.
     /// Returns how many changes it queued.
     pub fn republish_after_relay_loss(&self, tag: &str, relay_has: i64) -> Result<usize> {
         let tx = self.conn.unchecked_transaction()?;
         let mut queued = 0;
         for (project_id, room) in self.connected_boards()? {
-            let rows: Vec<(String, String, i64, String, String, i64, i64)> = {
-                let mut st = self.conn.prepare(
-                    "SELECT kind, origin, origin_id, field, value, wall_ms, counter FROM sync_fields
-                      WHERE room = ?1 AND tag = ?2 ORDER BY wall_ms, counter",
-                )?;
-                let rows = st
-                    .query_map(params![room, tag], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
-                    .collect::<rusqlite::Result<_>>()?;
-                rows
-            };
-            for (kind, origin, origin_id, field, value, wall_ms, counter) in rows {
-                let entity = Ref { kind, origin, id: origin_id };
-                let value: Value = serde_json::from_str(&value).map_err(|e| Error::Other(e.to_string()))?;
-                // As flush names them: a row's own fields are about itself, an event about its
-                // note if it has one, else its task.
-                let (field, subject) = if field == ROW {
-                    let as_ref = |k: &str| -> Option<Ref> {
-                        let v = value.get(k)?;
-                        Some(Ref { kind: k.into(), origin: v.get("origin")?.as_str()?.into(), id: v.get("id")?.as_i64()? })
-                    };
-                    (None, as_ref("note").or_else(|| as_ref("task")))
-                } else {
-                    (Some(field), Some(entity.clone()))
-                };
-                let clock = Clock { wall_ms, counter: counter as u32, tag: tag.to_string() };
-                self.conn.execute("INSERT INTO sync_outbox (project_id, room, body) VALUES (?1, ?2, '')", params![project_id, room])?;
-                let seq = self.conn.last_insert_rowid();
-                let change = Change { cid: format!("{tag}:{seq}"), entity, subject, field, value, clock, extra: Default::default() };
-                let body = serde_json::to_string(&change).map_err(|e| Error::Other(e.to_string()))?;
-                self.conn.execute("UPDATE sync_outbox SET body = ?1 WHERE seq = ?2", params![body, seq])?;
-                queued += 1;
-            }
+            queued += self.queue_held(project_id, &room, tag, false)?;
             self.conn.execute("UPDATE sync_rooms SET cursor = 0 WHERE project_id = ?1", [project_id])?;
         }
-        // From here on the relay's count is the baseline, so this runs once per loss.
+        self.set_sent_baseline(tag, relay_has)?;
+        tx.commit()?;
+        Ok(queued)
+    }
+
+    /// This store's rooms now live on another relay -- moved, or set up anew -- that holds
+    /// nothing of theirs yet, or only what teammates back before this one brought (docs/sync.md,
+    /// "Moving to another relay"). For every connected board: everything held about its room
+    /// goes out again, this store's own work as itself and everyone else's carried, all of it
+    /// with the clocks of the original edits, and forgets the old relay made carried as well;
+    /// the room is read from the start; it is joined again before anything is sent, and its id
+    /// on the old relay is forgotten, so the new one's does not read as "deleted and reopened".
+    ///
+    /// Safe in any order and any number of times: a change already in the room is ignored by
+    /// every receiver, and a carried one only ever fills a gap. Returns how many it queued.
+    ///
+    /// `to` is the new relay's instance, recorded in the same transaction, compared and set: two
+    /// processes finding the move at once queue everything once, not twice.
+    pub fn relay_moved(&self, tag: &str, relay_has: i64, to: &str) -> Result<usize> {
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        let from = self.relay_instance()?;
+        if from.as_deref() == Some(to) {
+            return Ok(0);
+        }
+        if let Some(left) = &from {
+            self.conn.execute("INSERT OR IGNORE INTO sync_left_relays (instance, left_at) VALUES (?1, ?2)", params![left, now()])?;
+        }
+        self.set_relay_instance(to)?;
+        let mut queued = 0;
+        for (project_id, room) in self.connected_boards()? {
+            queued += self.queue_room_again(project_id, &room, tag, true)?;
+            self.conn.execute("UPDATE sync_rooms SET cursor = 0, relay_room = NULL, rejoin = 1 WHERE project_id = ?1", [project_id])?;
+        }
+        self.set_sent_baseline(tag, relay_has)?;
+        tx.commit()?;
+        Ok(queued)
+    }
+
+    /// `project_id` was just connected to a room that holds none of this store's work: one
+    /// deleted on the relay and opened again, or a relay set up anew before 0.3.0 could tell.
+    /// What the board already published to a room of that name goes out again with its original
+    /// clocks -- not stamped as of now, which let a member's stale copy undo what a teammate had
+    /// changed since (#1130). Others' work is carried if the relay takes carried changes
+    /// (`carry`: it names an instance); an older relay gets only this store's own, and the rest
+    /// arrives as each author connects. Never-published rows go out through the normal flush.
+    pub fn republish_into_fresh_room(&self, project_id: i64, carry: bool) -> Result<usize> {
+        let room = self.room_of(project_id)?.ok_or_else(|| Error::Other("this board is not connected to a room".into()))?;
+        let tag = self.origin_tag()?.ok_or_else(|| Error::Other("no origin tag yet: set up the remote first".into()))?;
+        let tx = self.conn.unchecked_transaction()?;
+        let queued = self.queue_room_again(project_id, &room, &tag, carry)?;
+        tx.commit()?;
+        Ok(queued)
+    }
+
+    /// What `relay_moved` and `republish_into_fresh_room` send for one board: everything held,
+    /// and, when carrying, the forgets the old relay made.
+    fn queue_room_again(&self, project_id: i64, room: &str, tag: &str, carry: bool) -> Result<usize> {
+        let mut queued = self.queue_held(project_id, room, tag, carry)?;
+        if carry {
+            let forgotten: Vec<(String, String, i64)> = self
+                .conn
+                .prepare("SELECT kind, origin, origin_id FROM sync_forgotten WHERE room = ?1 ORDER BY kind, origin, origin_id")?
+                .query_map([room], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (kind, origin, id) in forgotten {
+                let entity = Ref { kind, origin, id };
+                let clock = Clock { wall_ms: 0, counter: 0, tag: SERVER_TAG.to_string() };
+                queued += self.queue_change(project_id, room, tag, entity, None, Some(FORGOTTEN.into()), Value::Bool(true), clock, true)?;
+            }
+        }
+        Ok(queued)
+    }
+
+    /// Queues again what `sync_fields` holds about `room`, with its original clocks: only what
+    /// `tag` wrote, or, with `everything`, also what others wrote, carried on their behalf.
+    ///
+    /// Only what is on `project_id` now. `sync_fields` is kept by room name, and also holds
+    /// what an earlier board connected under that name published, or what was moved off the
+    /// board since -- neither of which this board is sending.
+    fn queue_held(&self, project_id: i64, room: &str, tag: &str, everything: bool) -> Result<usize> {
+        /// One `sync_fields` row: what was last published or received for one field.
+        struct Held {
+            entity: Ref,
+            field: String,
+            value: String,
+            clock: Clock,
+        }
+        let rows: Vec<Held> = self
+            .conn
+            .prepare(
+                "SELECT f.kind, f.origin, f.origin_id, f.field, f.value, f.wall_ms, f.counter, f.tag FROM sync_fields f
+                   JOIN sync_ids i ON i.kind = f.kind AND i.origin = f.origin AND i.origin_id = f.origin_id
+                  WHERE f.room = ?1 AND (?3 OR f.tag = ?2) AND f.tag <> ?4
+                    AND CASE f.kind
+                          WHEN 'task'  THEN EXISTS(SELECT 1 FROM tasks  WHERE id = i.local_id AND project_id = ?5)
+                          WHEN 'note'  THEN EXISTS(SELECT 1 FROM notes  WHERE id = i.local_id AND project_id = ?5)
+                          WHEN 'event' THEN EXISTS(SELECT 1 FROM events WHERE id = i.local_id AND project_id = ?5)
+                          ELSE 0 END
+                  ORDER BY f.wall_ms, f.counter, f.tag",
+            )?
+            .query_map(params![room, tag, everything, SERVER_TAG, project_id], |r| {
+                Ok(Held {
+                    entity: Ref { kind: r.get(0)?, origin: r.get(1)?, id: r.get(2)? },
+                    field: r.get(3)?,
+                    value: r.get(4)?,
+                    clock: Clock { wall_ms: r.get(5)?, counter: r.get::<_, i64>(6)? as u32, tag: r.get(7)? },
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut queued = 0;
+        for Held { entity, field, value, clock } in rows {
+            let value: Value = serde_json::from_str(&value).map_err(|e| Error::Other(e.to_string()))?;
+            // As flush names them: a row's own fields are about itself, an event about its
+            // note if it has one, else its task.
+            let (field, subject) = if field == ROW {
+                let as_ref = |k: &str| -> Option<Ref> {
+                    let v = value.get(k)?;
+                    Some(Ref { kind: k.into(), origin: v.get("origin")?.as_str()?.into(), id: v.get("id")?.as_i64()? })
+                };
+                (None, as_ref("note").or_else(|| as_ref("task")))
+            } else {
+                (Some(field), Some(entity.clone()))
+            };
+            // Under another tag than this store's current one -- a teammate's, or this store's
+            // own from before a new key -- the relay takes it only carried.
+            let carried = clock.tag != tag;
+            queued += self.queue_change(project_id, room, tag, entity, subject, field, value, clock, carried)?;
+        }
+        Ok(queued)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn queue_change(
+        &self, project_id: i64, room: &str, tag: &str, entity: Ref, subject: Option<Ref>, field: Option<String>, value: Value,
+        clock: Clock, carried: bool,
+    ) -> Result<usize> {
+        self.conn.execute("INSERT INTO sync_outbox (project_id, room, body) VALUES (?1, ?2, '')", params![project_id, room])?;
+        let seq = self.conn.last_insert_rowid();
+        let change = Change { cid: format!("{tag}:{seq}"), entity, subject, field, value, clock, carried, extra: Default::default() };
+        let body = serde_json::to_string(&change).map_err(|e| Error::Other(e.to_string()))?;
+        self.conn.execute("UPDATE sync_outbox SET body = ?1 WHERE seq = ?2", params![body, seq])?;
+        Ok(1)
+    }
+
+    /// From here on the relay's count is the baseline, so a loss is handled once.
+    fn set_sent_baseline(&self, tag: &str, relay_has: i64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO sync_sent (tag, seq) VALUES (?1, ?2) ON CONFLICT (tag) DO UPDATE SET seq = excluded.seq",
             params![tag, relay_has],
         )?;
-        tx.commit()?;
-        Ok(queued)
+        Ok(())
+    }
+
+    /// The relay instance this store last synced with (`Hello::instance`). None before the
+    /// first sync with a relay that names one.
+    pub fn relay_instance(&self) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT relay_instance FROM sync_node WHERE id = 1", [], |r| r.get(0)).optional()?.flatten())
+    }
+
+    /// The name this machine went by on the relay, as it last said (`WhoAmI::user`).
+    pub fn own_name(&self) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT own_name FROM sync_node WHERE id = 1", [], |r| r.get(0)).optional()?.flatten())
+    }
+
+    pub fn set_own_name(&self, name: &str) -> Result<()> {
+        self.conn.execute("UPDATE sync_node SET own_name = ?1 WHERE id = 1", [name])?;
+        Ok(())
+    }
+
+    /// Whether this store moved away from the relay `instance` (`relay_moved`).
+    pub fn left_relay(&self, instance: &str) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sync_left_relays WHERE instance = ?1)", [instance], |r| r.get(0))?)
+    }
+
+    pub fn set_relay_instance(&self, instance: &str) -> Result<()> {
+        self.conn.execute("UPDATE sync_node SET relay_instance = ?1 WHERE id = 1", [instance])?;
+        Ok(())
+    }
+
+    /// Whether `project_id`'s room has to be joined again before anything is sent: it is on a
+    /// relay this store has not been a member on yet (`relay_moved`).
+    pub fn needs_rejoin(&self, project_id: i64) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT rejoin FROM sync_rooms WHERE project_id = ?1", [project_id], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0) != 0)
+    }
+
+    /// The room was joined on the new relay; `relay_room` is its id there.
+    pub fn rejoined(&self, project_id: i64, relay_room: Option<i64>) -> Result<()> {
+        self.conn.execute("UPDATE sync_rooms SET rejoin = 0, relay_room = ?2 WHERE project_id = ?1", params![project_id, relay_room])?;
+        Ok(())
+    }
+
+    /// Every tag this store knows from `room`: its own, and every author and creator of what it
+    /// holds from there. A room on a new relay whose members carry none of these is not the
+    /// team's, whatever its name.
+    pub fn tags_known_in(&self, room: &str) -> Result<std::collections::HashSet<String>> {
+        let mut st = self.conn.prepare(
+            "SELECT tag FROM sync_own_tags
+              UNION SELECT tag FROM sync_fields WHERE room = ?1
+              UNION SELECT origin FROM sync_fields WHERE room = ?1",
+        )?;
+        let tags = st.query_map([room], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(tags)
     }
 }
 
@@ -1026,6 +1223,7 @@ impl Store {
             field: field.map(String::from),
             value,
             clock,
+            carried: false,
             extra: Default::default(),
         };
         let body = serde_json::to_string(&change).map_err(|e| Error::Other(e.to_string()))?;
@@ -1153,8 +1351,20 @@ impl Store {
         }
 
         let field = c.field.as_deref().ok_or_else(|| Error::Other(format!("a {} change without a field", e.kind)))?;
+        // Carried by a member on its author's behalf after a move (`Change::carried`): it fills
+        // a gap and never overwrites, so a stale copy cannot undo a newer edit, and nobody can
+        // carry a change to someone else's work.
+        // A placeholder's fields (zero clock, no tag) are not values anyone wrote: those it fills.
+        if c.carried && self.stored_field(room, e, field)?.is_some_and(|(_, at)| !at.tag.is_empty() || at.wall_ms > 0) {
+            return Ok(Outcome::Ignored);
+        }
         if e.kind == "task" && field == LEFT_ROOM {
-            return self.apply_left(project_id, e, &p.author);
+            // The person who moved it, not the one who carried it here.
+            let who = match c.carried {
+                true => self.member_names()?.remove(&c.clock.tag).unwrap_or_else(|| c.clock.tag.clone()),
+                false => p.author.clone(),
+            };
+            return self.apply_left(project_id, e, &who, c.carried);
         }
         let s = specs(&e.kind)
             .iter()
@@ -1229,8 +1439,16 @@ impl Store {
 
     /// A task another member moved off the team board. Their history stays here, frozen and
     /// archived, rather than vanishing: it is part of this board's history too.
-    fn apply_left(&self, project_id: i64, e: &Ref, author: &str) -> Result<Outcome> {
+    fn apply_left(&self, project_id: i64, e: &Ref, author: &str, carried: bool) -> Result<Outcome> {
         let Some(local) = self.local_id(e)? else { return Ok(Outcome::Ignored) };
+        // Carried, it is what this store already had before the move: a second "moved off"
+        // line, under the name of whoever carried it, would only be wrong.
+        if carried {
+            let archived: bool = self.conn.query_row("SELECT status = 'archived' FROM tasks WHERE id = ?1", [local], |r| r.get(0))?;
+            if archived {
+                return Ok(Outcome::Ignored);
+            }
+        }
         let n = self.conn.execute(
             "UPDATE tasks SET status = 'archived', updated_at = ?3, version = version + 1 WHERE id = ?1 AND project_id = ?2",
             params![local, project_id, now()],
@@ -1289,8 +1507,22 @@ impl Store {
     /// for a task or note it is the body, whose origin is whoever last wrote it.
     /// Every room's members by tag, for naming who wrote what. A tag in two rooms is one
     /// machine.
+    ///
+    /// Over the last name every tag went by (`sync_names`), so a teammate who is not in any
+    /// room's list right now -- not back yet after a move -- is still named. Missing on a store
+    /// older than migration 20, which the read-only hook may be reading: then only the lists.
     pub(crate) fn member_names(&self) -> Result<std::collections::HashMap<String, String>> {
         let mut names = std::collections::HashMap::new();
+        match self.conn.prepare("SELECT tag, name FROM sync_names") {
+            Ok(mut st) => {
+                for row in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+                    let (t, n) = row?;
+                    names.insert(t, n);
+                }
+            }
+            Err(e) if crate::core::workstream::is_missing_schema(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
         let mut st = self.conn.prepare("SELECT members FROM sync_room_status")?;
         for members in st.query_map([], |r| r.get::<_, String>(0))? {
             let members: Vec<Value> = serde_json::from_str(&members?).unwrap_or_default();

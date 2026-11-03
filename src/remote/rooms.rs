@@ -54,7 +54,10 @@ pub enum Listing {
 /// for the client when this run may not use the network.
 pub fn list(store: &Mutex<Store>, c: Option<&Client>) -> Result<Listing> {
     let rooms = match c {
-        Some(c) => c.rooms().map_err(|e| e.to_string()),
+        Some(c) => {
+            super::engine::claim(&lock(store), c);
+            c.rooms().map_err(|e| e.to_string())
+        }
         None => Err("sync is off for this run".to_string()),
     };
     let s = lock(store);
@@ -142,7 +145,11 @@ pub fn look(c: &Client, info: &RoomInfo, own_tags: &[String]) -> Result<Preview>
 /// when the relay has no such room.
 pub fn show(store: &Mutex<Store>, c: &Client, room: &str) -> Result<Option<(Preview, Option<String>)>> {
     let room = parse_room(room)?;
-    let own = lock(store).own_tags()?;
+    let own = {
+        let s = lock(store);
+        super::engine::claim(&s, c);
+        s.own_tags()?
+    };
     let Some(info) = find_room(c, &room)? else { return Ok(None) };
     let preview = look(c, &info, &own)?;
     let s = lock(store);
@@ -328,9 +335,6 @@ pub fn connect(store: &Mutex<Store>, c: &Client, plan: ConnectPlan) -> Result<Co
             backup = dir.join(format!("kanban-before-connect-{room}-{stamp}-{n}.db"));
         }
         s.backup_to(&backup)?;
-        if plan.inspection.fresh {
-            s.forget_sent(room)?;
-        }
         backup
     };
     // Joined before a new board is made: a relay that fails here then leaves nothing behind
@@ -348,6 +352,17 @@ pub fn connect(store: &Mutex<Store>, c: &Client, plan: ConnectPlan) -> Result<Co
     s.connect_board(pid, room)?;
     if let Some(id) = joined.room.id {
         s.set_relay_room(pid, id)?;
+    }
+    // A room that holds none of this machine's work gets what the board published before, with
+    // the clocks it was written at (`Store::republish_into_fresh_room`). Others' work is carried
+    // only by a relay that takes carried changes, which is one that names its instance.
+    if plan.inspection.fresh {
+        drop(s);
+        let carry = c.hello().map(|h| h.instance.is_some()).unwrap_or(false);
+        let s = lock(store);
+        s.republish_into_fresh_room(pid, carry)?;
+        let board_name = s.project(pid)?.name;
+        return Ok(Connected { pid, board_name, created, backup });
     }
     let board_name = s.project(pid)?.name;
     Ok(Connected { pid, board_name, created, backup })

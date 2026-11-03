@@ -414,11 +414,18 @@ async fn run_mcp() -> Result<(), Box<dyn std::error::Error>> {
     use ai_kanban::remote::config::{adopt_plugin_settings, Adoption};
     let connected = store.connected_boards().map(|b| !b.is_empty()).unwrap_or(true);
     let notice = match adopt_plugin_settings(connected) {
-        Ok(Adoption::Adopted(cfg)) => {
+        Ok(Adoption::Adopted { cfg, replaced }) => {
             eprintln!("ai-kanban: relay {} from the plugin settings saved as this machine's remote", cfg.url);
+            // A move to another relay, or a new key: before the new one is touched, one last
+            // round with the old, so nothing that only reached it is left behind. Before the
+            // sync thread and the tools start, which would reach the new relay first.
+            if let Some(old) = replaced.filter(|_| ai_kanban::remote::config::sync_enabled()) {
+                let n = ai_kanban::remote::engine::drain(&store, &old, std::time::Duration::from_secs(8));
+                eprintln!("ai-kanban: synced {n} board(s) with {} one last time", old.url);
+            }
             None
         }
-        Ok(Adoption::Kept { machine }) => Some(ai_kanban::render::relay_settings_kept(&machine.url)),
+        Ok(Adoption::Kept { machine, left }) => Some(ai_kanban::render::relay_settings_kept(&machine.url, left)),
         Ok(_) => None,
         Err(e) => {
             eprintln!("ai-kanban: could not save the relay from the plugin settings: {e}");
