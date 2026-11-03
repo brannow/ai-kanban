@@ -137,8 +137,8 @@ agent's.
   person on every call, in every permission mode, auto included. `destructiveHint` would not have
   done it -- Claude Code does not use annotations for permissions -- and a plugin cannot ship a
   permission rule. One prompt per connect is cheap: it happens about once per project per person.
-  Source: code.claude.com/docs mcp.md, "Require approval for a specific tool" -- read, not yet
-  seen working live (#1119 stays in testing until it has been).
+  Source: code.claude.com/docs mcp.md, "Require approval for a specific tool". Seen working
+  live 2026-11-03 on 0.2.8: the prompt appeared in a session in auto mode (#1119).
 - **What is approved must be on screen before the prompt.** The prompt shows only the tool's
   arguments, so the summary lives in `room_show`, which never prompts: which board (name and
   folder first, so an agent in the wrong project is caught) and what of it would be published.
