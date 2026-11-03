@@ -279,3 +279,34 @@ fn a_shared_board_with_handles_on_every_line_stays_affordable() {
     eprintln!("\n=== task_add on a shared board -- ~{} tokens ===\n{}", tokens(&text), text);
     assert!(tokens(&text) < 250, "task_add on a shared board cost {} tokens", tokens(&text));
 }
+
+/// A relay a whole company shares: 40 rooms, each with a handful of members. The agent's
+/// `room_list` shows a capped page of them, its own room always among it.
+#[test]
+fn a_busy_relays_room_list_stays_affordable() {
+    use ai_kanban::remote::rooms::{Listed, Listing};
+    use ai_kanban::sync::protocol::{Member, RoomInfo};
+    let now = ai_kanban::core::now();
+    let rooms: Vec<Listed> = (0..40)
+        .map(|i| Listed {
+            info: RoomInfo {
+                id: Some(i),
+                name: format!("customer-project-{i:02}"),
+                created_at: now - 86_400 * 90,
+                created_by: "someone-long-named".into(),
+                members: (0..5).map(|m| Member { tag: format!("m{m}"), user: format!("teammate-{m}") }).collect(),
+                changes: 1000,
+                head: 1000,
+                board: Some(format!("Customer project {i} relaunch")),
+                last_change_at: Some(now - 3600 * (40 - i)),
+            },
+            // The oldest room is the one connected here: it must not be cut for being quiet.
+            mine: (i == 0).then(|| ("relaunch".to_string(), Default::default())),
+        })
+        .collect();
+    let max = ai_kanban::mcp::server::ROOM_LIST_LIMIT;
+    let text = render::room_listing(&Listing::Rooms(rooms), "https://relay.example.com", now, max, "room_show", "room_connect");
+    assert!(text.contains("customer-project-00") && text.contains("<- your board relaunch"), "{text}");
+    assert!(text.contains("25 more rooms"), "the rest is counted, not dropped: {text}");
+    assert!(tokens(&text) < 1100, "room_list cost {} tokens", tokens(&text));
+}

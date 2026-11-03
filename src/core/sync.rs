@@ -237,6 +237,14 @@ impl Store {
         Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sync_own_tags WHERE tag = ?1)", [tag], |r| r.get(0))?)
     }
 
+    /// Every tag this store has published under: what `is_own_tag` asks, read once, for a
+    /// caller that checks many changes while not holding the store (`remote::rooms::look`).
+    pub fn own_tags(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT tag FROM sync_own_tags ORDER BY tag")?;
+        let tags = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(tags)
+    }
+
     /// The next clock value: never behind the wall clock, never behind anything seen before.
     fn tick(&self, tag: &str) -> Result<Clock> {
         let (wall, counter): (i64, i64) =

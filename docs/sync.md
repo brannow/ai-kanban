@@ -68,7 +68,7 @@ rewrite and a single writer), cr-sqlite (last push 2024-10, native extension). T
 | A room carries **tasks, their events, notes (including board-level notes) and board-level events**. | Notes and decisions are the knowledge half. A teammate's `recall` finding your root cause is the double work avoided most often. |
 | Sync is **both ways for every task, your own included.** | Teammates log evidence and findings on your tasks, and you need that back. Publishing without receiving would leave your copy behind the room's. |
 | Synced per room: workstream **membership**, by name (normalized: `Crawl Replay` and `crawl_replay` are one, so the same workstream made twice by accident merges). Closing is local -- but a teammate putting work into a workstream after it was closed here reopens it here (`workstream_reopened`), or their work would sit where the directory does not show it. Local only: `current_workstream`, `project_paths`, `repos.path`. | Which workstream a task belongs to is shared. Which one *you* are in is your context. This also prevents one person's workstream switch from changing everyone's view. |
-| **Connecting is a CLI step,** never the agent's: `ai-kanban room join <server>/<room>`. | Joining publishes the board's whole history to others, and that is a human decision. |
+| **The agent connects; the person decides what is published.** `room_connect` (MCP) or `ai-kanban room connect`. A board with content connects only with the person's yes, and Claude Code asks them on every `room_connect` call. The person's own part is the key and the plugin settings. | Was "a CLI step, never the agent's" until 2026-11-03 (#1119). In use, agents ran the binary with `--yes` when they hit that wall, skipping the summary the rule was there to show. Publishing history is still a human decision; the prompt is now where it is made. `docs/tool-design.md`, "Rooms". |
 | A first connect publishes the board's existing tasks, history and notes. When two existing boards join one room, the result is the **union**. | That is what R4 asks for. Duplicates get reconciled by people, by forgetting or merging one, since only people know two tasks are the same. |
 | `task_update(move_to)` **onto** a connected board publishes the task. **Off** one, the task leaves the room: others keep a frozen, archived copy with "moved off the team board by benny". | The agent can move tasks, so both directions need a defined result. Deleting the task on others' machines would destroy their history of it. |
 
@@ -110,9 +110,15 @@ background thread; no tool or page waits for it. A connected board's `board` hea
 to act), and nothing on boards that are not shared. The web UI's room badge dot is grey when
 offline and amber when someone has to act, the tooltip saying the board works as usual.
 
-The commands below do the same by hand, and the rest of connecting. Claude can run them when
-asked (the plugin puts `ai-kanban` on its shell's PATH); none of them needs the key once the
-remote is set.
+**The agent's way in is the room tools** (`room_list`, `room_show`, `room_connect`,
+`room_disconnect`; `docs/tool-design.md`, "Rooms"). They do what the commands below do, from the
+same code (`src/remote/rooms.rs`), with one difference: `room_connect` picks the board of the
+folder the session works in, and makes it from that folder -- git remote as its key -- when
+there is none yet.
+
+The commands below do the same by hand, and the rest of connecting: setting the remote, and the
+choices the tools leave to a person (discarding unsent changes, wiping teammates' tasks). None of
+them needs the key once the remote is set.
 
 ```
 ai-kanban remote https://sync.board.rannow.de --key akb_…   set the remote, check the key

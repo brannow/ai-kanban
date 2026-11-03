@@ -11,6 +11,7 @@ pub mod client;
 pub mod config;
 pub mod daemon;
 pub mod engine;
+pub mod rooms;
 
 pub use client::{Client, RemoteError};
 pub use config::RemoteConfig;

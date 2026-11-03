@@ -148,6 +148,14 @@ impl Syncer {
         let _ = self.kick.send(Kick::Now);
     }
 
+    /// A board was just connected in this process: a round now, whether or not anything is
+    /// waiting to go out. The round is what starts the room's notification stream, and a kick
+    /// with an empty outbox runs none -- the room would sit unwatched until the next backstop
+    /// round, up to a minute, with teammates' changes waiting on it.
+    pub fn room_added(&self) {
+        let _ = self.kick.send(Kick::Announced);
+    }
+
     /// A quick round for one board, on the caller's connection, before an agent claims work or
     /// files a task -- so what it sees is current, not as of the last minute. Failures are
     /// recorded for the header and otherwise ignored: the claim must never fail because the

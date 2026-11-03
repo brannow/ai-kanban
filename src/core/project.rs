@@ -71,6 +71,14 @@ pub enum Resolution {
     Directory,
 }
 
+/// What `Store::folder_board` found: the board a folder opens, or the name a session there
+/// would give the one it creates.
+#[derive(Debug, Clone)]
+pub enum FolderBoard {
+    Existing(Project),
+    New(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub project: Project,
@@ -457,6 +465,24 @@ impl Store {
             // yet, and this function must never bring one into being.
             Some(Found::Identity((key, _, _, _))) => self.project_by_key(&key),
             None => Ok(None),
+        }
+    }
+
+    /// The board a session in `start` opens, or the name of the one it would create there --
+    /// without creating it. For connecting a room from where the agent is: every refusal has to
+    /// come before anything is written, and a board created by `resolve_project` and then
+    /// refused would be left behind.
+    pub fn folder_board(&self, start: &Path) -> Result<FolderBoard> {
+        let start = canonical(start);
+        match self.walk(&start)? {
+            Some(Found::Known(p)) => Ok(FolderBoard::Existing(p)),
+            Some(Found::Identity((key, name, _, _))) => {
+                Ok(self.project_by_key(&key)?.map(FolderBoard::Existing).unwrap_or(FolderBoard::New(name)))
+            }
+            None if is_above_every_project(&start, dirs::home_dir().map(|h| canonical(&h)).as_deref()) => {
+                Err(Error::SharedDirectory { path: start.to_string_lossy().into_owned() })
+            }
+            None => Ok(FolderBoard::New(basename(&start))),
         }
     }
 

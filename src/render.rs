@@ -867,6 +867,119 @@ pub fn sync_state(s: &crate::core::sync::SyncStatus, now: i64) -> String {
     parts.join(" \u{b7} ")
 }
 
+/// `room list` / `room_list`. `limit` caps the rooms shown -- the agent's answer has a budget,
+/// a person's terminal does not -- keeping the rooms with a board here and the most recently
+/// active ones. `show` and `connect` say how to go on, in the caller's own terms.
+pub fn room_listing(l: &crate::remote::rooms::Listing, url: &str, now: i64, limit: usize, show: &str, connect: &str) -> String {
+    use crate::remote::rooms::Listing;
+    let mut out = String::new();
+    match l {
+        Listing::Unreachable { error, mine } => {
+            out.push_str(&format!("{url} is not answering ({error}). What this machine knows of its shared boards:\n\n"));
+            if mine.is_empty() {
+                out.push_str("(none)\n");
+            }
+            for (room, board, s) in mine {
+                out.push_str(&format!("{room:<16} <- your board {board}\n{:<16} {}\n", "", sync_state(s, now)));
+            }
+        }
+        Listing::Rooms(rooms) if rooms.is_empty() => {
+            out.push_str(&format!("No rooms on {url} yet. Connecting a board creates one: {connect}\n"));
+        }
+        Listing::Rooms(rooms) => {
+            let mut shown: Vec<&crate::remote::rooms::Listed> = rooms.iter().collect();
+            if shown.len() > limit {
+                shown.sort_by_key(|r| (r.mine.is_none(), std::cmp::Reverse(r.info.last_change_at.unwrap_or(0))));
+                shown.truncate(limit);
+            }
+            for r in &shown {
+                let line = room_line(&r.info, r.mine.as_ref().map(|(b, s)| (b.as_str(), s)), now);
+                out.push_str(&line);
+                out.push('\n');
+            }
+            if rooms.len() > shown.len() {
+                out.push_str(&format!("...{} more rooms, quieter ones\n", rooms.len() - shown.len()));
+            }
+            out.push_str(&format!("\nWhat is in one: {show}\n"));
+        }
+    }
+    safe(&out).into_owned()
+}
+
+/// `room show` / `room_show`: the room's first lines, then the board it holds. Everything in it
+/// came from the room, so through the same filter as every answer.
+pub fn room_preview(p: &crate::remote::rooms::Preview, url: &str, now: i64) -> String {
+    let mut out = room_header(&p.info, url, now);
+    if let Some(b) = &p.board {
+        out.push('\n');
+        out.push_str(&board(b));
+    }
+    safe(&out).into_owned()
+}
+
+/// The end of `room_show` for a room no board here is in: what `room_connect` would do. The
+/// board's name and folder come first, so an agent sitting in the wrong project is caught when
+/// the person reads it; and what would be published, since the confirmation prompt that follows
+/// shows only the tool's arguments.
+pub fn connect_outlook(plan: &crate::remote::rooms::ConnectPlan, tag: &str, folder: Option<&std::path::Path>) -> String {
+    use crate::remote::rooms::Choice;
+    let room = &plan.inspection.room;
+    let which = |b: &str| match folder {
+        Some(f) => format!("board \"{b}\" (the board of this folder, {})", f.display()),
+        None => format!("board \"{b}\""),
+    };
+    let what = match (&plan.choice, plan.publish) {
+        (Choice::Board(_), Some(p)) if plan.publishes_history() => format!(
+            "Connecting {} to room \"{room}\" would publish its whole history to everyone in the room: {} task{}, {} \
+             note{}, {} event{} (as #N-{tag}). That cannot be taken back: every member keeps a full copy. Tell the user \
+             this before calling room_connect.",
+            which(&plan.board_name), p.tasks, plural(p.tasks as usize), p.notes, plural(p.notes as usize), p.events,
+            plural(p.events as usize)
+        ),
+        (Choice::Board(_), _) => format!(
+            "Connecting {} to room \"{room}\" publishes nothing existing -- the board is empty -- only what is written \
+             from now on.",
+            which(&plan.board_name)
+        ),
+        (_, _) => match folder {
+            Some(f) => format!(
+                "Connecting makes a new board \"{}\" for this folder ({}), so sessions here open it, and fills it from \
+                 the room. Nothing existing is published.",
+                plan.board_name, f.display()
+            ),
+            None => format!("Connecting makes a new board \"{}\" and fills it from the room.", plan.board_name),
+        },
+    };
+    format!("{what}\nroom_connect asks the user to confirm. Another board: pass project.\n")
+}
+
+/// `room_connect` done. `first` is the sync round inside the call: (pushed, applied), or why
+/// it failed; `unsent` what is still going out; `syncing` whether this session syncs in the
+/// background at all.
+pub fn connected(
+    board: &str, room: &str, url: &str, made_for: Option<&std::path::Path>, first: &Result<(usize, usize), String>, unsent: i64,
+    syncing: bool,
+) -> String {
+    let mut out = format!("Connected: board \"{board}\" is shared through room \"{room}\" on {url}.");
+    if let Some(dir) = made_for {
+        out.push_str(&format!(" The board is new, made for this folder ({}), so sessions here open it.", dir.display()));
+    }
+    out.push('\n');
+    match first {
+        Ok((pushed, applied)) => out.push_str(&format!("Published {pushed} change{}, received {applied}.", plural(*pushed))),
+        Err(e) => out.push_str(&format!("The first sync failed ({e}); it is retried, nothing is lost.")),
+    }
+    if unsent > 0 {
+        out.push_str(&format!(" {unsent} more still to send."));
+    }
+    out.push_str(if syncing {
+        " The rest happens in the background.\n"
+    } else {
+        " This session started without a relay, so it does not sync in the background: the next session does.\n"
+    });
+    safe(&out).into_owned()
+}
+
 /// The first lines of `room show`, above the board the room holds.
 pub fn room_header(r: &crate::sync::protocol::RoomInfo, url: &str, now: i64) -> String {
     let from = r.board.as_ref().map(|b| format!(" from board \"{b}\"")).unwrap_or_default();

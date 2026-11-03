@@ -322,3 +322,63 @@ fn a_teammates_control_characters_never_reach_my_terminal_or_my_agent() {
         .query_row("SELECT title FROM tasks WHERE title LIKE 'Harmless%'", [], |r| r.get(0)).unwrap();
     assert_eq!(stored, title, "stored as written: the filter is on the way out");
 }
+
+/// The agent manages rooms itself (#1119), the person only sets the relay. Volker has no board
+/// for the team's project yet: his agent finds the room, looks in, and connects -- the board is
+/// made for the folder it works in, not by name. Benny's agent, sitting on a board that already
+/// has work, has to have looked -- room_show says what would be published -- before connecting
+/// publishes it; the yes is Claude Code's prompt on room_connect.
+#[test]
+fn an_agent_joins_a_teams_room_itself() {
+    let relay = HttpRelay::start();
+    let (a, b) = (Install::new("a"), Install::new("b"));
+    a.cli(&["board", "add", "bmu"]);
+    a.cli(&["remote", &relay.url, "--key", &relay.key("benny", "a1")]);
+    a.cli(&["room", "connect", "bmu", "--board", "bmu", "--yes"]);
+    let mut aa = a.agent();
+    aa.tool("task_add", json!({ "project": "bmu", "title": "Import job drops umlauts" }));
+
+    // Without a relay, the agent is told it is the person's to set, and where.
+    let mut ba = b.agent();
+    let unset = ba.try_tool("room_list", json!({})).unwrap_err();
+    assert!(unset.contains("/plugin") && unset.contains("Team relay"), "{unset}");
+    drop(ba);
+    b.cli(&["remote", &relay.url, "--key", &relay.key("volker", "b1")]);
+    let mut ba = b.agent();
+
+    let look = ba.until("the room has Benny's task", "room_show", json!({ "room": "bmu" }), |t| t.contains("Import job drops umlauts"));
+    assert!(look.contains("makes a new board \"install-b\" for this folder") && look.contains("Nothing existing is published"), "{look}");
+    assert!(!ba.tool("room_list", json!({})).contains("v1 volker"), "looking is not joining");
+    assert!(ba.tool("room_list", json!({})).contains("bmu"));
+
+    let joined = ba.tool("room_connect", json!({ "room": "bmu" }));
+    assert!(joined.contains("Connected: board \"install-b\"") && joined.contains("made for this folder"), "{joined}");
+    assert!(joined.contains("Import job drops umlauts") && joined.contains("@bmu"), "the answer is the board, the room's work on it:\n{joined}");
+    // A session in this folder now opens that board: the next call needs no project.
+    assert!(ba.tool("board", json!({})).contains("Board: install-b @bmu"));
+    let again = ba.try_tool("room_connect", json!({ "room": "bmu" })).unwrap_err();
+    assert!(again.contains("already connected"), "{again}");
+
+    // Benny's own folder board has work on it: connecting it without having looked is refused.
+    aa.tool("task_add", json!({ "title": "Private spike: try a new parser" }));
+    let blind = aa.try_tool("room_connect", json!({ "room": "parser" })).unwrap_err();
+    assert!(blind.contains("room_show parser"), "{blind}");
+    assert!(!aa.tool("room_list", json!({})).contains("parser"), "nothing was created on the relay");
+    let look = aa.tool("room_show", json!({ "room": "parser" }));
+    assert!(look.contains("does not exist yet") && look.contains("board \"install-a\" (the board of this folder") && look.contains("1 task"), "{look}");
+    assert!(look.contains("cannot be taken back") && look.contains("Tell the user"), "{look}");
+    let yes = aa.tool("room_connect", json!({ "room": "parser" }));
+    assert!(yes.contains("Connected: board \"install-a\"") && yes.contains("Private spike"), "{yes}");
+
+    let left = aa.tool("room_disconnect", json!({ "room": "parser" }));
+    assert!(left.contains("install-a is local again"), "{left}");
+    assert!(!left.contains("@parser"), "the header no longer names the room:\n{left}");
+    assert!(aa.try_tool("room_disconnect", json!({ "room": "parser" })).unwrap_err().contains("Connected here: bmu"));
+
+    // Only connecting asks the person, on every call, whatever the permission mode.
+    let tools = aa.request("tools/list", json!({}));
+    let asks: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter()
+        .filter(|t| t["_meta"]["anthropic/requiresUserInteraction"] == json!(true))
+        .map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(asks, ["room_connect"]);
+}

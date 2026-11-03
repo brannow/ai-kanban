@@ -1,6 +1,7 @@
 //! `ai-kanban remote` and `ai-kanban room`: connecting this machine to a relay, and a board to
-//! a room. A person's commands, never the agent's -- connecting publishes a board's whole
-//! history, and that is a decision. `docs/sync.md`, "Connecting a board", is the design.
+//! a room, from a terminal. What the room commands do lives in `remote::rooms`, shared with the
+//! agent's room tools (#1119); this file asks the questions and prints. `docs/sync.md`,
+//! "Connecting a board", is the design.
 //!
 //! Every question has a flag that answers it. Without a terminal (a script, `tests/cli.rs`) a
 //! missing answer is an error that names the flag, and nothing is left half-done.
@@ -8,10 +9,10 @@
 use super::client::{Client, RemoteError};
 use super::config::{self, RemoteConfig};
 use super::engine::{check_identity, sync_board};
-use crate::core::model::BoardQuery;
+use super::rooms::{self, Choice};
 use crate::core::Store;
-use crate::sync::protocol::{RoomInfo, MAX_PAGE};
 use std::io::{BufRead, IsTerminal, Write};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 type CliResult = Result<(), Box<dyn std::error::Error>>;
@@ -114,7 +115,7 @@ pub fn remote_cmd() -> CliResult {
     let a = args()?;
     let store = Store::open_default()?;
     if a.disconnect {
-        return remote_disconnect(&store, &a);
+        return remote_disconnect(store, &a);
     }
     if let Some(url) = &a.move_to {
         return remote_move(&store, url);
@@ -231,15 +232,16 @@ fn remote_move(store: &Store, url: &str) -> CliResult {
     Ok(())
 }
 
-fn remote_disconnect(store: &Store, a: &Args) -> CliResult {
+fn remote_disconnect(store: Store, a: &Args) -> CliResult {
     let cfg = need_remote()?;
     let boards = store.connected_boards()?;
+    let shared = Mutex::new(store);
     if !confirm(&format!("All connected boards will be uncoupled from {} and the key removed. Continue?", cfg.url), a.yes)? {
         println!("cancelled.");
         return Ok(());
     }
     for (pid, room) in boards {
-        disconnect(store, &cfg, pid, &room, a)?;
+        disconnect(&shared, &cfg, pid, &room, a)?;
     }
     RemoteConfig::remove()?;
     println!("remote removed. Every board is local again.");
@@ -252,7 +254,7 @@ fn remote_disconnect(store: &Store, a: &Args) -> CliResult {
 
 pub fn room_cmd() -> CliResult {
     let a = args()?;
-    let store = Store::open_default()?;
+    let store = Mutex::new(Store::open_default()?);
     match a.pos.first().map(String::as_str) {
         Some("list") | None => room_list(&store),
         Some("show") => {
@@ -267,229 +269,91 @@ pub fn room_cmd() -> CliResult {
             let room = a.pos.get(1).ok_or("usage: ai-kanban room disconnect <room> [--keep-foreign|--wipe-foreign] [--sync-first|--discard] [--yes]")?;
             let cfg = need_remote()?;
             let room = crate::sync::protocol::room_name(room).ok_or("not a room name")?;
-            let pid = store.board_of_room(&room)?.ok_or_else(|| format!("no board on this machine is connected to room {room}"))?;
+            let pid = lock(&store).board_of_room(&room)?.ok_or_else(|| format!("no board on this machine is connected to room {room}"))?;
             disconnect(&store, &cfg, pid, &room, &a)
         }
         // `status` was the shared boards' half of what `list` now shows; kept for what notes say.
         Some("status") => room_list(&store),
-        Some("sync") => room_sync(&store),
+        Some("sync") => room_sync(&lock(&store)),
         Some(other) => Err(format!("unknown room command {other:?}: list, show, connect, disconnect, status, sync").into()),
     }
 }
 
-/// Every room on the relay, and for the ones a board here shares, how its sync is doing. One
-/// command for both: what is out there and how mine are doing are the same question. Without
-/// the relay, what this machine knows of its own shared boards.
-fn room_list(store: &Store) -> CliResult {
+fn lock(s: &Mutex<Store>) -> MutexGuard<'_, Store> {
+    s.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn room_list(store: &Mutex<Store>) -> CliResult {
     let cfg = need_remote()?;
-    if let Some(why) = store.paused()? {
+    if let Some(why) = lock(store).paused()? {
         println!("sync paused: {why}\n");
     }
     if !config::sync_enabled() {
         println!("sync off for this run (AI_KANBAN_SYNC)\n");
     }
-    let now = crate::core::now();
-    let rooms = if config::sync_enabled() { client(&cfg).rooms() } else { Err(RemoteError::Offline("sync is off for this run".into())) };
-    let rooms = match rooms {
-        Ok(r) => r,
-        Err(e) => {
-            println!("{} is not answering ({e}). What this machine knows of its shared boards:\n", cfg.url);
-            for (pid, room) in store.connected_boards()? {
-                let s = store.sync_status(pid)?.unwrap_or_default();
-                println!("{room:<16} <- your board {}\n{:<16} {}", store.project(pid)?.name, "", crate::render::sync_state(&s, now));
-            }
-            return Ok(());
-        }
-    };
-    if rooms.is_empty() {
-        println!("No rooms on {} yet. Connecting a board creates one: ai-kanban room connect <room>", cfg.url);
-        return Ok(());
-    }
-    for r in rooms {
-        let mine = match store.board_of_room(&r.name)? {
-            Some(pid) => Some((store.project(pid)?.name, store.sync_status(pid)?.unwrap_or_default())),
-            None => None,
-        };
-        let line = crate::render::room_line(&r, mine.as_ref().map(|(b, s)| (b.as_str(), s)), now);
-        println!("{}", crate::render::safe(&line));
-    }
-    println!("\nWhat is in one: ai-kanban room show <room>");
+    let c = client(&cfg);
+    let listing = rooms::list(store, config::sync_enabled().then_some(&c))?;
+    print!(
+        "{}",
+        crate::render::room_listing(&listing, &cfg.url, crate::core::now(), usize::MAX, "ai-kanban room show <room>", "ai-kanban room connect <room>")
+    );
     Ok(())
 }
 
-fn room_show(store: &Store, room: &str) -> CliResult {
+fn room_show(store: &Mutex<Store>, room: &str) -> CliResult {
     need_network()?;
     let cfg = need_remote()?;
-    let room = parse_room(room)?;
     let c = client(&cfg);
-    let info = find_room(&c, &room)?.ok_or_else(|| format!("no room {room} on {}. All of them: ai-kanban room list", cfg.url))?;
-    print!("{}", preview(&c, &cfg.url, &info)?);
-    match store.board_of_room(&room)? {
-        Some(pid) => println!("\nConnected here to your board {}.", store.project(pid)?.name),
+    let room = rooms::parse_room(room)?;
+    let (preview, here) = rooms::show(store, &c, &room)?.ok_or_else(|| format!("no room {room} on {}. All of them: ai-kanban room list", cfg.url))?;
+    print!("{}", crate::render::room_preview(&preview, &cfg.url, crate::core::now()));
+    match here {
+        Some(board) => println!("\nConnected here to your board {board}."),
         None => println!("\nConnect one of your boards to it: ai-kanban room connect {room}"),
     }
     Ok(())
 }
 
-fn parse_room(room: &str) -> Result<String, Box<dyn std::error::Error>> {
-    crate::sync::protocol::room_name(room)
-        .ok_or_else(|| format!("{room:?} is not a room name: lowercase letters, digits, '-' and '_'").into())
-}
-
-fn find_room(c: &Client, room: &str) -> Result<Option<RoomInfo>, RemoteError> {
-    Ok(c.rooms()?.into_iter().find(|r| r.name == room))
-}
-
-/// The tag a preview store publishes under. The relay never issues it -- tags it hands out are
-/// an initial and a number -- so no change in a room can look like the preview's own.
-const PREVIEW_TAG: &str = "preview";
-
-/// What a room holds, shown as the board view shows any board, without connecting to it: the
-/// room's log pulled into a throwaway in-memory store and rendered from there. The relay
-/// interprets nothing; the counts and claims are the client's own board logic.
-///
-/// Pull and apply only. `sync_board` would also push, sending the temporary board's own
-/// creation into the room; `check_identity` would give the store this machine's tag, and this
-/// machine's published tasks would then read as the preview's own.
-fn preview(c: &Client, url: &str, info: &RoomInfo) -> Result<String, Box<dyn std::error::Error>> {
-    Ok(look(c, url, info, None)?.0)
-}
-
-/// `preview`, also counting the tasks in the room created under one of `own`'s tags: what a
-/// board of `own` published there.
-fn look(c: &Client, url: &str, info: &RoomInfo, own: Option<&Store>) -> Result<(String, i64), Box<dyn std::error::Error>> {
-    let mut out = crate::render::room_header(info, url, crate::core::now());
-    if info.changes == 0 {
-        return Ok((crate::render::safe(&out).into_owned(), 0));
-    }
-    let mut mine = std::collections::HashSet::new();
-    let (tmp, pid) = Store::preview(&info.name, info.board.as_deref().unwrap_or(&info.name), PREVIEW_TAG)?;
-    let mut since = 0;
-    loop {
-        let page = c.pull(&info.name, since, MAX_PAGE).map_err(|e| match e {
-            // A relay from before reading was open to every key.
-            RemoteError::NotFound(m) if m.contains("not a member") => {
-                format!("the relay at {url} shows a room only to its members -- it is older than this ai-kanban. Update the relay")
-            }
-            e => e.to_string(),
-        })?;
-        let Some(last) = page.changes.iter().map(|p| p.seq).max() else { break };
-        since = last;
-        if let Some(store) = own {
-            for p in &page.changes {
-                if p.change.entity.kind == "task" && store.is_own_tag(&p.change.entity.origin)? {
-                    mine.insert((p.change.entity.origin.clone(), p.change.entity.id));
-                }
-            }
-        }
-        tmp.apply(pid, &page.changes)?;
-        if !page.more {
-            break;
-        }
-    }
-    let members: Vec<(String, String)> = info.members.iter().map(|m| (m.tag.clone(), m.user.clone())).collect();
-    tmp.sync_succeeded(pid, &members)?;
-    out.push('\n');
-    out.push_str(&crate::render::board(&tmp.board(pid, &BoardQuery::board())?));
-    // Everything in it came from the room: through the same filter as every answer.
-    Ok((crate::render::safe(&out).into_owned(), mine.len() as i64))
-}
-
-/// Which board a room connects to: one that exists, or one made for it -- made only once the
-/// person has confirmed, so cancelling leaves nothing behind.
-enum Pick {
-    Board(i64),
-    New(String),
-}
-
-fn room_connect(store: &Store, room: &str, a: &Args) -> CliResult {
+fn room_connect(store: &Mutex<Store>, room: &str, a: &Args) -> CliResult {
     need_network()?;
     let cfg = need_remote()?;
-    let room = parse_room(room)?;
     let c = client(&cfg);
-    if let Err(e) = check_identity(store, &c) {
-        return Err(e.into());
-    }
-    if let Some(pid) = store.board_of_room(&room)? {
-        return Err(format!("room {room} is already connected to board {} on this machine", store.project(pid)?.name).into());
-    }
-
+    let inspection = rooms::inspect(store, &c, room)?;
+    let room = inspection.room.clone();
     // What is in the room comes first: whoever answers the questions below should know which
     // room they are answering them about.
-    let existing = find_room(&c, &room)?;
-    let mut published_before = 0;
-    // Whether the room is known to hold nothing this machine published: it does not exist yet,
-    // or its log has none of this store's tasks. Then what this store remembers sending to a
-    // room by that name is of one that is gone (deleted and reopened, or a relay set up anew),
-    // and is forgotten once the connect is confirmed.
-    let mut fresh = existing.is_none();
-    match &existing {
-        // A relay from before open reads cannot show it; connecting must still work there.
-        Some(info) => match look(&c, &cfg.url, info, Some(store)) {
-            Ok((p, mine)) => {
-                println!("{p}");
-                published_before = mine;
-                fresh = mine == 0;
-            }
-            Err(e) => println!("(cannot show what is in room \"{room}\": {e})\n"),
-        },
+    match &inspection.preview {
+        Some(Ok(p)) => println!("{}", crate::render::room_preview(p, &cfg.url, crate::core::now())),
+        Some(Err(e)) => println!("(cannot show what is in room \"{room}\": {e})\n"),
         None => println!("Room \"{room}\" does not exist yet on {} -- connecting creates it.\n", cfg.url),
     }
 
-    let pick = match (&a.board, a.new_board) {
+    let choice = match (&a.board, a.new_board) {
         (Some(_), true) => return Err("--board and --new-board contradict each other".into()),
-        (Some(b), false) => Pick::Board(store.project_by_name_or_key(b)?.id),
-        (None, true) => Pick::New(free_name(store, &room)?),
+        (Some(b), false) => match lock(store).project_by_name_or_key(b) {
+            Ok(p) => Choice::Board(p.id),
+            // A typo must never create a board in a team room, so an unknown name is refused --
+            // naming the flag that does make one (#1120).
+            Err(e @ crate::core::Error::ProjectNotFound { .. }) => {
+                return Err(format!("{}\nTo make a new board for this room instead: --new-board", crate::render::error(&e)).into())
+            }
+            Err(e) => return Err(e.into()),
+        },
+        (None, true) => Choice::Named(room.clone()),
         (None, false) => pick_board(store, &room)?,
     };
-    // Before anything is written -- the backup, the join, a new board.
-    let target = match &pick {
-        Pick::Board(pid) => Some(*pid),
-        Pick::New(_) => None,
-    };
-    // Skipped only for a room that does not exist: one that does may hold tasks this machine
-    // received onto another board, and a room of nothing but those still looks "fresh".
-    if let Some((elsewhere, tasks)) = if existing.is_none() { None } else { store.room_held_elsewhere(&room, target)? } {
-        let held = store.project(elsewhere)?.name;
-        let fix = match &pick {
-            Pick::Board(pid) => format!("or merge it into this one first: ai-kanban board merge \"{}\" \"{held}\"", store.project(*pid)?.name),
-            Pick::New(_) => "or merge it into the board you want first (ai-kanban board merge <board> <that board>)".to_string(),
-        };
-        return Err(format!(
-            "{tasks} task(s) of room {room} are on board \"{held}\" on this machine. A room's tasks live on one board per \
-             machine, so another board would not get them. Connect \"{held}\" again (ai-kanban room connect {room} --board \"{held}\"), {fix}"
-        )
-        .into());
-    }
-    if published_before > store.own_tasks_held(&room)? {
-        return Err(format!(
-            "room {room} holds {published_before} task(s) this machine published from a board it no longer has. A board \
-             connected now would not get them back: they read as this machine's own echoes. To start over in the room, \
-             give this machine a key of its own (relay admin: key add <label>), set it (ai-kanban remote <url> --key <key>), \
-             then connect -- the old tasks then arrive as anyone else's"
-        )
-        .into());
-    }
-    let (name, publish) = match &pick {
-        Pick::Board(pid) => {
-            let board = store.project(*pid)?;
-            if let Some(r) = store.room_of(*pid)? {
-                return Err(format!("board {} is already connected to room {r}", board.name).into());
-            }
-            (board.name, Some(store.publish_summary(*pid)?))
-        }
-        Pick::New(name) => (name.clone(), None),
-    };
+    let plan = rooms::plan(store, inspection, choice)?;
 
-    let tag = store.origin_tag()?.unwrap_or_default();
-    match publish {
+    let tag = lock(store).origin_tag()?.unwrap_or_default();
+    let name = plan.board_name.clone();
+    match &plan.publish {
         Some(p) => {
             println!("board \"{name}\" -> room \"{room}\" on {}", cfg.url);
             println!("  will publish:  {} tasks, {} events, {} notes   (as #N-{tag})", p.tasks, p.events, p.notes);
         }
         None => println!("a new board \"{name}\" -> room \"{room}\" on {}", cfg.url),
     }
-    if let Some(r) = &existing {
+    if let Some(r) = &plan.inspection.existing {
         let who = r.members.iter().map(|m| format!("{} ({})", m.user, m.tag)).collect::<Vec<_>>().join(", ");
         println!("  will receive:  {} changes{}", r.changes, if who.is_empty() { String::new() } else { format!(" from {who}") });
     }
@@ -498,55 +362,20 @@ fn room_connect(store: &Store, room: &str, a: &Args) -> CliResult {
         return Ok(());
     }
 
-    // Whole seconds name it, so a second connect within the same one gets a counter rather
-    // than a refusal to overwrite the first backup.
-    let dir = Store::default_path()?.parent().map(|d| d.to_path_buf()).unwrap_or_default();
-    let stamp = crate::core::now();
-    let mut backup = dir.join(format!("kanban-before-connect-{room}-{stamp}.db"));
-    for n in 2.. {
-        if !backup.exists() {
-            break;
+    let named = matches!(plan.choice, Choice::Named(_));
+    let done = rooms::connect(store, &c, plan)?;
+    println!("backup written: {}", done.backup.display());
+    if done.created {
+        println!("board {} created.", done.board_name);
+        if named {
+            give_it_a_folder(&lock(store), done.pid, &done.board_name)?;
         }
-        backup = dir.join(format!("kanban-before-connect-{room}-{stamp}-{n}.db"));
     }
-    store.backup_to(&backup)?;
-    println!("backup written: {}", backup.display());
-    if fresh {
-        store.forget_sent(&room)?;
-    }
-
-    let pid = match pick {
-        Pick::Board(pid) => pid,
-        Pick::New(name) => {
-            let p = store.create_board(&name)?;
-            println!("board {} created.", p.name);
-            give_it_a_folder(store, p.id, &p.name)?;
-            p.id
-        }
-    };
-    let joined = c.join(&room, Some(&name))?;
-    store.connect_board(pid, &room)?;
-    if let Some(id) = joined.room.id {
-        store.set_relay_room(pid, id)?;
-    }
-    match sync_board(store, &c, pid) {
+    match sync_board(&lock(store), &c, done.pid) {
         Ok(s) => println!("connected. Published {} changes, received {}. The board now shows as: Board: {name} @{room}", s.pushed, s.applied),
         Err(e) => println!("connected, but the first sync failed: {e}\nIt is retried on the next sync; nothing is lost."),
     }
     Ok(())
-}
-
-/// The room's name for a new board, if no board has it yet. Checked when it is chosen, so the
-/// person is not told after confirming.
-fn free_name(store: &Store, name: &str) -> Result<String, Box<dyn std::error::Error>> {
-    if store.all_projects()?.iter().any(|p| p.name.eq_ignore_ascii_case(name)) {
-        return Err(format!(
-            "there is already a board called {name}. Connect that one (--board {name}), or make one with another \
-             name: ai-kanban board add <name>, then --board <name>"
-        )
-        .into());
-    }
-    Ok(name.to_string())
 }
 
 /// A board with no folder is one no session opens: an agent in the project resolves to another
@@ -572,7 +401,8 @@ fn give_it_a_folder(store: &Store, pid: i64, name: &str) -> CliResult {
 /// The board to connect, asked for when neither `--board` nor `--new-board` was given. Boards
 /// already in a room are not offered, the one this folder resolves to comes first, and 0 makes
 /// a new one.
-fn pick_board(store: &Store, room: &str) -> Result<Pick, Box<dyn std::error::Error>> {
+fn pick_board(store: &Mutex<Store>, room: &str) -> Result<Choice, Box<dyn std::error::Error>> {
+    let store = lock(store);
     let connected: Vec<i64> = store.connected_boards()?.into_iter().map(|(p, _)| p).collect();
     let here = std::env::current_dir().ok().and_then(|d| store.find_project(&d).ok().flatten()).map(|p| p.id);
     let mut boards: Vec<_> = store.all_projects()?.into_iter().filter(|p| !connected.contains(&p.id)).collect();
@@ -597,12 +427,14 @@ fn pick_board(store: &Store, room: &str) -> Result<Pick, Box<dyn std::error::Err
     let n: usize = if answer.is_empty() { default } else { answer.parse().map_err(|_| format!("{answer:?} is not one of the numbers"))? };
     if n == 0 {
         let name = ask_as_typed(&format!("Name for the new board [{room}]:"), "--new-board")?;
-        return Ok(Pick::New(free_name(store, if name.is_empty() { room } else { &name })?));
+        return Ok(Choice::Named(if name.is_empty() { room.to_string() } else { name }));
     }
-    boards.get(n - 1).map(|p| Pick::Board(p.id)).ok_or_else(|| format!("{n} is not one of the numbers").into())
+    boards.get(n - 1).map(|p| Choice::Board(p.id)).ok_or_else(|| format!("{n} is not one of the numbers").into())
 }
 
-fn disconnect(store: &Store, cfg: &RemoteConfig, pid: i64, room: &str, a: &Args) -> CliResult {
+fn disconnect(shared: &Mutex<Store>, cfg: &RemoteConfig, pid: i64, room: &str, a: &Args) -> CliResult {
+    let guard = lock(shared);
+    let store: &Store = &guard;
     let board = store.project(pid)?;
     let status = store.sync_status(pid)?.unwrap_or_default();
     println!("Board \"{}\" and room \"{room}\" will be uncoupled.", board.name);
@@ -649,14 +481,11 @@ fn disconnect(store: &Store, cfg: &RemoteConfig, pid: i64, room: &str, a: &Args)
         return Ok(());
     }
 
-    // Best effort: leaving tells the relay nobody here is connected any more. Offline, the board
-    // is uncoupled anyway; the relay only uses membership for its own housekeeping.
-    if config::sync_enabled() {
-        if let Err(e) = client(cfg).leave(room) {
-            println!("  (could not tell the relay: {e})");
-        }
+    drop(guard);
+    let c = client(cfg);
+    if let Some(e) = rooms::uncouple(shared, config::sync_enabled().then_some(&c), pid, room, wipe)? {
+        println!("  (could not tell the relay: {e})");
     }
-    store.disconnect_board(pid, wipe)?;
     println!("disconnected. Board \"{}\" is local again{}.", board.name, if wipe { ", without other members' tasks" } else { "" });
     Ok(())
 }

@@ -147,7 +147,8 @@ fn a_room_can_be_looked_into_without_joining_and_connected_to_a_new_board() {
 
     let no_board = volker.fails(&["room", "connect", "sbahn"]);
     assert!(no_board.contains("--new-board"), "without a terminal it says how to make one: {no_board}");
-    volker.fails(&["room", "connect", "sbahn", "--board", "sbhan", "--yes"]);
+    let typo = volker.fails(&["room", "connect", "sbahn", "--board", "sbhan", "--yes"]);
+    assert!(typo.contains("--new-board"), "an unknown board names the flag that makes one (#1120): {typo}");
     assert!(volker.store().all_projects().unwrap().is_empty(), "a mistyped --board creates nothing");
     let both = volker.fails(&["room", "connect", "sbahn", "--board", "x", "--new-board", "--yes"]);
     assert!(both.contains("contradict"), "{both}");

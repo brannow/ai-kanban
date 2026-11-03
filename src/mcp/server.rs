@@ -60,16 +60,21 @@ pub struct AiKanban {
     /// Something about this session's setup the agent should pass on, said first in every
     /// `board` answer: a relay in the plugin's settings that this machine did not take.
     notice: Option<String>,
+    /// The (room, board) pairs `room_show` has told the agent what connecting would publish
+    /// for, this session. `room_connect` publishes a board's existing content only after that:
+    /// it is the one tool that prompts the person, and the prompt shows only its arguments, so
+    /// what they approve must already be in the conversation.
+    previewed: Mutex<std::collections::HashSet<(String, i64)>>,
 }
 
 impl AiKanban {
     pub fn new(store: Store) -> Self {
-        Self { store: Arc::new(Mutex::new(store)), sync: None, cwd: project_dir(), notice: None }
+        Self { store: Arc::new(Mutex::new(store)), sync: None, cwd: project_dir(), notice: None, previewed: Mutex::default() }
     }
 
     /// `new`, syncing shared boards in the background (`remote::daemon`).
     pub fn with_sync(store: Store, sync: Option<crate::remote::daemon::Syncer>) -> Self {
-        Self { store: Arc::new(Mutex::new(store)), sync: sync.map(Arc::new), cwd: project_dir(), notice: None }
+        Self { store: Arc::new(Mutex::new(store)), sync: sync.map(Arc::new), cwd: project_dir(), notice: None, previewed: Mutex::default() }
     }
 
     /// Says `notice` at the top of every `board` answer.
@@ -90,6 +95,33 @@ impl AiKanban {
     fn catch_up(&self, store: &Store, project_id: i64) {
         if let Some(s) = &self.sync {
             s.now(store, project_id);
+        }
+    }
+
+    /// The relay this machine is set up for, for the room tools. The URL and key are the
+    /// person's to set, never the agent's: the error says where, in terms the agent can pass on.
+    fn relay(&self) -> Result<(crate::remote::RemoteConfig, crate::remote::Client), ErrorData> {
+        if !crate::remote::config::sync_enabled() {
+            return Err(ErrorData::invalid_params("Sync is off for this session (AI_KANBAN_SYNC), so nothing can reach the relay.", None));
+        }
+        let cfg = crate::remote::RemoteConfig::load().map_err(fail)?.ok_or_else(|| {
+            ErrorData::invalid_params(
+                "This machine has no team relay set. That is the person's to do, once: in Claude Code, /plugin -> \
+                 ai-kanban -> Configure -> Team relay URL and Team relay key (the key comes from whoever runs the \
+                 relay). It takes effect when the session restarts.",
+                None,
+            )
+        })?;
+        let c = crate::remote::Client::new(&cfg.url, &cfg.key, ROOM_TIMEOUT);
+        Ok((cfg, c))
+    }
+
+    /// The board a room tool means: one named by name or key, or the folder's. Never through
+    /// `resolve`, which would take a directory and make a board for it before any refusal.
+    fn board_choice(&self, project: Option<&str>) -> Result<crate::remote::rooms::Choice, ErrorData> {
+        match project.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(name) => Ok(crate::remote::rooms::Choice::Board(self.store().project_by_name_or_key(name).map_err(fail)?.id)),
+            None => crate::remote::rooms::choose_folder(&self.store, &self.cwd).map_err(refused),
         }
     }
 
@@ -378,6 +410,41 @@ pub struct RepoRemoveParams {
     /// The repo, by name as the board lists it, or by path.
     pub repo: String,
     pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RoomParams {
+    /// The room's name, as room_list shows it: lowercase letters, digits, '-' and '_'.
+    pub room: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RoomBoardParams {
+    /// The room's name, as room_list shows it. One that does not exist yet is created by
+    /// connecting.
+    pub room: String,
+    /// The board to connect, by name as `board(project: "all")` lists them. Omit it: the board
+    /// of the folder you are working in, made for it if it has none yet, is almost always
+    /// the one meant.
+    pub project: Option<String>,
+}
+
+/// The room tools' relay requests: long enough for a relay on the other side of the world.
+const ROOM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long `room_connect` and `room_disconnect` sync inside the call. What does not fit, the
+/// background syncer finishes; a board with years of history must not hold the agent for
+/// minutes.
+const ROOM_SYNC_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+/// Rooms one `room_list` shows. Asserted in `tests/budget.rs`.
+pub const ROOM_LIST_LIMIT: usize = 15;
+/// The one tool Claude Code asks the person about on every call, whatever the permission mode.
+/// Connecting publishes to a team, which the agent may set in motion but not decide alone; and
+/// it happens about once per project, so one prompt is the whole cost.
+const ASKS_THE_PERSON: &str = "room_connect";
+
+/// A room operation's failure as the agent reads it.
+fn refused(e: Box<dyn std::error::Error>) -> ErrorData {
+    ErrorData::invalid_params(e.to_string(), None)
 }
 
 // ---------------------------------------------------------------------------
@@ -780,6 +847,167 @@ impl AiKanban {
         self.wrote();
         Ok(format!("Board: {}\n\nrecorded.\n", resolved.project.name))
     }
+
+    /// The rooms on this machine's team relay: the shared boards teammates work in, who is in
+    /// each, and for the one a board here is connected to, how its sync is doing. Use it when
+    /// the user wants to work with their team, or join one.
+    #[tool(name = "room_list", annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true))]
+    fn room_list(&self) -> Result<String, ErrorData> {
+        let (cfg, c) = self.relay()?;
+        let listing = crate::remote::rooms::list(&self.store, Some(&c)).map_err(refused)?;
+        Ok(render::room_listing(&listing, &cfg.url, crate::core::now(), ROOM_LIST_LIMIT, "room_show", "room_connect"))
+    }
+
+    /// What a room holds, shown as a board, without joining it -- its tasks, who has what in
+    /// doing, who is connected -- and what connecting would do: which board, and what of it
+    /// would be published. Looking does not make you a member. Call it before room_connect.
+    #[tool(name = "room_show", annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true))]
+    fn room_show(&self, Parameters(p): Parameters<RoomBoardParams>) -> Result<String, ErrorData> {
+        use crate::remote::rooms::{self, Choice};
+        let (cfg, c) = self.relay()?;
+        let room = rooms::parse_room(&p.room).map_err(refused)?;
+        let now = crate::core::now();
+        if self.store().board_of_room(&room).map_err(fail)?.is_some() {
+            let Some((preview, here)) = rooms::show(&self.store, &c, &room).map_err(refused)? else {
+                return Err(ErrorData::invalid_params(format!("No room {room} on {}. room_list shows them all.", cfg.url), None));
+            };
+            let mut out = render::room_preview(&preview, &cfg.url, now);
+            out.push_str(&format!("\nConnected here to your board {}.\n", here.unwrap_or_default()));
+            return Ok(out);
+        }
+        let inspection = rooms::inspect(&self.store, &c, &room).map_err(refused)?;
+        let mut out = match &inspection.preview {
+            Some(Ok(preview)) => render::room_preview(preview, &cfg.url, now),
+            Some(Err(e)) => format!("(cannot show what is in room \"{room}\": {e})\n"),
+            None => format!("Room \"{room}\" does not exist yet on {}: connecting creates it.\n", cfg.url),
+        };
+        let choice = self.board_choice(p.project.as_deref())?;
+        let folder = p.project.is_none().then_some(self.cwd.as_path());
+        out.push('\n');
+        match rooms::plan(&self.store, inspection, choice) {
+            Ok(plan) => {
+                if let Choice::Board(pid) = plan.choice {
+                    self.previewed.lock().unwrap_or_else(|e| e.into_inner()).insert((room.clone(), pid));
+                }
+                let tag = self.store().origin_tag().map_err(fail)?.unwrap_or_default();
+                out.push_str(&render::connect_outlook(&plan, &tag, folder));
+            }
+            Err(e) => out.push_str(&format!("Connecting from here would be refused: {e}\n")),
+        }
+        Ok(render::safe(&out).into_owned())
+    }
+
+    /// Share a board with the team through a room on the relay: from then on everything
+    /// written on it reaches every member, and theirs arrives here. Use it when the user
+    /// wants to join a team's room or share this project's board. A room that does not exist
+    /// yet is created. Claude Code asks the user to confirm every call.
+    ///
+    /// Call room_show first and tell the user what it says connecting would publish: a board
+    /// that already has content sends all of it to everyone in the room, which cannot be taken
+    /// back, and is only connected after room_show has said so. The board defaults to the one
+    /// of the folder you work in, made for it if it has none yet.
+    #[tool(name = "room_connect", annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = true))]
+    fn room_connect(&self, Parameters(p): Parameters<RoomBoardParams>) -> Result<String, ErrorData> {
+        use crate::remote::rooms::{self, Choice};
+        let (cfg, c) = self.relay()?;
+        let inspection = rooms::inspect(&self.store, &c, &p.room).map_err(refused)?;
+        let choice = self.board_choice(p.project.as_deref())?;
+        let plan = rooms::plan(&self.store, inspection, choice).map_err(refused)?;
+        if let (true, Choice::Board(pid)) = (plan.publishes_history(), &plan.choice) {
+            let key = (plan.inspection.room.clone(), *pid);
+            if !self.previewed.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "Not connected: board \"{}\" already has content, and connecting would publish all of it to room \
+                         {}. Call room_show {} first and tell the user what it would publish; then room_connect.",
+                        plan.board_name, plan.inspection.room, plan.inspection.room
+                    ),
+                    None,
+                ));
+            }
+        }
+
+        let made_for_folder = matches!(plan.choice, Choice::Folder(_));
+        let done = rooms::connect(&self.store, &c, plan).map_err(refused)?;
+        let first = {
+            let store = self.store();
+            crate::remote::sync_board_within(&store, &c, done.pid, ROOM_SYNC_BUDGET).map_err(|e| e.to_string())
+        };
+        if let Some(s) = &self.sync {
+            s.room_added();
+        }
+        let store = self.store();
+        let room = store.room_of(done.pid).map_err(fail)?.unwrap_or_default();
+        let unsent = store.sync_status(done.pid).map_err(fail)?.map(|s| s.unsent).unwrap_or(0);
+        let mut out = render::connected(
+            &done.board_name,
+            &room,
+            &cfg.url,
+            made_for_folder.then_some(self.cwd.as_path()),
+            &first.map(|s| (s.pushed, s.applied)),
+            unsent,
+            self.sync.is_some(),
+        );
+        out.push('\n');
+        out.push_str(&render::board(&store.board(done.pid, &BoardQuery::board()).map_err(fail)?));
+        Ok(out)
+    }
+
+    /// Stop sharing a board with its room: it becomes local again. Everything already
+    /// published stays in the room for the others, and teammates' tasks stay on this board as
+    /// they are. Changes not sent yet are sent first; if the relay cannot take them, nothing
+    /// is uncoupled.
+    #[tool(name = "room_disconnect", annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true))]
+    fn room_disconnect(&self, Parameters(p): Parameters<RoomParams>) -> Result<String, ErrorData> {
+        let room = crate::remote::rooms::parse_room(&p.room).map_err(refused)?;
+        // Offline is fine when nothing is waiting to go out: the relay only learns later.
+        let relay = self.relay().ok();
+        let (pid, board, unsent) = {
+            let store = self.store();
+            let Some(pid) = store.board_of_room(&room).map_err(fail)? else {
+                let connected = store.connected_boards().map_err(fail)?.into_iter().map(|(_, r)| r).collect::<Vec<_>>();
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "No board on this machine is connected to room {room}. {}",
+                        if connected.is_empty() { "None is connected to any room.".to_string() } else { format!("Connected here: {}.", connected.join(", ")) }
+                    ),
+                    None,
+                ));
+            };
+            store.flush().map_err(fail)?;
+            let mut unsent = store.sync_status(pid).map_err(fail)?.map(|s| s.unsent).unwrap_or(0);
+            // Disconnecting with changes not sent would keep them from the team, silently.
+            if let (true, Some((_, c))) = (unsent > 0, &relay) {
+                let _ = crate::remote::sync_board_within(&store, c, pid, ROOM_SYNC_BUDGET);
+                unsent = store.sync_status(pid).map_err(fail)?.map(|s| s.unsent).unwrap_or(0);
+            }
+            (pid, store.project(pid).map_err(fail)?.name, unsent)
+        };
+        if unsent > 0 {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "{unsent} change(s) on board {board} have not reached room {room} yet, and the relay is not taking them \
+                     now. Nothing was uncoupled: that would keep them from the team. Try again once the relay is \
+                     reachable. Dropping them instead is the person's call: ai-kanban room disconnect {room} --discard"
+                ),
+                None,
+            ));
+        }
+        let foreign = self.store().foreign_task_count(pid).map_err(fail)?;
+        let told = crate::remote::rooms::uncouple(&self.store, relay.as_ref().map(|(_, c)| c), pid, &room, false).map_err(refused)?;
+        let store = self.store();
+        let mut out = format!(
+            "Board {board} is local again: nothing written on it reaches room {room} any more, and the room keeps \
+             everything already published.{}\n",
+            if foreign > 0 { format!(" The {foreign} task(s) teammates created stay here as they are and no longer change.") } else { String::new() }
+        );
+        if let Some(e) = told {
+            out.push_str(&format!("(The relay could not be told -- {e}. It does not need to be.)\n"));
+        }
+        out.push('\n');
+        out.push_str(&render::board(&store.board(pid, &BoardQuery::board()).map_err(fail)?));
+        Ok(out)
+    }
 }
 
 /// Written out rather than left to the macro so the server can carry `instructions`.
@@ -806,7 +1034,15 @@ impl ServerHandler for AiKanban {
         let supports_cache_hints = context.protocol_version().is_some_and(|version| {
             version >= rmcp::model::ProtocolVersion::V_2026_07_28
         });
-        let tools = crate::mcp::schema::portable_tools(Self::tool_router().list_all());
+        let mut tools = crate::mcp::schema::portable_tools(Self::tool_router().list_all());
+        // Claude Code prompts for a tool marked so on every call, in every permission mode;
+        // `destructive_hint` alone changes nothing there. A plugin cannot ship a permission rule,
+        // so the marker is how the plugin itself keeps the person in the loop.
+        for t in tools.iter_mut().filter(|t| t.name == ASKS_THE_PERSON) {
+            let mut meta = t.meta.take().unwrap_or_default();
+            meta.0.insert("anthropic/requiresUserInteraction".into(), serde_json::Value::Bool(true));
+            t.meta = Some(meta);
+        }
         Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
             tools,
@@ -852,7 +1088,9 @@ impl ServerHandler for AiKanban {
              task, say why: what changed is recoverable from the diff, why it changed is not. \
              Record what you work out about the codebase as a note, with the files it \
              concerns. Before debugging something that feels familiar, try `recall` -- it \
-             searches other projects too."
+             searches other projects too.\n\n\
+             When the user wants to work with their team, the room tools share a board through \
+             the team's relay: `room_list` to find the room, `room_connect` to join it."
                 .into(),
         );
         info

@@ -96,7 +96,7 @@ difference between a board showing a slice and a board hiding work.
 
 ---
 
-## The eight tools
+## The tools
 
 | Tool | The intent it serves |
 |---|---|
@@ -112,6 +112,48 @@ difference between a board showing a slice and a board hiding work.
 Each is one call. `task_update` takes status, priority, body **and** the `log` entry
 together, because splitting them would make recording the reason a separate call — and a
 separate call is the one that gets skipped.
+
+### Rooms: four tools, one of them asks the person
+
+| Tool | The intent it serves |
+|---|---|
+| `room_list` | "Which team boards are there?" |
+| `room_show` | "What is in that one?" -- without joining it |
+| `room_connect` | "Join the team's room" / "share this board" |
+| `room_disconnect` | "Stop sharing this board" |
+
+Decided 2026-11-03 (#1119), reversing "connecting is a CLI step, never the agent's"
+(`docs/sync.md`). In real use that rule did not keep the agent out: an agent asked to join a
+team hit the wall and ran the binary from its shell, where `--yes` skips the publish summary.
+The rule protected the consent step by removing it. The person's part is now exactly two
+things: creating the key and putting it in the plugin's settings. Everything else is the
+agent's.
+
+- **The board defaults to the folder's**, made for it the way a session makes one (keyed by
+  the git remote, so it is the same identity on every teammate's clone) -- never by name. Board
+  names are local by design, and a board made by name has no folder, so no session opens it.
+- **Publishing history is the one decision, and the person makes it at the prompt.**
+  `room_connect` carries `_meta["anthropic/requiresUserInteraction"]: true`: Claude Code asks the
+  person on every call, in every permission mode, auto included. `destructiveHint` would not have
+  done it -- Claude Code does not use annotations for permissions -- and a plugin cannot ship a
+  permission rule. One prompt per connect is cheap: it happens about once per project per person.
+  Source: code.claude.com/docs mcp.md, "Require approval for a specific tool" -- read, not yet
+  seen working live (#1119 stays in testing until it has been).
+- **What is approved must be on screen before the prompt.** The prompt shows only the tool's
+  arguments, so the summary lives in `room_show`, which never prompts: which board (name and
+  folder first, so an agent in the wrong project is caught) and what of it would be published.
+  The server remembers, per session, the (room, board) pairs it showed that for, and
+  `room_connect` refuses to publish a board's existing content without it, naming `room_show`.
+  A new or empty board needs no look: it sends nothing but what is written from now on.
+  Considered and dropped (Benjamin, 2026-11-03): a `publish_history: true` flag on
+  `room_connect` itself. Its first, flagless call cost a prompt only to show the summary -- two
+  prompts per connect, the first one trained to be clicked through.
+- **`room_disconnect` takes only the safe path**: unsent changes go out first (refused if the
+  relay cannot take them), teammates' tasks are kept. Discarding and wiping stay CLI flags.
+- **One implementation.** `src/remote/rooms.rs` holds every refusal; the CLI and the tools only
+  ask and render around it.
+- **Deferred tools make four more cheap.** Plugin tools arrive deferred (note #12): a session
+  pays for their names, not their schemas.
 
 ### Workstreams add no tool
 
@@ -353,8 +395,15 @@ sentinel.
 | `task_add`, `note_add`, `log` | false | false | false |
 | `task_update`, `note_update` | false | false | false |
 
-`destructiveHint` is false throughout because nothing is ever destroyed: `archived` is a
-status rather than a delete, and a note edit writes the previous value into the event log.
+| `room_list`, `room_show` | true | true | — |
+| `room_connect` | false | false | true |
+| `room_disconnect` | false | false | false |
+
+`destructiveHint` is false for the board tools because nothing is ever destroyed: `archived`
+is a status rather than a delete, and a note edit writes the previous value into the event log.
+`room_connect` is the exception: what it publishes cannot be called back from teammates'
+machines. The room tools are also `openWorldHint` (they reach the relay). None of this makes
+Claude Code prompt; the `requiresUserInteraction` marker on `room_connect` does (above).
 
 The write tools are **not** idempotent, and saying so matters: calling `task_add` twice
 creates two tasks. A client that assumed otherwise and retried would silently duplicate work.
