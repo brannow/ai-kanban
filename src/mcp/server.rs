@@ -156,6 +156,46 @@ impl AiKanban {
             }
         }
     }
+
+    /// `board` with `since` / `until`: what changed in that range (#1172).
+    ///
+    /// A pure read, unlike the board's own `workstream` argument: here a workstream narrows
+    /// this one answer and is never entered. Looking back at last week's slice must not move
+    /// where the next `task_add` lands.
+    fn changes(&self, store: &Store, p: &BoardParams) -> Result<String, ErrorData> {
+        use crate::core::changes::ChangeQuery;
+        let now = crate::core::now();
+        let (since, until) = store.change_range(p.since.as_deref(), p.until.as_deref(), now).map_err(fail)?;
+        let all_rows = p.include.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(ALL));
+        let mut q = ChangeQuery {
+            since,
+            until,
+            status: statuses(&p.status)?,
+            limit: if all_rows { usize::MAX } else { ChangeQuery::LIMIT },
+            workstream: None,
+        };
+        if p.project.as_deref().is_some_and(|s| s.trim().eq_ignore_ascii_case(ALL)) {
+            let c = store.changes_everywhere(&q).map_err(fail)?;
+            return Ok(render::changes(None, &c));
+        }
+        let pid = self.resolve(store, p.project.as_deref()).map_err(fail)?.project.id;
+        q.workstream = match p.workstream.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(w) if w.eq_ignore_ascii_case(ALL) => None,
+            Some(w) => Some(store.workstream_by_name(pid, w).map_err(fail)?
+                .ok_or_else(|| fail(Error::InvalidValue {
+                    field: "workstream",
+                    value: w.to_string(),
+                    valid: "a workstream this board has, or \"all\"".into(),
+                }))?.id),
+            None => store.current_workstream(pid).map_err(fail)?.map(|w| w.id),
+        };
+        // The board's header, nothing listed: the same first lines as every board call, so the
+        // board, its scope and its sync state are stated here too.
+        let head = store.board(pid, &BoardQuery { status: vec![], limit: 0, recent_limit: 0, workstream: q.workstream })
+            .map_err(fail)?;
+        let c = store.changes(pid, &q).map_err(fail)?;
+        Ok(format!("{}{}", self.notice.clone().unwrap_or_default(), render::changes(Some(&head), &c)))
+    }
 }
 
 /// `CLAUDE_PROJECT_DIR` first, process cwd second.
@@ -186,6 +226,17 @@ where F: Fn(&str) -> Result<T, String> {
             Err(valid) => Err(fail(Error::InvalidValue { field, value: v.clone(), valid })),
         },
     }
+}
+
+/// A comma-separated status list, or fails naming the valid ones. Empty when absent.
+fn statuses(raw: &Option<String>) -> Result<Vec<Status>, ErrorData> {
+    let mut out = Vec::new();
+    for part in raw.as_deref().unwrap_or("").split(',').map(str::trim).filter(|x| !x.is_empty()) {
+        out.push(Status::parse(part).map_err(|valid| {
+            fail(Error::InvalidValue { field: "status", value: part.to_string(), valid })
+        })?);
+    }
+    Ok(out)
 }
 
 fn csv(s: &Option<String>) -> Option<Vec<String>> {
@@ -222,6 +273,15 @@ pub struct BoardParams {
     ///
     /// Tasks you file afterwards join this workstream automatically.
     pub workstream: Option<String>,
+    /// Show what changed since then instead of the open tasks: each task touched once, with
+    /// its status and what happened, plus decisions and logs. A relative age (30m, 12h, 3d,
+    /// 2w), today, yesterday, or a date (2026-11-02, "2026-11-02 14:00") in local time.
+    /// With project "all", across every board. `status` keeps only tasks now in those
+    /// statuses; include "all" lifts the 30-line cap.
+    pub since: Option<String>,
+    /// End of that range, same forms as `since`; a date includes that whole day. Omit for
+    /// now. Given without `since`, the range is the 7 days before it.
+    pub until: Option<String>,
 }
 
 /// A task as the board shows it: `12`, or on a shared board a handle like `122-v1`.
@@ -457,6 +517,7 @@ fn refused(e: Box<dyn std::error::Error>) -> ErrorData {
 impl AiKanban {
     /// Show the board: what is in flight, what is blocked and why, and what happened
     /// recently. Call this when starting work on a project to find out where things stand.
+    /// Pass `since` (3d, yesterday, 2026-11-02) to see what changed in that time instead.
     ///
     /// Pass `workstream` when the user says what you are working on ("we're doing the
     /// contact form now") -- the board narrows to it and tasks you file afterwards join it.
@@ -472,6 +533,13 @@ impl AiKanban {
     fn board(&self, Parameters(p): Parameters<BoardParams>) -> Result<String, ErrorData> {
         let store = self.store();
 
+        // Before the "all" summary below, which returns early: "what changed everywhere since
+        // Friday" is a changes view, not a list of boards.
+        let blank = |s: &Option<String>| s.as_deref().map(str::trim).unwrap_or("").is_empty();
+        if !blank(&p.since) || !blank(&p.until) {
+            return self.changes(&store, &p);
+        }
+
         // "all" is a summary of every board, never a merged task list: every open task
         // across every project is a pile, not a board.
         if p.project.as_deref().map(|s| s.eq_ignore_ascii_case(ALL)).unwrap_or(false) {
@@ -481,14 +549,8 @@ impl AiKanban {
 
         let resolved = self.resolve(&store, p.project.as_deref()).map_err(fail)?;
         let mut q = BoardQuery::board();
-        if let Some(s) = &p.status {
-            let mut statuses = Vec::new();
-            for part in s.split(',').map(str::trim).filter(|x| !x.is_empty()) {
-                statuses.push(Status::parse(part).map_err(|valid| {
-                    fail(Error::InvalidValue { field: "status", value: part.to_string(), valid })
-                })?);
-            }
-            q.status = statuses;
+        if p.status.is_some() {
+            q.status = statuses(&p.status)?;
         }
         if p.include.as_deref().map(|s| s.eq_ignore_ascii_case(ALL)).unwrap_or(false) {
             q.limit = usize::MAX;

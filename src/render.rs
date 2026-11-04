@@ -347,6 +347,114 @@ fn event_line(e: &Event, now: i64, h: &Handles) -> String {
     format!("  {:<4} {}{what}\n", when, h.by("event", e.id, e.actor))
 }
 
+/// `board(since, until)`: what changed in a time range, one line per task and per
+/// project-level entry, newest first. `head` is the board whose header leads the view; None
+/// for the view across every board, which is grouped by board instead.
+pub fn changes(head: Option<&BoardSnapshot>, c: &crate::core::changes::Changes) -> String {
+    use crate::core::changes::Change;
+    let mut out = match head {
+        Some(snap) => header(snap),
+        None => "Every board\n".to_string(),
+    };
+    // The resolved range, always: the agent passed "3d" or a date, and has to be able to see
+    // what that became -- the same reason the header names the board and the workstream.
+    let until = if c.until > c.now { "now".to_string() } else { local_time(c.until, c.utc_offset, c.now) };
+    out.push_str(&format!(
+        "\nchanged since {} ({}), until {until}\n",
+        local_time(c.since, c.utc_offset, c.now),
+        since(c.now, c.since),
+    ));
+    if c.rows.is_empty() {
+        out.push_str("  nothing in this range\n");
+        return out;
+    }
+    let line = |r: &Change| match r {
+        Change::Task(t) => change_line(t, c.now, &c.handles),
+        Change::Entry(e) => event_line(e, c.now, &c.handles),
+    };
+    if c.projects.is_empty() {
+        for r in &c.rows {
+            out.push_str(&line(r));
+        }
+    } else {
+        for p in &c.projects {
+            out.push_str(&format!("\n{}\n", p.name));
+            for r in c.rows.iter().filter(|r| r.newest().project_id == p.id) {
+                out.push_str(&line(r));
+            }
+        }
+    }
+    if c.omitted > 0 {
+        out.push_str(&format!(
+            "\n  ...+{} more in this range -- narrow it, or pass include: \"all\"\n",
+            c.omitted
+        ));
+    }
+    out
+}
+
+/// One task in the changes view: when, which, where it stands now, and what happened to it.
+/// The "who" only appears for another member's work, so a board without a room carries no
+/// names at all -- on it every line would say "you".
+fn change_line(t: &crate::core::changes::TaskChange, now: i64, h: &Handles) -> String {
+    let status = t.status.map(|s| s.as_str()).unwrap_or("gone");
+    let e = &t.shown;
+    let body = h.text(&e.body, h.origin_of("event", e.id));
+    let what = match (status_transition(&e.kind), e.kind.as_str()) {
+        (Some(to), _) => format!("-> {to}{}", if body.is_empty() { String::new() } else { format!(": {}", truncate(&body, 45)) }),
+        (None, "created") => "filed".to_string(),
+        (None, "log") => format!("logged: {}", truncate(&body, 45)),
+        (None, _) => truncate(&body, 45),
+    };
+    // When the line reports an older transition than the newest event, the two can have
+    // different authors: "· by" names whoever wrote LAST, so the transition names its own,
+    // or volker's move followed by my log would read as my move.
+    let what = if e.id != t.last.id { format!("{}{what}", h.by("event", e.id, e.actor)) } else { what };
+    let more = if t.events > 1 { format!(" (+{} more)", t.events - 1) } else { String::new() };
+    let mut who = String::new();
+    let editor = h.author("event", t.last.id);
+    if let Some(by) = &editor {
+        who.push_str(&format!(" \u{b7} by {by}"));
+    }
+    if let Some(filer) = h.task_from(t.task_id).filter(|f| Some(f) != editor.as_ref()) {
+        who.push_str(&format!(" \u{b7} filed by {filer}"));
+    }
+    // No quotes around the title: titles carry quotes of their own, and nested ones made the
+    // line unreadable on a real board.
+    format!(
+        "  {:<4} {} {status} {} -- {what}{more}{who}\n",
+        ago(now, t.last.ts),
+        h.task(t.task_id),
+        truncate(&t.title, 40),
+    )
+}
+
+/// `Nov 2 14:00`, with the year once it is not this one. In local time, from an offset core
+/// read off the machine: the range is printed for the person and the agent to check against a
+/// clock, and a UTC time would be off by hours for most of them.
+fn local_time(ts: i64, offset: i64, now: i64) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let (y, m, d, secs) = civil(ts + offset);
+    let (this_year, ..) = civil(now + offset);
+    let year = if y == this_year { String::new() } else { format!(" {y}") };
+    format!("{} {d}{year} {:02}:{:02}", MONTHS[(m - 1) as usize], secs / 3600, secs % 3600 / 60)
+}
+
+/// Epoch seconds -> (year, month, day, seconds into the day). Howard Hinnant's
+/// days-from-civil inverse; exact for the proleptic Gregorian calendar, no table needed.
+fn civil(t: i64) -> (i64, i64, i64, i64) {
+    let (days, secs) = (t.div_euclid(86400), t.rem_euclid(86400));
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d, secs)
+}
+
 /// A history line in `task_show`. Logs and every reason a `task_update` or move carries
 /// print whole: they are the "why" the agent resumes a task for, and cut at 55 characters a
 /// "USER DECISION ..." or a "DONE, commit ..." survives only as its first clause. Every

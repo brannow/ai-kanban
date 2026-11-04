@@ -5,6 +5,7 @@
 //!     └── HTTP API     -> JSON + the web UI, for a human
 
 pub mod board;
+pub mod changes;
 pub mod error;
 pub mod forget;
 pub mod merge;

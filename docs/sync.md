@@ -108,7 +108,10 @@ rotation without a terminal; not built yet.
 background thread; no tool or page waits for it. A connected board's `board` header says
 `offline` (passes by itself) or `sync failing: <what>; local work is unaffected` (someone has
 to act), and nothing on boards that are not shared. The web UI's room badge dot is grey when
-offline and amber when someone has to act, the tooltip saying the board works as usual.
+offline and amber when someone has to act, the tooltip saying the board works as usual. The
+badge also says when the board last synced, on the badge rather than in the tooltip, because a
+stale copy has to be noticeable at a glance: `synced just now`, `5 min ago`, `3 hours ago`,
+`1 day ago`, then a date (`Nov 3, 14:20`) once a relative age stops saying anything.
 
 **The agent's way in is the room tools** (`room_list`, `room_show`, `room_connect`,
 `room_disconnect`; `docs/tool-design.md`, "Rooms"). They do what the commands below do, from the

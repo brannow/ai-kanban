@@ -581,3 +581,36 @@ fn a_verified_session_on_the_old_relay_sends_nothing_there_after_the_store_moved
     expect(&benny, &state, &mut wrong);
     done(wrong);
 }
+
+/// Every store connected before 0.3.0 meets its relay's instance id for the first time, on the
+/// relay it has always used, with boards connected. That is no move: the instance is recorded,
+/// nothing is sent again, nothing is joined anew.
+#[test]
+fn a_store_from_before_0_3_0_on_its_own_relay_is_not_moved() {
+    let relay = HttpRelay::start();
+    let (benjamin, _benny, state) = mixed_work(&relay, "upgrade", true);
+    let mut wrong = vec![];
+    {
+        let s = benjamin.store.lock().unwrap();
+        s.conn.execute("UPDATE sync_node SET relay_instance = NULL WHERE id = 1", []).unwrap();
+    }
+    // A new process: its client has checked nothing yet.
+    let fresh = Client::new(&relay.url, &benjamin.key, Duration::from_secs(5));
+    let s = benjamin.store.lock().unwrap();
+    if let Err(e) = check_identity(&s, &fresh) {
+        wrong.push(format!("identity: {e}"));
+    }
+    match sync_board(&s, &fresh, benjamin.pid) {
+        Ok(d) if d.pushed == 0 => {}
+        other => wrong.push(format!("the first round after the upgrade sent again: {other:?}")),
+    }
+    if s.relay_instance().unwrap().is_none() {
+        wrong.push("the instance was not recorded".into());
+    }
+    if s.needs_rejoin(benjamin.pid).unwrap() {
+        wrong.push("the room is marked to be joined again".into());
+    }
+    drop(s);
+    expect(&benjamin, &state, &mut wrong);
+    done(wrong);
+}

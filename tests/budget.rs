@@ -310,3 +310,25 @@ fn a_busy_relays_room_list_stays_affordable() {
     assert!(text.contains("25 more rooms"), "the rest is counted, not dropped: {text}");
     assert!(tokens(&text) < 1100, "room_list cost {} tokens", tokens(&text));
 }
+
+#[test]
+fn a_changes_range_over_the_whole_history_costs_about_what_a_board_does() {
+    // The range is the agent's to choose, and "since 2w" on a busy board can cover every event
+    // there is. What it costs must be bounded by the row cap, not by how much happened.
+    use ai_kanban::core::changes::ChangeQuery;
+    let (s, pid) = year_old_project();
+    // The fixture's 600 short session logs would fill the cap with ~70-character lines. Task
+    // rows are the long ones (title, status, what changed), so the worst case is a range full
+    // of them: push the logs out of it.
+    s.conn.execute("UPDATE events SET ts = ts - 30 * 86400 WHERE task_id IS NULL", []).unwrap();
+    let (since, until) = s.change_range(Some("1d"), None, ai_kanban::core::now()).unwrap();
+    let q = ChangeQuery { since, until, status: vec![], limit: ChangeQuery::LIMIT, workstream: None };
+    let head = s.board(pid, &BoardQuery { status: vec![], limit: 0, recent_limit: 0, workstream: None }).unwrap();
+    let c = s.changes(pid, &q).unwrap();
+    let text = render::changes(Some(&head), &c);
+    eprintln!("\n=== board(since) over 800 events -- ~{} tokens ===\n{}", tokens(&text), text);
+
+    assert!(c.omitted > 0, "the fixture must overflow the cap");
+    assert!(text.contains("more in this range"), "the remainder is stated, not dropped");
+    assert!(tokens(&text) < 1100, "changes cost {} tokens", tokens(&text));
+}

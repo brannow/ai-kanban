@@ -200,6 +200,56 @@ workstream's tasks is the "grouped rendering" this design rejected — it would 
 `compute_omitted` to account per group or the *nothing is dropped silently* guarantee starts
 lying.
 
+### What changed: `board(since, until)`, not a history tool
+
+`recent` answers "what happened lately" with a fixed count, so one busy day pushes everything
+older out of it. The question an agent returning after a weekend actually has is bounded by
+time: "what happened since Friday", on this board or on all of them (#1172).
+
+It is two arguments on `board` rather than a tool of its own: `board` already owns `recent`,
+and a second tool covering nearly the same ground would make the agent pick between them —
+which needs knowledge of ai-kanban's internals. Given either argument, `board` renders the board
+header (board, scope, sync line) and then a changes view in place of the task columns:
+
+```
+Board: ai-kanban  (31 open, 1 doing, 16 testing, 46 done)
+
+changed since Nov 2 01:21 (3d ago), until now
+  1d   #1133 testing Moving to another relay is invisible:… -- -> testing: Built on branch… (+3 more)
+  1d   Released as 0.3.0 (91f57ed, tag v0.3.0, pushed to main). Benjamin…
+```
+
+On a shared board a teammate's work carries their name: `· by Volker` for the latest edit, and
+`Volker: -> testing` when the transition the line reports was theirs but someone wrote after it.
+
+The decisions in it, each one a way the view could quietly mislead:
+
+- **Built on events, one row per task.** An event says *what* changed; `updated_at` does not,
+  and a `log` deliberately leaves it alone. The row's time and its "by" are the task's newest
+  event in the range — history is append-only, so that is the latest edit.
+- **The row reports the newest status *transition*, not the newest event.** A task moved to
+  testing and then given a log must still read "-> testing"; the log would bury the line's
+  point. `+N more` counts the rest.
+- **Project-level entries are rows too.** Releases, decisions and session summaries belong to
+  no task and are often the most important lines.
+- **Who appears only for another member's work** (`Handles`), so a board without a room names
+  nobody: there every line would say "you". "filed by" is added when the filer is someone else
+  again.
+- **The resolved range is printed.** The agent passed `3d` or a date and must be able to check
+  what it became — the same reason the header names the board.
+- **Relative ages and local dates.** Agents are unreliable at knowing "now", so `3d`, `12h`,
+  `today`, `yesterday` exist to spare them computing timestamps. A date given as `until`
+  includes that whole day; "until Nov 3" read as Nov 3 00:00 would drop the day it names.
+  Date strings are shape-checked before SQLite parses them: SQLite reads a bare `3` as a
+  Julian day, which would turn "three days" into 4710 BC and an empty view.
+- **Defaults.** `until` defaults to now; `until` alone means the 7 days before it.
+- **One cap, 30 rows, `+N more` stated.** Across `project: "all"` the cap is shared and filled
+  newest first, so the first board cannot take the whole view. `include: "all"` lifts it.
+  `status` keeps only tasks now in those statuses and drops entries ("what got finished this
+  week"). Asserted in `tests/budget.rs`.
+- **A workstream narrows the view and is never entered.** Unlike `board(workstream)`, looking
+  back at last week's slice must not move where the next `task_add` lands.
+
 ### `task_show`
 
 ```
@@ -353,8 +403,9 @@ has touched all year.
 
 **No required `project` argument.** See above.
 
-**No tool for reading raw events.** They surface through `board`'s `recent`, `task_show`'s
-history, and `recall` -- with `full: true` when an entry must be read whole. A tool that
+**No tool for reading raw events.** They surface through `board`'s `recent`, `board(since)`
+(one capped line per task, not per event), `task_show`'s history, and `recall` -- with
+`full: true` when an entry must be read whole. A tool that
 dumps the log would be a tool for producing token cost; a search that returns three whole
 entries is not.
 

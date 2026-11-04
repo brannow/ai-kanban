@@ -807,11 +807,16 @@ function renderRoom() {
   dot.className = 'dot';
   dot.textContent = '\u25cf';
   el.append(dot);
+  // Visible, not only in the tooltip: a stale shared board has to be noticeable at a glance.
+  const at = document.createElement('span');
+  at.className = 'synced';
+  at.textContent = s.last_ok_at ? ` · synced ${syncedAt(s.last_ok_at)}` : ' · never synced';
+  el.append(at);
   const unsent = s.unsent_tasks + s.unsent_notes;
   el.title = [
     `shared through room ${s.room}`,
     s.live === true ? 'live: teammates\' changes arrive as they happen' : s.live === false ? 'not live: reconnecting' : null,
-    s.last_ok_at ? `last sync ${since(s.last_ok_at)}` : 'never synced',
+    s.last_ok_at ? `last sync ${when(s.last_ok_at)}` : 'never synced',
     unsent ? `${s.unsent_tasks} task(s), ${s.unsent_notes} note(s) not sent yet` : 'nothing unsent',
     s.last_error ? `last error: ${s.last_error}` : null,
     SYNC.paused ? `sync paused: ${SYNC.paused}` : null,
@@ -819,8 +824,24 @@ function renderRoom() {
     s.members.length ? 'team: ' + s.members.map(m => `${m.user} (${m.tag})`).join(', ') : null,
   ].filter(Boolean).join('\n');
 }
-// `ago` gives "just now" for the last minute; this keeps "ago" off it.
-function since(ts) { const a = ago(ts); return a === 'just now' ? a : `${a} ago`; }
+// The room badge's "synced ..." label, worded the way GitHub and GitLab word it. Not `ago`:
+// that one is the compact "3h" of the task rows, where a date would widen every row. Past two
+// days a relative age stops being useful ("9 days ago" -- since when?), so it turns into a date.
+// "1 day ago" rather than "yesterday": 47 hours back can be two calendar days back.
+function syncedAt(ts) {
+  const d = Math.floor(Date.now() / 1000) - SKEW - ts;
+  if (d < 45) return 'just now';
+  if (d < 90) return '1 min ago';
+  if (d < 3600) return `${Math.floor(d / 60)} min ago`;
+  if (d < 7200) return '1 hour ago';
+  if (d < 86400) return `${Math.floor(d / 3600)} hours ago`;
+  if (d < 172800) return '1 day ago';
+  const t = new Date(ts * 1000);
+  return t.toLocaleString(undefined, {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+    year: t.getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
+  });
+}
 setInterval(refreshSync, 10000);
 
 async function onProjectChange() {

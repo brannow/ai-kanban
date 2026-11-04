@@ -10,9 +10,9 @@ use crate::core::model::{Actor, Event, Project};
 use crate::core::store::{now, Store};
 use rusqlite::params;
 
-const EVENT_COLS: &str = "id, project_id, task_id, ts, actor, kind, body";
+pub(crate) const EVENT_COLS: &str = "id, project_id, task_id, ts, actor, kind, body";
 
-fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
+pub(crate) fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     Ok(Event {
         id: r.get(0)?,
         project_id: r.get(1)?,
